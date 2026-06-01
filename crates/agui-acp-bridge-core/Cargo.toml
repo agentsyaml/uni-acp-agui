@@ -1,0 +1,45 @@
+[package]
+name = "agui-acp-bridge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["unstable_session_model", "unstable_session_usage"]
+# Enables the ACP `session/set_model` request and `SessionModelState`
+# discovery surface. Marked **unstable** in the upstream schema; opt out
+# by building with `--no-default-features` if you are pinning to the
+# stable subset.
+unstable_session_model = [
+    "agent-client-protocol/unstable_session_model",
+]
+# Enables the ACP `SessionUpdate::UsageUpdate` variant carrying token
+# context-window stats and cumulative cost. Required for compatibility
+# with agents that emit usage telemetry on `session/update` (opencode
+# does this on every LLM round-trip — without this feature the ACP
+# client library raises a JSON-RPC `Invalid params` back to the agent
+# every time, polluting logs and potentially confusing the agent).
+# Translated to a CUSTOM `agent:usage_update` event so frontends can
+# render token meters / cost badges.
+unstable_session_usage = [
+    "agent-client-protocol/unstable_session_usage",
+]
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+agent-client-protocol-tokio = { workspace = true }
+agui-rs-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+agui-acp-bridge-policy = { path = "../agui-acp-bridge-policy" }

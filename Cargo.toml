@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agui-acp-bridge-core",
+    "crates/agui-acp-bridge-policy",
+    "crates/agui-acp-bridge-server",
+    "crates/agui-acp-bridge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alexsun/uni-acp-agui"
+
+[workspace.dependencies]
+agent-client-protocol = "0.11"
+agent-client-protocol-tokio = "0.11"
+
+agui-rs-core = "0.1"
+agui-rs-server = "0.1"
+agui-rs-client = "0.1"
+agui-rs-encoder = "0.1"
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+axum = "0.7"
+tower = "0.5"
+http-body-util = "0.1"
+dashmap = "6"
+
+clap = { version = "4", features = ["derive"] }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

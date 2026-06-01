@@ -1,0 +1,44 @@
+{
+  "name": "copilotkit-acp-demo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "dev:bridge": "cargo run --manifest-path ../../Cargo.toml -p agui-acp-bridge-cli -- --max-sessions 16 opencode acp",
+    "dev:bridge:echo": "cargo run --manifest-path ../../Cargo.toml -p agui-acp-bridge-cli -- --max-sessions 16 --in-process",
+    "dev:bridge:hitl": "cargo run --manifest-path ../../Cargo.toml -p agui-acp-bridge-cli -- --max-sessions 16 --policy interrupt -- opencode acp",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ag-ui/client": "0.0.53",
+    "@copilotkit/react-core": "1.58.0",
+    "@copilotkit/react-ui": "1.58.0",
+    "@copilotkit/runtime": "1.58.0",
+    "next": "16.2.6",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@standard-schema/spec": "^1.1.0",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  },
+  "ignoreScripts": [
+    "sharp",
+    "unrs-resolver"
+  ],
+  "trustedDependencies": [
+    "sharp",
+    "unrs-resolver"
+  ]
+}

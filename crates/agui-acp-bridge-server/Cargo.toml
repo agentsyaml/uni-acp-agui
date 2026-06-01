@@ -1,0 +1,51 @@
+[package]
+name = "agui-acp-bridge-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["unstable_session_model", "unstable_session_usage"]
+# Forwarded from `agui-acp-bridge-core`. Disable to drop ACP `session/set_model`
+# support (see core's feature docs).
+unstable_session_model = [
+    "agui-acp-bridge-core/unstable_session_model",
+]
+# Forwarded from `agui-acp-bridge-core`. Disable only if you are pinning
+# to the stable ACP subset and your agents will not emit usage updates.
+unstable_session_usage = [
+    "agui-acp-bridge-core/unstable_session_usage",
+]
+
+[dependencies]
+agui-acp-bridge-core = { path = "../agui-acp-bridge-core", default-features = false }
+agui-acp-bridge-policy = { path = "../agui-acp-bridge-policy" }
+agent-client-protocol = { workspace = true }
+agent-client-protocol-tokio = { workspace = true }
+agui-rs-core = { workspace = true }
+agui-rs-server = { workspace = true }
+agui-rs-encoder = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Tests-only HTTP client used by the mock ACP agent to talk to the
+# bridge's in-process MCP endpoint over the bound TCP port.
+# rustls-tls keeps the build self-contained on Windows / CI runners
+# without an OpenSSL toolchain.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
