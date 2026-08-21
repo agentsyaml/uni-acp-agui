@@ -7,29 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["unstable_session_model", "unstable_session_usage"]
-# Enables the ACP `session/set_model` request and `SessionModelState`
-# discovery surface. Marked **unstable** in the upstream schema; opt out
-# by building with `--no-default-features` if you are pinning to the
-# stable subset.
-unstable_session_model = [
-    "agent-client-protocol/unstable_session_model",
-]
-# Enables the ACP `SessionUpdate::UsageUpdate` variant carrying token
-# context-window stats and cumulative cost. Required for compatibility
-# with agents that emit usage telemetry on `session/update` (opencode
-# does this on every LLM round-trip — without this feature the ACP
-# client library raises a JSON-RPC `Invalid params` back to the agent
-# every time, polluting logs and potentially confusing the agent).
-# Translated to a CUSTOM `agent:usage_update` event so frontends can
-# render token meters / cost badges.
-unstable_session_usage = [
-    "agent-client-protocol/unstable_session_usage",
-]
+default = ["unstable_session_usage"]
+# Compatibility feature for the legacy `SessionModelState` discovery mirror.
+# ACP 2.0 exposes the stable v1 schema directly; model changes still use the
+# stable `session/set_config_option` path in the bridge.
+unstable_session_model = []
+# Compatibility feature for the ACP `SessionUpdate::UsageUpdate` translation.
+# ACP 2.0 exposes the stable v1 usage update without a draft feature; it is
+# translated to a CUSTOM `agent:usage_update` event for the frontend.
+unstable_session_usage = []
 
 [dependencies]
 agent-client-protocol = { workspace = true }
-agent-client-protocol-tokio = { workspace = true }
 agui-rs-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

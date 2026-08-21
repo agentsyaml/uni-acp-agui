@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
@@ -223,13 +223,13 @@ async fn run_mcp_using_agent(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -492,10 +492,10 @@ async fn drive_run(
                         active_call = Some((id, name, String::new()));
                     }
                     "TOOL_CALL_ARGS" => {
-                        if let Some((_, _, args)) = active_call.as_mut() {
-                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                                args.push_str(delta);
-                            }
+                        if let Some((_, _, args)) = active_call.as_mut()
+                            && let Some(delta) = event.get("delta").and_then(|v| v.as_str())
+                        {
+                            args.push_str(delta);
                         }
                         // Once we have args we know what to call. Real
                         // hooks (CopilotKit) fire on ARGS-complete; the
@@ -601,6 +601,33 @@ async fn frontend_tool_round_trip_streams_call_and_returns_browser_result() {
     assert!(
         tool_end < run_finished,
         "tool call must complete before RUN_FINISHED: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn frontend_tool_mcp_url_encodes_special_thread_path_segment() {
+    let (bound, captured) = spawn_bridge().await;
+    let thread_id = "thread/slash?query#fragment";
+    let input = input_with_tool(thread_id, "run-special-path", say_hello_tool());
+    let on_tool_call: OnToolCall = Box::new(|_, _, _| Box::new(|| json!({"ok": true})));
+
+    let events = tokio::time::timeout(
+        Duration::from_secs(20),
+        drive_run(bound, &input, on_tool_call),
+    )
+    .await
+    .expect("special path MCP call deadlocked");
+    assert!(events.contains(&"TOOL_CALL_START".into()), "{events:?}");
+    assert!(events.contains(&"RUN_FINISHED".into()), "{events:?}");
+
+    let advertised = captured
+        .lock()
+        .await
+        .clone()
+        .expect("agent must receive an MCP URL");
+    assert_eq!(
+        advertised,
+        format!("http://{bound}/mcp/thread%2Fslash%3Fquery%23fragment")
     );
 }
 

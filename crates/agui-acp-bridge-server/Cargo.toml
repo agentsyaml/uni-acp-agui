@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["unstable_session_model", "unstable_session_usage"]
-# Forwarded from `agui-acp-bridge-core`. Disable to drop ACP `session/set_model`
-# support (see core's feature docs).
+default = ["unstable_session_usage"]
+# Forwarded from `agui-acp-bridge-core` for the legacy model discovery mirror.
+# Model changes use `session/set_config_option` regardless of this feature.
 unstable_session_model = [
     "agui-acp-bridge-core/unstable_session_model",
 ]
@@ -23,7 +23,6 @@ unstable_session_usage = [
 agui-acp-bridge-core = { path = "../agui-acp-bridge-core", default-features = false }
 agui-acp-bridge-policy = { path = "../agui-acp-bridge-policy" }
 agent-client-protocol = { workspace = true }
-agent-client-protocol-tokio = { workspace = true }
 agui-rs-core = { workspace = true }
 agui-rs-server = { workspace = true }
 agui-rs-encoder = { workspace = true }

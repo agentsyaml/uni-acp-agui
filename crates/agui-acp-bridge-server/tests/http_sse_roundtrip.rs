@@ -10,11 +10,15 @@ mod support;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_client_protocol::schema::v1::StopReason;
 use agui_acp_bridge_server::{
     AcpClient, BridgeAppState, InProcessAcpClient, acp::CustomAgentInProcessClient, test_agents,
 };
-use agui_rs_core::types::RunAgentInput;
+use agui_rs_core::types::{
+    InputContent, InputContentSource, Message, RunAgentInput, UserMessage, UserMessageContent,
+};
 use axum::http::StatusCode;
+use serde_json::Value;
 
 use support::{collect_sse_body, user_input};
 
@@ -53,6 +57,45 @@ async fn echo_roundtrip_emits_run_lifecycle_events() {
 }
 
 #[tokio::test]
+async fn stop_reasons_emit_the_expected_single_terminal_event() {
+    let cases = [
+        (StopReason::EndTurn, None),
+        (StopReason::Cancelled, Some("ACP_CANCELLED")),
+        (StopReason::MaxTokens, Some("ACP_MAX_TOKENS")),
+        (StopReason::MaxTurnRequests, Some("ACP_MAX_TURN_REQUESTS")),
+        (StopReason::Refusal, Some("ACP_REFUSAL")),
+    ];
+
+    for (stop_reason, expected_code) in cases {
+        let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+            test_agents::run_stop_reason_agent(stream, stop_reason)
+        }));
+        let state = BridgeAppState::new(client, PathBuf::from("/"));
+        let (status, body) =
+            collect_sse_body(state, user_input("thread-stop", "run-stop", "hello")).await;
+        assert_eq!(status, StatusCode::OK, "body:\n{body}");
+
+        let terminal = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+            .next_back()
+            .expect("terminal event");
+        match expected_code {
+            None => {
+                assert_eq!(terminal["type"], "RUN_FINISHED", "body:\n{body}");
+                assert!(!body.contains("RUN_ERROR"), "body:\n{body}");
+            }
+            Some(code) => {
+                assert_eq!(terminal["type"], "RUN_ERROR", "body:\n{body}");
+                assert_eq!(terminal["code"], code, "body:\n{body}");
+                assert!(!body.contains("RUN_FINISHED"), "body:\n{body}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn empty_messages_emits_clean_noop_run() {
     // The bridge's contract: a run carries a fresh prompt only when
     // the tail of `messages[]` is a `User` text message. Empty
@@ -82,6 +125,69 @@ async fn empty_messages_emits_clean_noop_run() {
 }
 
 #[tokio::test]
+async fn multipart_user_input_is_rejected_before_session_creation() {
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opens_for_agent = opens.clone();
+    let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+        opens_for_agent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        test_agents::run_single_chunk_agent(stream)
+    }));
+    let state = BridgeAppState::new(client, PathBuf::from("/"));
+    let mut input = RunAgentInput::new("thread-multipart", "run-multipart");
+    input.messages.push(Message::User(UserMessage {
+        id: "multipart-1".into(),
+        content: UserMessageContent::Parts(vec![InputContent::Image {
+            source: InputContentSource::Data {
+                value: "aGVsbG8=".into(),
+                mime_type: "image/png".into(),
+            },
+            metadata: None,
+        }]),
+        name: None,
+        encrypted_value: None,
+    }));
+
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(body.contains("\"type\":\"RUN_STARTED\""), "body:\n{body}");
+    assert!(body.contains("\"type\":\"RUN_ERROR\""), "body:\n{body}");
+    assert!(
+        body.contains("\"code\":\"UNSUPPORTED_INPUT\""),
+        "body:\n{body}"
+    );
+    assert!(!body.contains("RUN_FINISHED"), "body:\n{body}");
+    assert_eq!(
+        state.session_count(),
+        0,
+        "multipart input must not open a session"
+    );
+    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn agui_resume_is_rejected_without_becoming_a_history_noop() {
+    let state = fresh_state();
+    let mut input = RunAgentInput::new("thread-resume", "run-resume");
+    input.resume = Some(Vec::new());
+
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(
+        body.contains("\"code\":\"AGUI_RESUME_UNSUPPORTED\""),
+        "body:\n{body}"
+    );
+    assert!(
+        !body.contains("RUN_FINISHED"),
+        "resume must not become a noop:\n{body}"
+    );
+    assert_eq!(
+        state.session_count(),
+        0,
+        "unsupported resume must not open a session"
+    );
+}
+
+#[tokio::test]
 async fn same_thread_id_reuses_session_across_runs() {
     let state = fresh_state();
 
@@ -106,6 +212,44 @@ async fn same_thread_id_reuses_session_across_runs() {
         1,
         "thread-reuse should map to a single cached session, got {}",
         state.session_count()
+    );
+}
+
+#[tokio::test]
+async fn same_thread_concurrency_is_rejected_and_next_run_can_execute() {
+    let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(|stream| {
+        test_agents::run_slow_prompt_agent(stream, 250)
+    }));
+    let state = BridgeAppState::new(client, PathBuf::from("/"));
+
+    let first_state = state.clone();
+    let first = tokio::spawn(async move {
+        collect_sse_body(first_state, user_input("thread-gate", "run-1", "first")).await
+    });
+    tokio::task::yield_now().await;
+    let second =
+        collect_sse_body(state.clone(), user_input("thread-gate", "run-2", "second")).await;
+    let first = first.await.expect("first run task");
+
+    let bodies = [&first.1, &second.1];
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|body| body.contains("\"code\":\"CONCURRENT_RUN\""))
+            .count(),
+        1,
+        "exactly one concurrent run must be rejected: first={first:?}, second={second:?}"
+    );
+    assert!(
+        bodies.iter().any(|body| body.contains("RUN_FINISHED")),
+        "one run must execute normally: first={first:?}, second={second:?}"
+    );
+
+    let (status, body) = collect_sse_body(state, user_input("thread-gate", "run-3", "after")).await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(
+        body.contains("RUN_FINISHED"),
+        "later run must execute:\n{body}"
     );
 }
 

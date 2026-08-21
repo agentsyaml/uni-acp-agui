@@ -23,20 +23,30 @@
 //!   `Allow`/`Deny` decisions respond inline; `Defer` decisions emit a
 //!   `BridgeStreamItem::Interrupt` and await an external resolution via
 //!   `AcpSessionHandle::resolve_permission` with `permission_timeout`.
-//! - `ReadTextFileRequest` / `WriteTextFileRequest` — sandboxed file I/O.
-//! - `CreateTerminalRequest` / `TerminalOutputRequest` — stub responses.
+//! - Filesystem and terminal request handlers are dormant reject-only
+//!   handlers: the client does not advertise those capabilities during
+//!   `initialize`, so every such request receives method-not-found instead of
+//!   exposing partial implementations.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
-    ContentBlock, CreateTerminalRequest, CreateTerminalResponse, InitializeRequest, McpServer,
-    McpServerHttp, NewSessionRequest, NewSessionResponse, PromptRequest, ProtocolVersion,
-    ReadTextFileRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SelectedPermissionOutcome, SessionId, SessionMode, SessionModeState,
-    SessionNotification, SetSessionModeRequest, StopReason, TerminalOutputRequest,
-    TerminalOutputResponse, TextContent, WriteTextFileRequest, WriteTextFileResponse,
+use agent_client_protocol::schema::ProtocolVersion;
+#[cfg(feature = "unstable_session_model")]
+use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
+use agent_client_protocol::schema::v1::{
+    CloseSessionRequest, ContentBlock, CreateTerminalRequest, DeleteSessionRequest, HttpHeader,
+    InitializeRequest, KillTerminalRequest, McpServer, McpServerHttp, NewSessionRequest,
+    NewSessionResponse, PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionId, SessionMode, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalOutputRequest,
+    TextContent, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo};
 use dashmap::DashMap;
@@ -45,10 +55,10 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::acp::{
     AcpSessionHandle, PendingPermissions, SessionCommand, SessionConfig, SessionInitState,
+    SessionTurnQueue, TurnState,
 };
 use crate::echo_agent;
 use crate::error::BridgeError;
-use crate::file_ops;
 use crate::policy::{PermissionDecision, PermissionPolicy};
 use crate::stream::{BridgeStreamItem, ModeOffering, SessionModesInit, SessionSummary};
 #[cfg(feature = "unstable_session_model")]
@@ -72,7 +82,7 @@ type EventSlot = Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>;
 /// dropped ("no active prompt"). When `Some`, the notification handler
 /// appends each update here instead; the actor flushes the buffer onto the
 /// first prompt's stream so the resuming client sees its prior conversation.
-type LoadBuffer = Arc<Mutex<Option<Vec<agent_client_protocol::schema::SessionUpdate>>>>;
+type LoadBuffer = Arc<Mutex<Option<Vec<agent_client_protocol::schema::v1::SessionUpdate>>>>;
 
 pub(crate) async fn spawn_in_process_echo_session(
     cfg: SessionConfig,
@@ -101,16 +111,20 @@ where
 {
     let (agent_stream, client_stream) = tokio::io::duplex(IN_PROCESS_DUPLEX_BUFFER);
 
-    tokio::spawn(async move {
+    let mut agent_guard = AbortOnDrop::new(tokio::spawn(async move {
         if let Err(err) = agent_runner(agent_stream).await {
             tracing::warn!(error = %err, "in-process test agent terminated with error");
         }
-    });
+    }));
 
     let (read, write) = tokio::io::split(client_stream);
     let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
 
-    spawn_session(transport, cfg).await
+    let result = spawn_session(transport, cfg).await;
+    if result.is_ok() {
+        agent_guard.disarm();
+    }
+    result
 }
 
 /// In-process equivalent of [`list_sessions_via`]: drive `session/list`
@@ -144,6 +158,35 @@ where
     list_sessions_via(transport, cfg).await
 }
 
+/// In-process equivalent of [`delete_session_via`].
+#[doc(hidden)]
+pub async fn delete_session_in_process_with<F>(
+    cfg: SessionConfig,
+    session_id: SessionId,
+    agent_runner: F,
+) -> Result<(), BridgeError>
+where
+    F: FnOnce(
+            tokio::io::DuplexStream,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), BridgeError>> + Send>,
+        > + Send
+        + 'static,
+{
+    let (agent_stream, client_stream) = tokio::io::duplex(IN_PROCESS_DUPLEX_BUFFER);
+
+    tokio::spawn(async move {
+        if let Err(err) = agent_runner(agent_stream).await {
+            tracing::warn!(error = %err, "in-process delete agent terminated with error");
+        }
+    });
+
+    let (read, write) = tokio::io::split(client_stream);
+    let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+
+    delete_session_via(transport, cfg, session_id).await
+}
+
 pub(crate) async fn spawn_session<T>(
     connector: T,
     cfg: SessionConfig,
@@ -152,36 +195,77 @@ where
     T: ConnectTo<Client> + Send + 'static,
 {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(COMMAND_BUFFER);
-    let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionInitState, BridgeError>>();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionReady, BridgeError>>();
     let pending_permissions: PendingPermissions = Arc::new(DashMap::new());
-    let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    let turn_queue = Arc::new(SessionTurnQueue::new(cfg.config.max_queued_turns));
+    let unusable = Arc::new(AtomicBool::new(false));
     let init_state = Arc::new(Mutex::new(SessionInitState::default()));
 
     let handle_pending = pending_permissions.clone();
-    let handle_cancel_notify = cancel_notify.clone();
+    let handle_turn_queue = turn_queue.clone();
+    let handle_unusable = unusable.clone();
     let handle_init_state = init_state.clone();
     let event_buffer = cfg.config.event_buffer;
+    let actor_state = SessionActorState {
+        pending_permissions,
+        turn_queue,
+        unusable,
+        init_state,
+    };
 
-    tokio::spawn(run_actor(
+    let mut actor_guard = AbortOnDrop::new(tokio::spawn(run_actor(
         connector,
         cfg,
         cmd_rx,
         ready_tx,
-        pending_permissions,
-        cancel_notify,
-        init_state,
-    ));
+        actor_state,
+    )));
 
     match ready_rx.await {
-        Ok(Ok(_)) => Ok(AcpSessionHandle::new(
-            cmd_tx,
-            handle_cancel_notify,
-            handle_pending,
-            handle_init_state,
-            event_buffer,
-        )),
+        Ok(Ok(ready)) => {
+            actor_guard.disarm();
+            Ok(AcpSessionHandle::new(
+                cmd_tx,
+                handle_pending,
+                handle_turn_queue,
+                handle_unusable,
+                ready.session_id,
+                ready.supports_close,
+                handle_init_state,
+                event_buffer,
+            ))
+        }
         Ok(Err(err)) => Err(err),
         Err(_) => Err(BridgeError::SessionClosed),
+    }
+}
+
+/// Keeps a newly spawned actor attached to its opener until the readiness
+/// handshake succeeds. Dropping the opener future otherwise detaches the
+/// actor, allowing a timed-out handshake to keep a connector/subprocess alive.
+struct AbortOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn disarm(&mut self) {
+        // Dropping a JoinHandle detaches the task. That is intentional only
+        // after the actor has reported a successful ready handshake.
+        self.handle.take();
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -209,15 +293,16 @@ where
     let connect_result = agent_client_protocol::Client
         .builder()
         .on_receive_dispatch(
-            async move |message: agent_client_protocol::Dispatch, cx: ConnectionTo<Agent>| {
+            async move |message: agent_client_protocol::Dispatch, _cx: ConnectionTo<Agent>| {
                 match message {
                     agent_client_protocol::Dispatch::Response(result, router) => {
-                        router.respond_with_result(result)
+                        router.route_with_result(result)
                     }
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
-                    ),
+                    agent_client_protocol::Dispatch::Request(_, responder) => responder
+                        .respond_with_error(agent_client_protocol::util::internal_error(
+                            "unhandled request",
+                        )),
+                    agent_client_protocol::Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -246,19 +331,73 @@ where
     }
 }
 
+/// Open a short-lived ACP connection, confirm the agent advertises
+/// `session/delete`, delete the supplied persisted session, and tear the
+/// connection down.
+pub(crate) async fn delete_session_via<T>(
+    connector: T,
+    _cfg: SessionConfig,
+    session_id: SessionId,
+) -> Result<(), BridgeError>
+where
+    T: ConnectTo<Client> + Send + 'static,
+{
+    let (result_tx, result_rx) = oneshot::channel::<Result<(), BridgeError>>();
+
+    let result_tx = std::sync::Mutex::new(Some(result_tx));
+    let connect_result = agent_client_protocol::Client
+        .builder()
+        .on_receive_dispatch(
+            async move |message: agent_client_protocol::Dispatch, _cx: ConnectionTo<Agent>| {
+                match message {
+                    agent_client_protocol::Dispatch::Response(result, router) => {
+                        router.route_with_result(result)
+                    }
+                    agent_client_protocol::Dispatch::Request(_, responder) => responder
+                        .respond_with_error(agent_client_protocol::util::internal_error(
+                            "unhandled request",
+                        )),
+                    agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_with(connector, move |cx: ConnectionTo<Agent>| {
+            let result_slot = result_tx;
+            async move {
+                let outcome = delete_session_inner(&cx, session_id).await;
+                if let Some(tx) = result_slot.lock().expect("result slot poisoned").take() {
+                    let _ = tx.send(outcome);
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+    match result_rx.await {
+        Ok(res) => res,
+        Err(_) => match connect_result {
+            Ok(()) => Err(BridgeError::SessionClosed),
+            Err(err) => Err(BridgeError::Acp(err)),
+        },
+    }
+}
+
 /// Inner body of [`list_sessions_via`]: initialize, capability-gate, then
 /// page through `session/list`.
 async fn list_sessions_inner(
     cx: &ConnectionTo<Agent>,
     _cwd: PathBuf,
 ) -> Result<Vec<SessionSummary>, BridgeError> {
-    use agent_client_protocol::schema::ListSessionsRequest;
+    use agent_client_protocol::schema::v1::ListSessionsRequest;
 
     let init = cx
         .send_request(InitializeRequest::new(ProtocolVersion::V1))
         .block_task()
         .await
         .map_err(BridgeError::Acp)?;
+
+    require_protocol_v1(init.protocol_version)?;
 
     if init.agent_capabilities.session_capabilities.list.is_none() {
         return Err(BridgeError::Unsupported("session/list".into()));
@@ -312,17 +451,83 @@ async fn list_sessions_inner(
     Ok(summaries)
 }
 
+async fn delete_session_inner(
+    cx: &ConnectionTo<Agent>,
+    session_id: SessionId,
+) -> Result<(), BridgeError> {
+    let init = cx
+        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await
+        .map_err(BridgeError::Acp)?;
+
+    require_protocol_v1(init.protocol_version)?;
+
+    if init
+        .agent_capabilities
+        .session_capabilities
+        .delete
+        .is_none()
+    {
+        return Err(BridgeError::Unsupported("session/delete".into()));
+    }
+
+    cx.send_request(DeleteSessionRequest::new(session_id))
+        .block_task()
+        .await
+        .map(|_| ())
+        .map_err(BridgeError::Acp)
+}
+
+struct SessionActorState {
+    pending_permissions: PendingPermissions,
+    turn_queue: Arc<SessionTurnQueue>,
+    unusable: Arc<AtomicBool>,
+    init_state: Arc<Mutex<SessionInitState>>,
+}
+
+struct SessionReady {
+    session_id: SessionId,
+    supports_close: bool,
+}
+
+/// Last-resort cleanup for actor cancellation or panic. The explicit cleanup
+/// at the normal return site runs before error-event backpressure, while this
+/// guard covers task aborts that never reach that site.
+struct ActorExitGuard {
+    pending_permissions: PendingPermissions,
+    turn_queue: Arc<SessionTurnQueue>,
+    unusable: Arc<AtomicBool>,
+}
+
+impl Drop for ActorExitGuard {
+    fn drop(&mut self) {
+        self.unusable.store(true, Ordering::Release);
+        self.turn_queue.clear();
+        drain_pending_permissions(&self.pending_permissions);
+    }
+}
+
 async fn run_actor<T>(
     connector: T,
     cfg: SessionConfig,
     cmd_rx: mpsc::Receiver<SessionCommand>,
-    ready_tx: oneshot::Sender<Result<SessionInitState, BridgeError>>,
-    pending_permissions: PendingPermissions,
-    cancel_notify: Arc<tokio::sync::Notify>,
-    init_state: Arc<Mutex<SessionInitState>>,
+    ready_tx: oneshot::Sender<Result<SessionReady, BridgeError>>,
+    state: SessionActorState,
 ) where
     T: ConnectTo<Client> + Send + 'static,
 {
+    let SessionActorState {
+        pending_permissions,
+        turn_queue,
+        unusable,
+        init_state,
+    } = state;
+    let _exit_guard = ActorExitGuard {
+        pending_permissions: pending_permissions.clone(),
+        turn_queue: turn_queue.clone(),
+        unusable: unusable.clone(),
+    };
     let event_slot: EventSlot = Arc::new(Mutex::new(None));
     let event_slot_for_notif = event_slot.clone();
     let event_slot_for_perm = event_slot.clone();
@@ -335,15 +540,17 @@ async fn run_actor<T>(
         policy,
         config,
         mcp_url,
+        mcp_headers,
         load_session_id,
     } = cfg;
     let permission_timeout = config.permission_timeout;
     let cwd = Arc::new(cwd);
-    let cwd_for_read = cwd.clone();
-    let cwd_for_write = cwd.clone();
 
     let pending_perms_for_handler = pending_permissions.clone();
     let pending_perms_for_drain = pending_permissions.clone();
+    let turns_for_handler = turn_queue.clone();
+    let turns_for_session = turn_queue.clone();
+    let unusable_for_session = unusable.clone();
 
     let ready_tx = std::sync::Mutex::new(Some(ready_tx));
 
@@ -359,7 +566,7 @@ async fn run_actor<T>(
                     // notification verbatim — the translator already turns
                     // CurrentModeUpdate into an `agent:mode_update` CUSTOM
                     // event for live UI updates.
-                    if let agent_client_protocol::schema::SessionUpdate::CurrentModeUpdate(ref m) =
+                    if let agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(ref m) =
                         notification.update
                     {
                         let new_id = m.current_mode_id.0.to_string();
@@ -367,6 +574,14 @@ async fn run_actor<T>(
                         if let Some(modes) = guard.modes.as_mut() {
                             modes.current_mode_id = new_id;
                         }
+                    } else if let agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+                        ref update,
+                    ) = notification.update
+                    {
+                        let options = update.config_options.clone();
+                        let mut guard = init_state.lock().expect("init_state poisoned");
+                        guard.config_options = Some(options.clone());
+                        sync_legacy_picker_state(&mut guard, &options);
                     }
                     // If a session/load is in progress, the agent is replaying
                     // history. Capture those updates into the load buffer (no
@@ -400,6 +615,7 @@ async fn run_actor<T>(
                 let policy = policy.clone();
                 let event_slot_for_perm = event_slot_for_perm.clone();
                 let pending_perms = pending_perms_for_handler.clone();
+                let turns = turns_for_handler.clone();
                 async move |req: RequestPermissionRequest,
                             responder: agent_client_protocol::Responder<
                     RequestPermissionResponse,
@@ -411,6 +627,7 @@ async fn run_actor<T>(
                         policy.clone(),
                         event_slot_for_perm.clone(),
                         pending_perms.clone(),
+                        turns.clone(),
                         permission_timeout,
                     )
                     .await
@@ -419,45 +636,44 @@ async fn run_actor<T>(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: ReadTextFileRequest, responder, _cx| {
-                let path = req.path.to_string_lossy();
-                let limit = req.limit.map(|l| l as usize);
-                match file_ops::read_text_file(&cwd_for_read, &path, limit).await {
-                    Ok(content) => responder.respond(ReadTextFileResponse::new(content)),
-                    Err(e) => {
-                        responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            format!("read_text_file failed: {e}"),
-                        ))
-                    }
-                }
+            async move |_req: ReadTextFileRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |req: WriteTextFileRequest, responder, _cx| {
-                let path = req.path.to_string_lossy();
-                let content = &req.content;
-                match file_ops::write_text_file(&cwd_for_write, &path, content).await {
-                    Ok(()) => responder.respond(WriteTextFileResponse::new()),
-                    Err(e) => {
-                        responder.respond_with_error(agent_client_protocol::util::internal_error(
-                            format!("write_text_file failed: {e}"),
-                        ))
-                    }
-                }
+            async move |_req: WriteTextFileRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |_req: CreateTerminalRequest, responder, _cx| {
-                let terminal_id = uuid::Uuid::new_v4().to_string();
-                responder.respond(CreateTerminalResponse::new(terminal_id))
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             async move |_req: TerminalOutputRequest, responder, _cx| {
-                responder.respond(TerminalOutputResponse::new("", false))
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: WaitForTerminalExitRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: KillTerminalRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: ReleaseTerminalRequest, responder, _cx| {
+                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -466,28 +682,34 @@ async fn run_actor<T>(
             let ready_slot = ready_tx;
             let event_slot = event_slot_for_session;
             let pending_for_drain = pending_permissions.clone();
-            let cancel_notify = cancel_notify.clone();
+            let turn_queue = turns_for_session.clone();
+            let unusable = unusable_for_session.clone();
             let mut cmd_rx = cmd_rx;
             let mcp_url = mcp_url.clone();
+            let mcp_headers = mcp_headers.clone();
             let init_state = init_state.clone();
             let load_session_id = load_session_id.clone();
             let load_buffer = load_buffer_for_session;
             async move {
-                let session_id = match initialize(
+                let (session_id, supports_close) = match initialize(
                     &cx,
                     cwd.as_ref().clone(),
                     mcp_url,
+                    mcp_headers,
                     load_session_id,
                     &load_buffer,
                 )
                 .await
                 {
-                    Ok((id, init)) => {
+                    Ok((id, init, supports_close)) => {
                         *init_state.lock().expect("init_state poisoned") = init.clone();
                         if let Some(tx) = ready_slot.lock().expect("ready slot poisoned").take() {
-                            let _ = tx.send(Ok(init));
+                            let _ = tx.send(Ok(SessionReady {
+                                session_id: id.clone(),
+                                supports_close,
+                            }));
                         }
-                        id
+                        (id, supports_close)
                     }
                     Err(err) => {
                         if let Some(tx) = ready_slot.lock().expect("ready slot poisoned").take() {
@@ -503,6 +725,7 @@ async fn run_actor<T>(
                             text,
                             events_tx,
                             finished_tx,
+                            turn,
                         } => {
                             *event_slot.lock().expect("event slot poisoned") =
                                 Some(events_tx.clone());
@@ -515,6 +738,7 @@ async fn run_actor<T>(
                                 .send(BridgeStreamItem::SessionInit {
                                     modes: snapshot.modes,
                                     models: snapshot.models,
+                                    config_options: snapshot.config_options,
                                 })
                                 .await;
 
@@ -539,7 +763,7 @@ async fn run_actor<T>(
                             }
 
                             // Run the prompt while concurrently watching for
-                            // a cancel notification (via Notify) and for
+                            // a cancel notification (via the turn state) and for
                             // the SSE consumer dropping. A naive serial
                             // `await` would let cancel signals miss the
                             // window — see audit P0 "session.cancel()
@@ -549,40 +773,157 @@ async fn run_actor<T>(
                                 &session_id,
                                 text,
                                 &events_tx,
-                                cancel_notify.as_ref(),
+                                turn.clone(),
+                                pending_permissions.clone(),
+                                config.cancel_grace_timeout,
                             )
                             .await;
+
+                            let grace_expired = matches!(
+                                &res,
+                                Err(BridgeError::Timeout(timeout))
+                                    if *timeout == config.cancel_grace_timeout
+                            ) && turn.is_cancelled();
 
                             *event_slot.lock().expect("event slot poisoned") = None;
 
                             let _ = finished_tx.send(res);
                             drop(events_tx);
+                            turn_queue.remove(&turn);
+                            if grace_expired {
+                                // The agent did not acknowledge cancellation
+                                // within the grace window. Its session state
+                                // is now unknowable; close the actor and make
+                                // the cache evict this handle rather than
+                                // reusing it for a later AG-UI run.
+                                unusable.store(true, Ordering::Release);
+                                break;
+                            }
                         }
                         SessionCommand::SetMode { mode_id, ack } => {
-                            // Run set_mode off the main loop so a long
-                            // in-flight prompt does NOT block mode
-                            // switches. ConnectionTo<Agent> is Clone +
-                            // Send and the SDK's request layer is
-                            // multiplexed by id, so concurrent
-                            // session/set_mode and session/prompt are
-                            // safe to dispatch.
-                            let cx2 = cx.clone();
-                            let sid = session_id.clone();
-                            let init_state = init_state.clone();
-                            tokio::spawn(async move {
-                                let res = send_set_mode(&cx2, &sid, &mode_id, init_state).await;
-                                let _ = ack.send(res);
-                            });
+                            // Settings are deliberately actor-serial. A
+                            // prompt owns the ACP turn until it finishes, so
+                            // a queued setting cannot race a later setting or
+                            // overwrite its newer cached snapshot.
+                            //
+                            // The HTTP caller may time out while this command
+                            // waits behind a prompt. Do not apply a command
+                            // whose responder has already gone away.
+                            let mut ack = ack;
+                            if ack.is_closed() {
+                                continue;
+                            }
+                            let res = tokio::select! {
+                                _ = ack.closed() => {
+                                    // The caller disconnected while the ACP
+                                    // request was in flight. Its eventual
+                                    // response cannot safely update a session
+                                    // that may be reused, so close this actor.
+                                    unusable.store(true, Ordering::Release);
+                                    break;
+                                }
+                                result = tokio::time::timeout(
+                                    config.set_session_timeout,
+                                    send_set_mode(&cx, &session_id, &mode_id, init_state.clone()),
+                                ) => match result {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        unusable.store(true, Ordering::Release);
+                                        let _ = send_setting_ack(
+                                            ack,
+                                            Err(BridgeError::Timeout(config.set_session_timeout)),
+                                            &unusable,
+                                        );
+                                        break;
+                                    }
+                                },
+                            };
+                            if ack.is_closed() && res.is_ok() {
+                                unusable.store(true, Ordering::Release);
+                                break;
+                            }
+                            if !send_setting_ack(ack, res, &unusable) {
+                                break;
+                            }
                         }
-                        #[cfg(feature = "unstable_session_model")]
-                        SessionCommand::SetModel { model_id, ack } => {
-                            let cx2 = cx.clone();
-                            let sid = session_id.clone();
-                            let init_state = init_state.clone();
-                            tokio::spawn(async move {
-                                let res = send_set_model(&cx2, &sid, &model_id, init_state).await;
-                                let _ = ack.send(res);
-                            });
+                        SessionCommand::SetConfigOption {
+                            config_id,
+                            value,
+                            ack,
+                        } => {
+                            let mut ack = ack;
+                            if ack.is_closed() {
+                                continue;
+                            }
+                            let res = tokio::select! {
+                                _ = ack.closed() => {
+                                    // The caller disconnected while the ACP
+                                    // request was in flight. Do not keep a
+                                    // state-uncertain session alive.
+                                    unusable.store(true, Ordering::Release);
+                                    break;
+                                }
+                                result = tokio::time::timeout(
+                                    config.set_session_timeout,
+                                    send_set_config_option(
+                                        &cx,
+                                        &session_id,
+                                        &config_id,
+                                        &value,
+                                        init_state.clone(),
+                                    ),
+                                ) => match result {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        unusable.store(true, Ordering::Release);
+                                        let _ = send_setting_ack(
+                                            ack,
+                                            Err(BridgeError::Timeout(config.set_session_timeout)),
+                                            &unusable,
+                                        );
+                                        break;
+                                    }
+                                },
+                            };
+                            if ack.is_closed() && res.is_ok() {
+                                unusable.store(true, Ordering::Release);
+                                break;
+                            }
+                            if !send_setting_ack(ack, res, &unusable) {
+                                break;
+                            }
+                        }
+                        SessionCommand::Close { ack } => {
+                            if !supports_close {
+                                let _ = ack.send(Err(BridgeError::Unsupported(
+                                    "session/close".into(),
+                                )));
+                                continue;
+                            }
+
+                            // Closing is a terminal actor operation. The
+                            // request uses the real ACP SessionId returned by
+                            // initialize, never the bridge thread/run ids.
+                            let result = match tokio::time::timeout(
+                                config.set_session_timeout,
+                                cx.send_request(CloseSessionRequest::new(session_id.clone()))
+                                    .block_task(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => Ok(()),
+                                Ok(Err(error)) => Err(BridgeError::Acp(error)),
+                                Err(_) => Err(BridgeError::Timeout(config.set_session_timeout)),
+                            };
+
+                            // A close response error/timeout leaves the ACP
+                            // state uncertain, so all terminal close outcomes
+                            // make this actor unusable and release local work.
+                            unusable.store(true, Ordering::Release);
+                            turn_queue.clear();
+                            drain_pending_permissions(&pending_for_drain);
+                            let _ = ack.send(result);
+                            break;
                         }
                         SessionCommand::DrainHistory {
                             events_tx,
@@ -596,6 +937,7 @@ async fn run_actor<T>(
                                 .send(BridgeStreamItem::SessionInit {
                                     modes: snapshot.modes,
                                     models: snapshot.models,
+                                    config_options: snapshot.config_options,
                                 })
                                 .await;
                             let replay = load_buffer.lock().expect("load buffer poisoned").take();
@@ -624,6 +966,12 @@ async fn run_actor<T>(
             }
         })
         .await;
+
+    // Every exit path below represents a dead actor. Mark the shared handle
+    // first so new prompts fail closed, then release every queued admission
+    // before any potentially backpressured error event is sent.
+    unusable.store(true, Ordering::Release);
+    turn_queue.clear();
 
     if let Err(err) = result {
         let sender = event_slot.lock().expect("event slot poisoned").clone();
@@ -661,13 +1009,29 @@ fn drain_pending_permissions(pending: &PendingPermissions) {
     }
 }
 
+/// Deliver a setting result or make the session unusable when the caller has
+/// gone away between the closed check and `send`.
+fn send_setting_ack(
+    ack: oneshot::Sender<Result<(), BridgeError>>,
+    result: Result<(), BridgeError>,
+    unusable: &AtomicBool,
+) -> bool {
+    if ack.send(result).is_err() {
+        unusable.store(true, Ordering::Release);
+        false
+    } else {
+        true
+    }
+}
+
 async fn initialize(
     cx: &ConnectionTo<Agent>,
     cwd: PathBuf,
     mcp_url: Option<String>,
+    mcp_headers: Vec<HttpHeader>,
     load_session_id: Option<String>,
     load_buffer: &LoadBuffer,
-) -> Result<(SessionId, SessionInitState), BridgeError> {
+) -> Result<(SessionId, SessionInitState, bool), BridgeError> {
     // Send the agent a conventional absolute cwd (no Windows `\\?\` verbatim
     // prefix) so its persisted session directory matches what other tools use
     // and directory-scoped `session/list` can find it later.
@@ -678,11 +1042,20 @@ async fn initialize(
         .await
         .map_err(BridgeError::Acp)?;
 
+    // ACP negotiates a wire protocol version, not a schema/package version.
+    // Do not issue any session request until the agent explicitly accepts v1.
+    require_protocol_v1(init_response.protocol_version)?;
+    let supports_close = init_response
+        .agent_capabilities
+        .session_capabilities
+        .close
+        .is_some();
+
     // Compose the optional MCP server entry once; both new and load requests
     // carry it so frontend tools work on resumed sessions too.
     let mcp_servers: Vec<McpServer> = match mcp_url {
         Some(url) if init_response.agent_capabilities.mcp_capabilities.http => {
-            vec![McpServer::Http(McpServerHttp::new(MCP_SERVER_NAME, url))]
+            vec![mcp_http_server(url, mcp_headers)]
         }
         Some(_) => {
             tracing::warn!(
@@ -694,47 +1067,51 @@ async fn initialize(
         None => vec![],
     };
 
-    // Resume path: load an existing session if the caller asked for it AND
-    // the agent advertises the `loadSession` capability. The agent replays
-    // the conversation history as `session/update` notifications during the
-    // call; those are captured into `load_buffer` (see the notification
-    // handler) so the handler can surface them on the resume run's stream.
+    // Strict resume path: load an existing ACP session only when the caller
+    // asked for it and the agent advertises `loadSession`. Unsupported load or
+    // a failed `session/load` is returned to the caller; it never becomes a
+    // fresh `session/new`. The agent replays history as `session/update`
+    // notifications during the call; those are captured into `load_buffer`
+    // (see the notification handler) so the handler can surface them on the
+    // resume run's stream.
     if let Some(sid) = load_session_id {
-        if init_response.agent_capabilities.load_session {
-            use agent_client_protocol::schema::LoadSessionRequest;
-            let session_id = SessionId::from(sid);
-            // Arm the buffer so history notifications are captured rather
-            // than dropped ("no active prompt").
-            load_buffer
-                .lock()
-                .expect("load buffer poisoned")
-                .replace(Vec::new());
-            let mut req = LoadSessionRequest::new(session_id.clone(), cwd.clone());
-            if !mcp_servers.is_empty() {
-                req = req.mcp_servers(mcp_servers.clone());
+        if !init_response.agent_capabilities.load_session {
+            return Err(BridgeError::ResumeUnsupported(
+                "agent does not advertise loadSession".into(),
+            ));
+        }
+        if sid.trim().is_empty() {
+            return Err(BridgeError::ResumeFailed(
+                "session/load requires a non-empty session id".into(),
+            ));
+        }
+
+        use agent_client_protocol::schema::v1::LoadSessionRequest;
+        let session_id = SessionId::from(sid);
+        // Arm the buffer so history notifications are captured rather
+        // than dropped ("no active prompt").
+        load_buffer
+            .lock()
+            .expect("load buffer poisoned")
+            .replace(Vec::new());
+        let mut req = LoadSessionRequest::new(session_id.clone(), cwd.clone());
+        if !mcp_servers.is_empty() {
+            req = req.mcp_servers(mcp_servers.clone());
+        }
+        let load = cx.send_request(req).block_task().await;
+        match load {
+            Ok(resp) => {
+                let init = init_state_from_load(&resp);
+                return Ok((session_id, init, supports_close));
             }
-            let load = cx
-                .send_request(req)
-                .block_task()
-                .await
-                .map_err(BridgeError::Acp);
-            match load {
-                Ok(resp) => {
-                    let init = init_state_from_load(&resp);
-                    return Ok((session_id, init));
-                }
-                Err(e) => {
-                    // Disarm the buffer and fall through to a fresh session
-                    // so a stale/invalid id doesn't hard-fail the run.
-                    load_buffer.lock().expect("load buffer poisoned").take();
-                    tracing::warn!(error = %e, "session/load failed; creating a fresh session");
-                }
+            Err(error) => {
+                // A strict resume never falls through to session/new. Clear
+                // any replay notifications before surfacing the load error.
+                load_buffer.lock().expect("load buffer poisoned").take();
+                return Err(BridgeError::ResumeFailed(format!(
+                    "session/load failed: {error}"
+                )));
             }
-        } else {
-            tracing::warn!(
-                "agent does not advertise loadSession capability; \
-                 creating a fresh session instead of resuming"
-            );
         }
     }
 
@@ -750,33 +1127,56 @@ async fn initialize(
         .map_err(BridgeError::Acp)?;
 
     let init = extract_init_state(&session);
-    Ok((session.session_id, init))
+    Ok((session.session_id, init, supports_close))
+}
+
+fn mcp_http_server(url: String, headers: Vec<HttpHeader>) -> McpServer {
+    McpServer::Http(McpServerHttp::new(MCP_SERVER_NAME, url).headers(headers))
 }
 
 /// Extract init state from a `LoadSessionResponse` (mirrors
 /// [`extract_init_state`] for `NewSessionResponse`).
 fn init_state_from_load(
-    resp: &agent_client_protocol::schema::LoadSessionResponse,
+    resp: &agent_client_protocol::schema::v1::LoadSessionResponse,
 ) -> SessionInitState {
     SessionInitState {
         modes: resp.modes.as_ref().map(modes_from_state),
         #[cfg(feature = "unstable_session_model")]
-        models: resp.models.as_ref().map(models_from_state),
+        models: resp
+            .config_options
+            .as_deref()
+            .and_then(models_from_config_options),
         #[cfg(not(feature = "unstable_session_model"))]
         models: None,
+        config_options: resp.config_options.clone(),
     }
 }
 
-/// Convert ACP-schema `SessionModeState` / `SessionModelState` into
-/// the bridge's serializable mirrors. Returns `None` when the agent
-/// did not advertise the corresponding capability.
+/// Convert the stable model config option into the bridge's legacy serializable
+/// model mirror. Returns `None` when the agent does not advertise a model
+/// select option.
 fn extract_init_state(resp: &NewSessionResponse) -> SessionInitState {
     SessionInitState {
         modes: resp.modes.as_ref().map(modes_from_state),
         #[cfg(feature = "unstable_session_model")]
-        models: resp.models.as_ref().map(models_from_state),
+        models: resp
+            .config_options
+            .as_deref()
+            .and_then(models_from_config_options),
         #[cfg(not(feature = "unstable_session_model"))]
         models: None,
+        config_options: resp.config_options.clone(),
+    }
+}
+
+fn require_protocol_v1(actual: ProtocolVersion) -> Result<(), BridgeError> {
+    if actual == ProtocolVersion::V1 {
+        Ok(())
+    } else {
+        Err(BridgeError::ProtocolVersionMismatch {
+            expected: ProtocolVersion::V1,
+            actual,
+        })
     }
 }
 
@@ -796,21 +1196,37 @@ fn modes_from_state(state: &SessionModeState) -> SessionModesInit {
 }
 
 #[cfg(feature = "unstable_session_model")]
-fn models_from_state(
-    state: &agent_client_protocol::schema::SessionModelState,
-) -> SessionModelsInit {
-    SessionModelsInit {
-        current_model_id: state.current_model_id.0.to_string(),
-        available_models: state
-            .available_models
+fn models_from_config_options(options: &[SessionConfigOption]) -> Option<SessionModelsInit> {
+    let option = options
+        .iter()
+        .find(|option| option.category.as_ref() == Some(&SessionConfigOptionCategory::Model))?;
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let available_models = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
             .iter()
-            .map(|m| ModelOffering {
-                id: m.model_id.0.to_string(),
-                name: m.name.clone(),
-                description: m.description.clone(),
+            .map(|model| ModelOffering {
+                id: model.value.0.to_string(),
+                name: model.name.clone(),
+                description: model.description.clone(),
             })
             .collect(),
-    }
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .map(|model| ModelOffering {
+                id: model.value.0.to_string(),
+                name: model.name.clone(),
+                description: model.description.clone(),
+            })
+            .collect(),
+        _ => return None,
+    };
+    Some(SessionModelsInit {
+        current_model_id: select.current_value.0.to_string(),
+        available_models,
+    })
 }
 
 /// Send `session/set_mode` and, on success, update the cached init state's
@@ -822,7 +1238,7 @@ async fn send_set_mode(
     mode_id: &str,
     init_state: Arc<Mutex<SessionInitState>>,
 ) -> Result<(), BridgeError> {
-    let mode_id_arc: agent_client_protocol::schema::SessionModeId = mode_id.to_string().into();
+    let mode_id_arc: agent_client_protocol::schema::v1::SessionModeId = mode_id.to_string().into();
     cx.send_request(SetSessionModeRequest::new(
         session_id.clone(),
         mode_id_arc.clone(),
@@ -837,28 +1253,54 @@ async fn send_set_mode(
     Ok(())
 }
 
-/// Send `session/set_model` and, on success, update the cached init state's
-/// `current_model_id`. Only compiled when `unstable_session_model` is on.
-#[cfg(feature = "unstable_session_model")]
-async fn send_set_model(
+fn sync_legacy_picker_state(
+    init_state: &mut SessionInitState,
+    config_options: &[SessionConfigOption],
+) {
+    let current_value = |category: SessionConfigOptionCategory| {
+        config_options
+            .iter()
+            .find(|option| option.category.as_ref() == Some(&category))
+            .and_then(|option| match &option.kind {
+                SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+                _ => None,
+            })
+    };
+
+    if let Some(current_mode_id) = current_value(SessionConfigOptionCategory::Mode)
+        && let Some(modes) = init_state.modes.as_mut()
+    {
+        modes.current_mode_id = current_mode_id;
+    }
+    #[cfg(feature = "unstable_session_model")]
+    if let Some(current_model_id) = current_value(SessionConfigOptionCategory::Model)
+        && let Some(models) = init_state.models.as_mut()
+    {
+        models.current_model_id = current_model_id;
+    }
+}
+
+/// Send the stable ACP `session/set_config_option` request and replace the
+/// cached config-option snapshot with the response's complete list.
+async fn send_set_config_option(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
-    model_id: &str,
+    config_id: &str,
+    value: &str,
     init_state: Arc<Mutex<SessionInitState>>,
 ) -> Result<(), BridgeError> {
-    use agent_client_protocol::schema::{ModelId, SetSessionModelRequest};
-    let model_id_arc: ModelId = model_id.to_string().into();
-    cx.send_request(SetSessionModelRequest::new(
-        session_id.clone(),
-        model_id_arc,
-    ))
-    .block_task()
-    .await
-    .map_err(BridgeError::Acp)?;
+    let response: SetSessionConfigOptionResponse = cx
+        .send_request(SetSessionConfigOptionRequest::new(
+            session_id.clone(),
+            config_id.to_string(),
+            value,
+        ))
+        .block_task()
+        .await
+        .map_err(BridgeError::Acp)?;
     let mut guard = init_state.lock().expect("init_state poisoned");
-    if let Some(models) = guard.models.as_mut() {
-        models.current_model_id = model_id.to_string();
-    }
+    guard.config_options = Some(response.config_options.clone());
+    sync_legacy_picker_state(&mut guard, &response.config_options);
     Ok(())
 }
 
@@ -875,16 +1317,31 @@ async fn send_set_model(
 /// silently — the first cancel did the work.
 async fn run_prompt_with_cancel(
     cx: &ConnectionTo<Agent>,
-    session_id: &agent_client_protocol::schema::SessionId,
+    session_id: &agent_client_protocol::schema::v1::SessionId,
     text: String,
     events_tx: &mpsc::Sender<BridgeStreamItem>,
-    cancel_notify: &tokio::sync::Notify,
+    turn: Arc<TurnState>,
+    pending_permissions: PendingPermissions,
+    cancel_grace_timeout: Duration,
 ) -> Result<StopReason, BridgeError> {
-    // Capture a notified() future BEFORE issuing the prompt, so we don't
-    // miss a cancel that arrives between issuing the request and reaching
-    // the select! below.
-    let cancelled = cancel_notify.notified();
+    // Register the waiter before checking the flag. `enable()` closes the
+    // check/register gap: a notify_one that races this setup remains queued
+    // for this future instead of being lost.
+    let cancelled = turn.cancel_notify.notified();
     tokio::pin!(cancelled);
+    cancelled.as_mut().enable();
+
+    // A queued turn can be cancelled before the actor starts it. Do not send
+    // an ACP prompt for a caller that has already disconnected.
+    if turn.is_cancelled() {
+        turn.cancel_and_drain(&pending_permissions);
+        let _ = events_tx
+            .send(BridgeStreamItem::Finished {
+                stop_reason: StopReason::Cancelled,
+            })
+            .await;
+        return Ok(StopReason::Cancelled);
+    }
 
     let mut prompt_fut = std::pin::pin!(async {
         cx.send_request(PromptRequest::new(
@@ -896,6 +1353,9 @@ async fn run_prompt_with_cancel(
         .map_err(BridgeError::Acp)
     });
 
+    let mut cancel_deadline = Box::pin(tokio::time::sleep(Duration::from_secs(
+        100 * 365 * 24 * 60 * 60,
+    )));
     let mut already_cancelled = false;
     let response = loop {
         tokio::select! {
@@ -905,22 +1365,38 @@ async fn run_prompt_with_cancel(
 
             () = &mut cancelled, if !already_cancelled => {
                 already_cancelled = true;
+                turn.cancel_and_drain(&pending_permissions);
                 let _ = cx.send_notification(
-                    agent_client_protocol::schema::CancelNotification::new(
+                    agent_client_protocol::schema::v1::CancelNotification::new(
                         session_id.clone(),
                     ),
                 );
+                cancel_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + cancel_grace_timeout);
             }
 
             // If the SSE consumer drops, eagerly cancel so the agent
             // stops doing work nobody will read.
             () = events_tx.closed(), if !already_cancelled => {
                 already_cancelled = true;
+                turn.cancel_and_drain(&pending_permissions);
                 let _ = cx.send_notification(
-                    agent_client_protocol::schema::CancelNotification::new(
+                    agent_client_protocol::schema::v1::CancelNotification::new(
                         session_id.clone(),
                     ),
                 );
+                cancel_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + cancel_grace_timeout);
+            }
+
+            () = &mut cancel_deadline, if already_cancelled => {
+                tracing::warn!(
+                    ?cancel_grace_timeout,
+                    "agent did not acknowledge session/cancel within grace window"
+                );
+                break Err(BridgeError::Timeout(cancel_grace_timeout));
             }
         }
     };
@@ -954,9 +1430,20 @@ async fn handle_permission_request(
     policy: Arc<dyn PermissionPolicy>,
     event_slot: EventSlot,
     pending_permissions: PendingPermissions,
+    turn_queue: Arc<SessionTurnQueue>,
     permission_timeout: Duration,
 ) -> Result<(), agent_client_protocol::Error> {
+    let turn = turn_queue.current();
     let decision = policy.decide(&req).await;
+
+    // A policy may have been awaiting its own async work when the turn was
+    // cancelled. Do not let that late decision resurrect a cancelled ACP
+    // permission request.
+    if turn.as_ref().is_some_and(|turn| turn.is_cancelled()) {
+        return responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+    }
 
     match decision {
         PermissionDecision::Allow { option_id } => {
@@ -968,6 +1455,13 @@ async fn handle_permission_request(
             RequestPermissionOutcome::Cancelled,
         )),
         PermissionDecision::Defer { interrupt_id } => {
+            let Some(turn) = turn else {
+                tracing::warn!("permission request arrived with no active turn; denying");
+                return responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            };
+
             // Look up the active prompt's event channel to emit the
             // Interrupt. Without an active prompt there's nobody listening,
             // so we deny rather than dangle the request.
@@ -988,10 +1482,16 @@ async fn handle_permission_request(
                 .iter()
                 .map(|o| o.option_id.0.to_string())
                 .collect::<std::collections::HashSet<_>>();
-            pending_permissions.insert(
+            let registered = turn.register_pending(
+                &pending_permissions,
                 interrupt_id.clone(),
-                crate::acp::PendingPermission::new(resolve_tx, valid_option_ids),
+                crate::acp::PendingPermission::new(resolve_tx, valid_option_ids, turn.clone()),
             );
+            if !registered {
+                return responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            }
 
             let interrupt = BridgeStreamItem::Interrupt {
                 id: interrupt_id.clone(),
@@ -999,7 +1499,7 @@ async fn handle_permission_request(
             };
             if tx.send(interrupt).await.is_err() {
                 // Receiver dropped (client disconnected) — clean up and deny.
-                pending_permissions.remove(&interrupt_id);
+                turn.remove_pending(&pending_permissions, &interrupt_id);
                 return responder.respond(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Cancelled,
                 ));
@@ -1010,10 +1510,11 @@ async fn handle_permission_request(
             // notification/request the agent sends until the user
             // approves/denies (or we time out — minutes by default).
             let pending = pending_permissions.clone();
+            let turn_for_wait = turn.clone();
             tokio::spawn(async move {
                 let resolution = tokio::time::timeout(permission_timeout, resolve_rx).await;
                 // Always remove from the pending map (even on timeout).
-                pending.remove(&interrupt_id);
+                turn_for_wait.remove_pending(&pending, &interrupt_id);
                 let response = match resolution {
                     Ok(Ok(PermissionDecision::Allow { option_id })) => {
                         RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
@@ -1048,8 +1549,302 @@ async fn handle_permission_request(
     }
 }
 
-// Subprocess-driven tests live in `core/tests/process_echo.rs`.
-// The in-process echo path is covered by `core/tests/in_process_echo.rs`
-// and by the server crate's HTTP/SSE roundtrip suite. Adding focused unit
-// tests directly on the actor would require leaking internals; we prefer
-// the integration-test approach.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Debug)]
+    struct DenyPolicy;
+
+    #[async_trait::async_trait]
+    impl crate::policy::PermissionPolicy for DenyPolicy {
+        async fn decide(
+            &self,
+            _request: &agent_client_protocol::schema::v1::RequestPermissionRequest,
+        ) -> PermissionDecision {
+            PermissionDecision::Deny
+        }
+    }
+
+    async fn run_unsupported_client_methods_agent(
+        stream: tokio::io::DuplexStream,
+        unsupported: Arc<AtomicUsize>,
+        capabilities_ok: Arc<AtomicBool>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, CreateTerminalRequest, InitializeResponse, KillTerminalRequest,
+            NewSessionRequest, NewSessionResponse, PromptResponse, ReadTextFileRequest,
+            ReleaseTerminalRequest, TerminalId, TerminalOutputRequest, WaitForTerminalExitRequest,
+            WriteTextFileRequest,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+
+        Agent
+            .builder()
+            .name("agui-bridge-unsupported-client-methods-test")
+            .on_receive_request(
+                {
+                    let capabilities_ok = capabilities_ok.clone();
+                    async move |req: InitializeRequest, responder, _cx| {
+                        capabilities_ok.store(
+                            !req.client_capabilities.fs.read_text_file
+                                && !req.client_capabilities.fs.write_text_file
+                                && !req.client_capabilities.terminal,
+                            Ordering::SeqCst,
+                        );
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("test-session")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let unsupported_for_handler = unsupported.clone();
+                    async move |req: PromptRequest,
+                                responder,
+                                cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let session_id = req.session_id;
+                        let terminal_id = TerminalId::new("unsupported-test-terminal");
+                        let unsupported = unsupported_for_handler.clone();
+                        let cx_for_requests = cx.clone();
+                        cx.spawn(async move {
+                            let read = cx_for_requests
+                                .send_request(ReadTextFileRequest::new(
+                                    session_id.clone(),
+                                    "/tmp/unsupported.txt",
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                read,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let write = cx_for_requests
+                                .send_request(WriteTextFileRequest::new(
+                                    session_id.clone(),
+                                    "/tmp/unsupported.txt",
+                                    "probe",
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                write,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let create = cx_for_requests
+                                .send_request(CreateTerminalRequest::new(
+                                    session_id.clone(),
+                                    "true",
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                create,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let output = cx_for_requests
+                                .send_request(TerminalOutputRequest::new(
+                                    session_id.clone(),
+                                    terminal_id.clone(),
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                output,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let wait = cx_for_requests
+                                .send_request(WaitForTerminalExitRequest::new(
+                                    session_id.clone(),
+                                    terminal_id.clone(),
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                wait,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let kill = cx_for_requests
+                                .send_request(KillTerminalRequest::new(
+                                    session_id.clone(),
+                                    terminal_id.clone(),
+                                ))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                kill,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            let release = cx_for_requests
+                                .send_request(ReleaseTerminalRequest::new(session_id, terminal_id))
+                                .block_task()
+                                .await;
+                            if matches!(
+                                release,
+                                Err(error)
+                                    if matches!(
+                                        error.code,
+                                        agent_client_protocol::ErrorCode::MethodNotFound
+                                    )
+                            ) {
+                                unsupported.fetch_add(1, Ordering::SeqCst);
+                            }
+
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(
+                                "unhandled request",
+                            )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    #[test]
+    fn successful_setting_ack_send_failure_marks_session_unusable() {
+        let unusable = AtomicBool::new(false);
+        let (ack, receiver) = oneshot::channel();
+        drop(receiver);
+
+        // `Ok(())` models a completed ACP setting RPC whose caller vanished
+        // before the actor could deliver the result.
+        assert!(!send_setting_ack(ack, Ok(()), &unusable));
+        assert!(unusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn mcp_http_server_propagates_authorization_header() {
+        let server = mcp_http_server(
+            "http://127.0.0.1:8080/mcp/thread".into(),
+            vec![HttpHeader::new("Authorization", "Bearer test-token")],
+        );
+        let McpServer::Http(server) = server else {
+            unreachable!("helper must build an HTTP MCP server");
+        };
+        assert_eq!(server.headers.len(), 1);
+        assert_eq!(server.headers[0].name, "Authorization");
+        assert_eq!(server.headers[0].value, "Bearer test-token");
+    }
+
+    #[tokio::test]
+    async fn unadvertised_filesystem_and_terminal_methods_are_not_found() {
+        let unsupported = Arc::new(AtomicUsize::new(0));
+        let capabilities_ok = Arc::new(AtomicBool::new(false));
+        let unsupported_for_agent = unsupported.clone();
+        let capabilities_for_agent = capabilities_ok.clone();
+        let cfg = SessionConfig {
+            cwd: PathBuf::from("/"),
+            policy: Arc::new(DenyPolicy),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(run_unsupported_client_methods_agent(
+                stream,
+                unsupported_for_agent,
+                capabilities_for_agent,
+            ))
+        })
+        .await
+        .expect("session opens");
+
+        let mut prompt =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.prompt("probe"))
+                .await
+                .expect("prompt opens before timeout")
+                .expect("prompt opens");
+        while let Some(item) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), prompt.events.recv())
+                .await
+                .expect("prompt event arrives before timeout")
+        {
+            if matches!(item, BridgeStreamItem::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), prompt.finished)
+                .await
+                .expect("finished result arrives before timeout")
+                .expect("finished sender remains")
+                .expect("prompt succeeds"),
+            StopReason::EndTurn
+        );
+        assert!(capabilities_ok.load(Ordering::SeqCst));
+        assert_eq!(unsupported.load(Ordering::SeqCst), 7);
+    }
+}

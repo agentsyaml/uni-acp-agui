@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     McpCapabilities, McpServer, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
@@ -174,13 +174,13 @@ async fn run_tool_calling_agent(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -330,12 +330,11 @@ fn first_tool_call_id(body: &str) -> Option<String> {
             continue;
         };
         let payload = payload.trim_start();
-        if payload.contains("\"type\":\"TOOL_CALL_START\"") {
-            if let Ok(v) = serde_json::from_str::<Value>(payload) {
-                if let Some(id) = v.get("toolCallId").and_then(|v| v.as_str()) {
-                    return Some(id.to_string());
-                }
-            }
+        if payload.contains("\"type\":\"TOOL_CALL_START\"")
+            && let Ok(v) = serde_json::from_str::<Value>(payload)
+            && let Some(id) = v.get("toolCallId").and_then(|v| v.as_str())
+        {
+            return Some(id.to_string());
         }
     }
     None
@@ -379,14 +378,12 @@ async fn tool_call_resolves_on_happy_path() {
             Ok(None) => break,
             Err(_) => {}
         }
-        if !posted {
-            if let Some(id) = first_tool_call_id(&body) {
-                assert_eq!(
-                    post_tool_response(bound, &id, "hi world").await,
-                    reqwest::StatusCode::OK
-                );
-                posted = true;
-            }
+        if !posted && let Some(id) = first_tool_call_id(&body) {
+            assert_eq!(
+                post_tool_response(bound, &id, "hi world").await,
+                reqwest::StatusCode::OK
+            );
+            posted = true;
         }
         if body.contains("\"type\":\"RUN_FINISHED\"") {
             break;
@@ -530,14 +527,12 @@ async fn bridge_stays_responsive_after_a_parked_disconnect() {
             Ok(None) => break,
             Err(_) => {}
         }
-        if !posted {
-            if let Some(id) = first_tool_call_id(&body) {
-                assert_eq!(
-                    post_tool_response(bound, &id, "ok").await,
-                    reqwest::StatusCode::OK
-                );
-                posted = true;
-            }
+        if !posted && let Some(id) = first_tool_call_id(&body) {
+            assert_eq!(
+                post_tool_response(bound, &id, "ok").await,
+                reqwest::StatusCode::OK
+            );
+            posted = true;
         }
         if body.contains("\"type\":\"RUN_FINISHED\"") {
             break;

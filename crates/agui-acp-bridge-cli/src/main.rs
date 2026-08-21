@@ -81,8 +81,13 @@ struct Cli {
     in_process: bool,
 
     /// Bind address.
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
+
+    /// Permit binding a non-loopback address without
+    /// `AGUI_ACP_BRIDGE_TOKEN`. Unsafe for production; disabled by default.
+    #[arg(long)]
+    allow_unauthenticated_non_loopback: bool,
 
     /// Bind port.
     #[arg(short, long, default_value_t = 8080)]
@@ -93,7 +98,7 @@ struct Cli {
     cwd: PathBuf,
 
     /// Permission policy applied to ACP `requestPermission` requests.
-    #[arg(long, value_enum, default_value_t = PolicyKind::AutoAllow)]
+    #[arg(long, value_enum, default_value_t = PolicyKind::AutoDeny)]
     policy: PolicyKind,
 
     /// Tool-call titles approved by `--policy allowlist`. Repeat to allow
@@ -120,18 +125,28 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     open_session_timeout: u64,
 
-    /// `session/set_mode` and `session/set_model` request timeout in
-    /// seconds. If the agent does not respond within this budget the
-    /// bridge returns 408 to the HTTP caller. Independent from
-    /// `open_session_timeout` so model switches that take longer than
-    /// session creation can be tuned separately.
+    /// Session setting request timeout in seconds. If the agent does not
+    /// respond within this budget the bridge returns 408 to the HTTP caller.
+    /// Independent from `open_session_timeout` so config changes that take
+    /// longer than session creation can be tuned separately.
     #[arg(long, default_value_t = 30)]
     set_session_timeout: u64,
+
+    /// Grace period in seconds after `session/cancel` before the bridge
+    /// closes and evicts an agent session that never returns a prompt result.
+    #[arg(long, default_value_t = 5)]
+    cancel_grace_timeout: u64,
 
     /// Per-prompt event-channel buffer size in `BridgeStreamItem`s.
     /// Tune up for very chatty agents; tune down to reduce memory.
     #[arg(long, default_value_t = 64)]
     event_buffer: usize,
+
+    /// Maximum time in seconds each SSE event send waits for the downstream
+    /// consumer. A stalled consumer cancels the current turn instead of
+    /// pinning the session. Set to `0` only to disable this protection.
+    #[arg(long, default_value_t = 30)]
+    slow_consumer_timeout: u64,
 
     /// Frontend-tool response timeout in seconds. Applied by the
     /// in-process MCP endpoint when awaiting a browser POST to
@@ -143,11 +158,19 @@ struct Cli {
     /// Maximum number of concurrently cached ACP sessions. When the cap is
     /// reached, opening a new session first evicts the least-recently-used
     /// idle session (one with no in-flight prompt), terminating its agent
-    /// (and subprocess). Set to `0` for unlimited. The default of 128 bounds
-    /// resource usage when clients churn through many distinct `threadId`s
-    /// (e.g. a browser minting a fresh thread on every page refresh).
+    /// (and subprocess). If every cached session is busy, the new request is
+    /// rejected before an ACP actor is opened. Set to `0` for unlimited. The
+    /// default of 128 bounds resource usage when clients churn through many
+    /// distinct `threadId`s (e.g. a browser minting a fresh thread on every
+    /// page refresh).
     #[arg(long, default_value_t = 128)]
     max_sessions: usize,
+
+    /// Maximum number of active plus queued prompt turns per ACP session.
+    /// Set to `0` for explicit unlimited development mode. The default of 32
+    /// rejects excess turns before they reach the actor command queue.
+    #[arg(long, default_value_t = 32)]
+    max_queued_turns: usize,
 
     /// Public URL the agent will use to reach the bridge's built-in MCP
     /// endpoint for `useFrontendTool`-style tool injection. Defaults to
@@ -199,6 +222,17 @@ async fn run(cli: Cli) -> Result<()> {
         );
     }
 
+    let bearer_token = match std::env::var("AGUI_ACP_BRIDGE_TOKEN") {
+        Ok(token) => Some(token),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(err) => bail!("failed to read AGUI_ACP_BRIDGE_TOKEN: {err}"),
+    };
+    require_non_loopback_auth(
+        cli.host,
+        bearer_token.is_some(),
+        cli.allow_unauthenticated_non_loopback,
+    )?;
+
     let client: Arc<dyn AcpClient> = if cli.in_process {
         Arc::new(InProcessAcpClient::new())
     } else {
@@ -221,15 +255,23 @@ async fn run(cli: Cli) -> Result<()> {
         permission_timeout: Duration::from_secs(cli.permission_timeout),
         idle_timeout: Duration::from_secs(cli.idle_timeout),
         event_buffer: cli.event_buffer,
+        slow_consumer_timeout: Duration::from_secs(cli.slow_consumer_timeout),
         open_session_timeout: Duration::from_secs(cli.open_session_timeout),
         frontend_tool_timeout: Duration::from_secs(cli.frontend_tool_timeout),
         set_session_timeout: Duration::from_secs(cli.set_session_timeout),
+        cancel_grace_timeout: Duration::from_secs(cli.cancel_grace_timeout),
         max_sessions: cli.max_sessions,
+        max_queued_turns: cli.max_queued_turns,
     };
 
     let state = BridgeAppState::builder(client, cli.cwd.clone())
         .with_config(config)
         .with_policy(policy);
+    let state = if let Some(token) = bearer_token {
+        state.with_bearer_token(token).map_err(anyhow::Error::msg)?
+    } else {
+        state
+    };
 
     // Frontend-tool injection is enabled by default. Users can opt out by
     // passing `--public-url ""`; otherwise we either honour the supplied
@@ -280,6 +322,20 @@ async fn run(cli: Cli) -> Result<()> {
         .context("axum::serve failed")?;
 
     tracing::info!("bridge stopped");
+    Ok(())
+}
+
+fn require_non_loopback_auth(
+    host: IpAddr,
+    token_configured: bool,
+    allow_unauthenticated: bool,
+) -> Result<()> {
+    if !host.is_loopback() && !token_configured && !allow_unauthenticated {
+        bail!(
+            "refusing unauthenticated non-loopback bind {host}; set \
+             AGUI_ACP_BRIDGE_TOKEN or pass --allow-unauthenticated-non-loopback"
+        );
+    }
     Ok(())
 }
 
@@ -340,7 +396,26 @@ mod tests {
         assert!(cli.in_process);
         assert!(cli.agent_command.is_empty());
         assert_eq!(cli.port, 8080);
+        assert_eq!(cli.slow_consumer_timeout, 30);
+        assert_eq!(cli.max_sessions, 128);
+        assert_eq!(cli.max_queued_turns, 32);
+        assert_eq!(cli.host, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert!(matches!(cli.policy, PolicyKind::AutoDeny));
+    }
+
+    #[test]
+    fn cli_keeps_explicit_auto_allow_available() {
+        let cli = Cli::parse_from(["agui-acp-bridge", "--in-process", "--policy", "auto-allow"]);
         assert!(matches!(cli.policy, PolicyKind::AutoAllow));
+    }
+
+    #[test]
+    fn non_loopback_requires_token_unless_explicitly_allowed() {
+        let remote = "192.0.2.10".parse().unwrap();
+        assert!(require_non_loopback_auth(remote, false, false).is_err());
+        assert!(require_non_loopback_auth(remote, true, false).is_ok());
+        assert!(require_non_loopback_auth(remote, false, true).is_ok());
+        assert!(require_non_loopback_auth("127.0.0.1".parse().unwrap(), false, false).is_ok());
     }
 
     #[test]

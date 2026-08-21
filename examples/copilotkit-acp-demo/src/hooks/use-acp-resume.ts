@@ -16,10 +16,10 @@ import { useConversations } from "@/components/copilot-provider";
  *
  * Instead we trigger the resume ourselves: point the agent at the selected
  * ACP SessionId, clear stale messages, and call `agent.runAgent()` with no
- * new user message. That is a real `POST /` the bridge turns into a bootstrap
- * run → `session/load` → the agent replays the conversation history as AG-UI
- * `TEXT_MESSAGE_*` events, which `runAgent` applies to `agent.messages`, and
- * `<CopilotChat>` renders.
+ * new user message plus the explicit `acpResume` forwarded prop. That is a
+ * real `POST /` the bridge turns into a private `session/load` run → the
+ * agent replays the conversation history as AG-UI `TEXT_MESSAGE_*` events,
+ * which `runAgent` applies to `agent.messages`, and `<CopilotChat>` renders.
  *
  * Keyed on `resumeToken` so re-opening the same conversation re-resumes.
  */
@@ -38,16 +38,18 @@ export function useAcpResume() {
     // `<CopilotChat threadId={threadId}>` binds the agent's threadId in its
     // own layout effect. Defer to a microtask so that binding (and the
     // matching message reset) is in place before we fire the run, then issue
-    // a bootstrap run (no new user message). The bridge resumes via
-    // session/load and streams the history back; runAgent applies it to
-    // agent.messages and <CopilotChat> renders it.
+    // an explicit private resume run (no new user message). The bridge only
+    // issues session/load when this marker is present; normal bootstrap runs
+    // remain ordinary connection/no-op runs.
     //
     // We do NOT mutate the agent object directly (threadId/messages) — the
     // React Compiler treats it as immutable, and CopilotChat owns that state.
     const id = setTimeout(() => {
-      void agent.runAgent().catch((err: unknown) => {
-        console.error("[useAcpResume] resume run failed", err);
-      });
+      void agent
+        .runAgent({ forwardedProps: { acpResume: true } })
+        .catch((err: unknown) => {
+          console.error("[useAcpResume] resume run failed", err);
+        });
     }, 0);
     return () => clearTimeout(id);
   }, [agent, threadId, resumeToken]);

@@ -1,14 +1,15 @@
-use agent_client_protocol::schema::{RequestPermissionRequest, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{
+    RequestPermissionRequest, SessionConfigOption, SessionUpdate, StopReason,
+};
 use serde_json::Value;
 
 /// ACP-protocol view of a session's mode / model offering, surfaced to the
 /// AG-UI client via [`BridgeStreamItem::SessionInit`] so frontends can render
 /// pickers without speaking ACP themselves.
 ///
-/// All fields are protocol-typed mirrors of `SessionModeState` /
-/// `SessionModelState` from `agent-client-protocol-schema` 0.12, with `Arc<str>`
-/// flattened to plain `String` to keep them serde-serializable into AG-UI
-/// CUSTOM event payloads.
+/// All fields are protocol-typed mirrors of ACP v1 mode and model config
+/// offerings, with `Arc<str>` flattened to plain `String` to keep them
+/// serde-serializable into AG-UI CUSTOM event payloads.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModeOffering {
     pub id: String,
@@ -40,7 +41,7 @@ pub struct SessionModelsInit {
 }
 
 /// Serializable summary of one persisted ACP session, mirroring
-/// `agent_client_protocol::schema::SessionInfo`. Returned by the bridge's
+/// `agent_client_protocol::schema::v1::SessionInfo`. Returned by the bridge's
 /// `GET /sessions` endpoint (backed by ACP `session/list`) so AG-UI
 /// frontends can render a conversation-history list without speaking ACP.
 ///
@@ -77,6 +78,7 @@ pub enum BridgeStreamItem {
     SessionInit {
         modes: Option<SessionModesInit>,
         models: Option<SessionModelsInit>,
+        config_options: Option<Vec<SessionConfigOption>>,
     },
     /// A permission request that the policy chose to defer to the client.
     Interrupt {

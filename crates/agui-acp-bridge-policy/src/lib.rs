@@ -1,6 +1,6 @@
 #![doc = "Built-in PermissionPolicy implementations for the AG-UI to ACP bridge."]
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
 };
 use agui_acp_bridge_core::{PermissionDecision, PermissionPolicy};
@@ -97,7 +97,9 @@ impl PermissionPolicy for InterruptViaAgUiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{PermissionOption, ToolCallUpdate, ToolCallUpdateFields};
+    use agent_client_protocol::schema::v1::{
+        PermissionOption, ToolCallUpdate, ToolCallUpdateFields,
+    };
 
     fn req_with(title: Option<&str>, options: Vec<PermissionOption>) -> RequestPermissionRequest {
         let mut fields = ToolCallUpdateFields::new();

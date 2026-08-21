@@ -27,8 +27,10 @@
 //! The registry also keeps a global reverse index `tool_call_id → thread_id`
 //! so [`FrontendToolRegistry::resolve_anywhere`] resolves in O(1) regardless
 //! of how many threads are live. The index is maintained automatically on
-//! [`ThreadEntry::register_pending`] / [`ThreadEntry::resolve_pending`] /
-//! [`ThreadEntry::drop`], so callers never need to manage it.
+//! [`ThreadEntry::register_pending`] /
+//! [`ThreadEntry::register_pending_on_active_sender`] /
+//! [`ThreadEntry::resolve_pending`] / [`ThreadEntry::drop`], so callers never
+//! need to manage it.
 //!
 //! Dropping a [`ThreadEntry`] (e.g. session reaped) drains all pending
 //! oneshots with an error so the MCP handler tasks exit promptly instead of
@@ -210,6 +212,25 @@ impl ThreadEntry {
         self.lock_sender().clone()
     }
 
+    /// Atomically snapshot the active sender and register a pending tool call.
+    ///
+    /// The sender lock covers both operations, so teardown cannot clear the
+    /// sender between the caller's presence check and pending registration.
+    /// If teardown won the race, no pending entry is created.
+    pub fn register_pending_on_active_sender(
+        &self,
+        tool_call_id: String,
+    ) -> Option<(
+        mpsc::Sender<BridgeStreamItem>,
+        oneshot::Receiver<FrontendToolResponse>,
+    )> {
+        let guard = self.lock_sender();
+        let sender = guard.as_ref()?.clone();
+        let receiver = self.register_pending(tool_call_id);
+        drop(guard);
+        Some((sender, receiver))
+    }
+
     /// The thread id this entry is keyed by. Empty string for orphaned
     /// entries.
     #[must_use]
@@ -345,6 +366,17 @@ impl FrontendToolRegistry {
         self.inner.threads.contains_key(thread_id)
     }
 
+    /// Number of browser-side frontend tool calls currently parked for a
+    /// thread. Unlike [`Self::entry`], this does not create a registry entry.
+    #[must_use]
+    pub fn pending_len(&self, thread_id: &str) -> usize {
+        self.inner
+            .threads
+            .get(thread_id)
+            .map(|entry| entry.pending_len())
+            .unwrap_or(0)
+    }
+
     /// Resolve a pending call without knowing its thread up-front.
     ///
     /// Uses the registry-wide reverse index for an O(1) lookup keyed by
@@ -408,6 +440,21 @@ mod tests {
         let got = entry.tools();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "alert");
+    }
+
+    #[test]
+    fn tool_response_preserves_text_content_and_error_flag() {
+        let ok = serde_json::to_value(FrontendToolResponse::ok("done")).unwrap();
+        assert_eq!(
+            ok,
+            serde_json::json!({"content": "done", "is_error": false})
+        );
+
+        let error = serde_json::to_value(FrontendToolResponse::error("failed")).unwrap();
+        assert_eq!(
+            error,
+            serde_json::json!({"content": "failed", "is_error": true})
+        );
     }
 
     #[tokio::test]
@@ -542,6 +589,42 @@ mod tests {
         // No sender installed; clearing must not panic and reports false.
         assert!(!entry.clear_active_sender_if_same(&tx));
         assert!(entry.active_sender().is_none());
+    }
+
+    #[tokio::test]
+    async fn atomic_pending_registration_is_aborted_by_sender_teardown() {
+        let registry = FrontendToolRegistry::new();
+        let entry = registry.entry("t1");
+        let (sender, _events) = mpsc::channel::<BridgeStreamItem>(1);
+        entry.set_active_sender(Some(sender.clone()));
+
+        let (registered_sender, receiver) = entry
+            .register_pending_on_active_sender("call-atomic".into())
+            .expect("active sender must register the pending call");
+        assert!(registered_sender.same_channel(&sender));
+        assert_eq!(entry.pending_len(), 1);
+
+        assert!(entry.clear_active_sender_if_same(&registered_sender));
+        entry.abort_pending_calls("sender cleared");
+        let response = receiver.await.expect("abort response");
+        assert!(response.is_error);
+        assert_eq!(entry.pending_len(), 0);
+    }
+
+    #[test]
+    fn atomic_pending_registration_rejects_after_sender_clear() {
+        let registry = FrontendToolRegistry::new();
+        let entry = registry.entry("t1");
+        let (sender, _events) = mpsc::channel::<BridgeStreamItem>(1);
+        entry.set_active_sender(Some(sender.clone()));
+        assert!(entry.clear_active_sender_if_same(&sender));
+
+        assert!(
+            entry
+                .register_pending_on_active_sender("call-cleared".into())
+                .is_none()
+        );
+        assert_eq!(entry.pending_len(), 0);
     }
 
     #[test]

@@ -11,12 +11,13 @@ pub use agui_acp_bridge_core::{
     AcpClient, AcpSessionHandle, BridgeConfig, BridgeError, BridgeStreamItem,
     CustomAgentInProcessClient, FrontendToolDef, FrontendToolRegistry, FrontendToolResponse,
     InProcessAcpClient, MCP_SERVER_NAME, MessageState, ModeOffering, PermissionDecision,
-    PermissionPolicy, ProcessAcpClient, PromptStream, SessionConfig, SessionInitState,
-    SessionModesInit, SessionSummary, ThreadEntry,
+    PermissionPolicy, ProcessAcpClient, PromptStream, SessionConfig, SessionConfigOption,
+    SessionInitState, SessionModesInit, SessionSummary, ThreadEntry,
 };
 #[cfg(feature = "unstable_session_model")]
 pub use agui_acp_bridge_core::{ModelOffering, SessionModelsInit};
 pub use handler::{
-    BridgeAppState, BridgeAppStateBuilder, BridgeHandler, ResolveOutcome, SetSessionStatus,
-    build_router, build_router_inner,
+    BridgeAppState, BridgeAppStateBuilder, BridgeHandler, CancelSessionBody, CloseSessionBody,
+    CloseSessionStatus, DeleteSessionBody, DeleteSessionStatus, ResolveOutcome,
+    SetSessionConfigOptionBody, SetSessionStatus, build_router, build_router_inner,
 };

@@ -17,24 +17,10 @@
 //! default streamable-HTTP behaviour for non-streaming tool calls and is
 //! all opencode requires.
 //!
-//! ## Why no auth on this route
-//!
-//! The MCP URL is given to **only one** ACP session and includes the
-//! thread id as a path component. It is also bound by the same axum
-//! router as the rest of the bridge (so a deployment that puts the bridge
-//! behind a reverse proxy can apply auth there). The thread id itself is
-//! a low-entropy value, so:
-//!
-//! - We refuse `tools/call` if the thread has no active SSE prompt sender
-//!   — i.e. nobody is listening to translate the tool call into a
-//!   user-visible event. This means even a guesser cannot trigger
-//!   in-browser side effects when no run is in flight.
-//! - We refuse `tools/list` for unknown threads (404), so probing for
-//!   threads is meaningfully restricted to threads that are currently
-//!   being driven by the legitimate AG-UI client.
-//!
-//! Treat the bridge as you would treat any HTTP server: bind it where
-//! only your trusted browser tab can reach it (loopback by default).
+//! Authentication is applied by the outer bridge router. The endpoint also
+//! refuses `tools/call` without an active prompt sender and refuses
+//! `tools/list` for unknown threads, but those checks are not a replacement
+//! for the router's bearer middleware.
 
 use axum::{
     Json,
@@ -53,8 +39,10 @@ use crate::handler::BridgeAppState;
 /// JSON-RPC envelope: request shape we accept on `POST /mcp/{thread}`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonRpcRequest {
-    #[allow(dead_code)] // jsonrpc string is always "2.0" by spec; we don't check
-    #[serde(default)]
+    /// JSON-RPC requires this to be the string "2.0". Non-string values are
+    /// retained as `None` so the route can return a JSON-RPC invalid-request
+    /// envelope instead of an axum deserialization rejection.
+    #[serde(default, deserialize_with = "deserialize_jsonrpc_version")]
     jsonrpc: Option<String>,
     /// Methods we know about. Notifications omit `id`; we still parse them.
     method: String,
@@ -62,6 +50,15 @@ pub(crate) struct JsonRpcRequest {
     params: Value,
     #[serde(default)]
     id: Option<Value>,
+}
+
+fn deserialize_jsonrpc_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?
+        .as_str()
+        .map(ToOwned::to_owned))
 }
 
 /// Minimal JSON-RPC reply. We always include `jsonrpc: "2.0"` so MCP
@@ -106,6 +103,23 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    fn invalid_request(id: Value) -> Self {
+        Self::err(id, -32600, "Invalid Request")
+    }
+}
+
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": { "listChanged": false }
+        },
+        "serverInfo": {
+            "name": "agui-acp-bridge",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    })
 }
 
 /// Route handler. axum extracts the `{thread}` path parameter and the
@@ -121,6 +135,12 @@ pub(crate) async fn mcp_route(
         has_id = req.id.is_some(),
         "MCP request received"
     );
+    if req.jsonrpc.as_deref() != Some("2.0") {
+        return Json(JsonRpcResponse::invalid_request(
+            req.id.unwrap_or(Value::Null),
+        ))
+        .into_response();
+    }
     // Notifications: id is None and we MUST NOT reply with a JSON-RPC
     // envelope. Acknowledge with 202 Accepted (per MCP guidance).
     if req.id.is_none() {
@@ -137,19 +157,7 @@ pub(crate) async fn mcp_route(
     let id = req.id.clone().unwrap_or(Value::Null);
 
     let response = match req.method.as_str() {
-        "initialize" => {
-            let result = json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": { "listChanged": true }
-                },
-                "serverInfo": {
-                    "name": "agui-acp-bridge",
-                    "version": env!("CARGO_PKG_VERSION"),
-                }
-            });
-            Json(JsonRpcResponse::ok(id, result)).into_response()
-        }
+        "initialize" => Json(JsonRpcResponse::ok(id, initialize_result())).into_response(),
         "tools/list" => handle_tools_list(&state, &thread_id, id).await,
         "tools/call" => handle_tools_call(&state, &thread_id, id, req.params).await,
         // We only need to support the methods opencode (and any
@@ -246,18 +254,6 @@ async fn handle_tools_call(
         .into_response();
     }
 
-    let Some(active_tx) = entry.active_sender() else {
-        // Either no prompt is in flight or the SSE stream just ended.
-        // Returning an MCP-side error lets the agent's LLM react
-        // (typically by apologising or continuing without the tool)
-        // instead of waiting on a sender that will never speak.
-        return Json(JsonRpcResponse::ok(
-            id.clone(),
-            mcp_error_content("frontend tool call dropped: no active AG-UI prompt"),
-        ))
-        .into_response();
-    };
-
     // Mint a tool_call_id; the frontend will echo it back. From here on
     // every log line for this dispatch carries the id in its span so
     // operators can correlate the MCP request, the AG-UI events, the
@@ -270,9 +266,18 @@ async fn handle_tools_call(
         thread_id = %thread_id,
     );
     let _enter = span.enter();
+    let Some((active_tx, rx)) = entry.register_pending_on_active_sender(tool_call_id.clone())
+    else {
+        // Either no prompt is in flight or the SSE stream just ended. The
+        // atomic registration method guarantees no pending entry was created
+        // while teardown owned the sender lock.
+        return Json(JsonRpcResponse::ok(
+            id.clone(),
+            mcp_error_content("frontend tool call dropped: no active AG-UI prompt"),
+        ))
+        .into_response();
+    };
     tracing::info!("dispatching frontend tool call");
-
-    let rx = entry.register_pending(tool_call_id.clone());
 
     let dispatched = active_tx
         .send(BridgeStreamItem::FrontendToolCall {
@@ -282,7 +287,7 @@ async fn handle_tools_call(
         })
         .await;
     if dispatched.is_err() {
-        // Active sender went away between active_sender() and send.
+        // The sender closed after atomic registration but before dispatch.
         // Clean up the pending entry to avoid a leak.
         tracing::warn!("SSE stream closed before dispatch; aborting tool call");
         entry.resolve_pending(
@@ -379,6 +384,42 @@ mod tests {
     }
 
     #[test]
+    fn initialize_does_not_advertise_unimplemented_list_changed_notifications() {
+        let result = initialize_result();
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+    }
+
+    #[test]
+    fn jsonrpc_version_must_be_exactly_two_point_zero() {
+        let valid: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .unwrap();
+        assert_eq!(valid.jsonrpc.as_deref(), Some("2.0"));
+        assert!(
+            valid.id.is_none(),
+            "valid notification must stay a notification"
+        );
+
+        for version in [json!("1.0"), json!(2.0), Value::Null] {
+            let request: JsonRpcRequest = serde_json::from_value(json!({
+                "jsonrpc": version,
+                "id": 1,
+                "method": "initialize"
+            }))
+            .unwrap();
+            assert_ne!(request.jsonrpc.as_deref(), Some("2.0"));
+        }
+
+        let response = serde_json::to_value(JsonRpcResponse::invalid_request(json!(1))).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["error"]["message"], "Invalid Request");
+    }
+
+    #[test]
     fn jsonrpc_response_omits_optional_fields() {
         let r = JsonRpcResponse::ok(json!(1), json!({"x":1}));
         let s = serde_json::to_value(r).unwrap();
@@ -395,5 +436,16 @@ mod tests {
         assert_eq!(v["isError"], false);
         assert_eq!(v["content"][0]["type"], "text");
         assert_eq!(v["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn mcp_tool_failure_is_result_error_not_jsonrpc_error() {
+        let result = mcp_error_content("frontend failed");
+        let response = serde_json::to_value(JsonRpcResponse::ok(json!(1), result)).unwrap();
+
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(response["result"]["content"][0]["type"], "text");
+        assert_eq!(response["result"]["content"][0]["text"], "frontend failed");
     }
 }

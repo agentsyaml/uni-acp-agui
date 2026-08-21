@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use agent_client_protocol::schema::ProtocolVersion;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,6 +20,12 @@ pub enum BridgeError {
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
 
+    #[error("unsupported ACP protocol version: agent negotiated {actual}, expected {expected}")]
+    ProtocolVersionMismatch {
+        expected: ProtocolVersion,
+        actual: ProtocolVersion,
+    },
+
     #[error("session closed")]
     SessionClosed,
 
@@ -28,6 +35,15 @@ pub enum BridgeError {
     /// corresponding UI.
     #[error("agent does not support: {0}")]
     Unsupported(String),
+
+    #[error("ACP resume unsupported: {0}")]
+    ResumeUnsupported(String),
+
+    #[error("ACP resume failed: {0}")]
+    ResumeFailed(String),
+
+    #[error("prompt turn queue is full (limit {max_queued_turns})")]
+    QueueCapacity { max_queued_turns: usize },
 }
 
 #[cfg(test)]

@@ -1,11 +1,11 @@
 # agui-acp-bridge
 
-把 [ACP](https://agentcommunicationprotocol.dev/) Agent 接入 [AG-UI](https://docs.copilotkit.ai/ag-ui) 前端的 Rust 网关。
+面向受支持的 [ACP v1](https://agentclientprotocol.com/) 子集的 Rust Bridge，提供 [AG-UI](https://docs.copilotkit.ai/ag-ui) HTTP/SSE 与 frontend-tool 网关。项目使用 ACP SDK 2.0.0 的稳定 v1 schema；并不承诺实现 ACP 的全部方法或能力。
 
-- **ACP**：`acp-rust`、Claude Code、Kiro CLI 等 Agent 运行时使用的 JSON-RPC 协议
+- **ACP v1**：Bridge 与适配器实际使用的 JSON-RPC session/update 子集
 - **AG-UI**：CopilotKit 等前端框架使用的 HTTP/SSE 事件协议
 
-任何符合 ACP 规范的 Agent，套上这一层就能直接对接 AG-UI 前端。当前 `cargo test --workspace` 77 通过、0 失败；CI 包含 `build / clippy / fmt / test`。
+Bridge 把受支持的 ACP turn/update 翻译为 AG-UI 事件，并可选提供权限与 frontend-tool 通道。Agent 即使声明了子集之外的能力，Bridge 也不会因此实现这些能力。
 
 English: [README.md](./README.md)
 
@@ -20,7 +20,7 @@ cargo run -p agui-acp-bridge-cli -- --in-process
 另开一个终端发请求：
 
 ```bash
-curl -N -X POST http://localhost:8080/ \
+curl -N -X POST http://127.0.0.1:8080/ \
   -H 'Content-Type: application/json' \
   -H 'Accept: text/event-stream' \
   -d '{"threadId":"t1","runId":"r1","messages":[{"role":"user","id":"m1","content":"你好"}],"tools":[],"context":[],"forwardedProps":{},"state":{}}'
@@ -51,13 +51,13 @@ AG-UI 客户端 ──POST /──► BridgeHandler ──prompt()──► AcpS
 agui-acp-bridge [OPTIONS] [-- AGENT_COMMAND...]
 
   --in-process                       使用内置 Echo Agent（与 AGENT_COMMAND 互斥）
-  --host <IP>            0.0.0.0     绑定地址
+  --host <IP>            127.0.0.1   绑定地址
   --port, -p <PORT>      8080        绑定端口
   --cwd, -w <DIR>        .           传给每个 ACP 会话的工作目录
-  --policy <KIND>        auto-allow  auto-allow | auto-deny | allowlist | interrupt
+  --policy <KIND>        auto-deny   auto-allow | auto-deny | allowlist | interrupt
   --allow <TITLE>                    allowlist 下批准的工具 title（可重复或逗号分隔）
   --permission-timeout <SEC>   300   推迟决策的权限请求兜底超时
-  --idle-timeout <SEC>         1800  空闲会话被回收阈值（in-flight prompt 不会被回收）
+  --idle-timeout <SEC>          120  空闲会话被回收阈值（in-flight prompt 不会被回收）
   --open-session-timeout <SEC> 30    ACP 握手超时
   --event-buffer <N>           64    per-prompt 事件 channel 容量
 ```
@@ -69,16 +69,38 @@ agui-acp-bridge [OPTIONS] [-- AGENT_COMMAND...]
 | 路径        | 方法 | 说明                                                          |
 | ----------- | ---- | ------------------------------------------------------------- |
 | `/`         | POST | AG-UI `RunAgentInput` → AG-UI 事件 SSE 流（默认 16 MiB body 上限） |
-| `/health`   | GET  | `200 {"status":"ok","sessions":N}`                            |
+| `/health`   | GET  | `200 {"status":"ok"}`                                          |
 | `/sessions` | GET  | 通过 ACP `session/list` 列出 Agent 持久化的会话（不支持时返回 `501`） |
 | `/approval` | POST | 决议被 `--policy interrupt` 推迟的权限请求                    |
+| `/session/cancel` | POST | 取消缓存会话的当前 turn（不存在时返回 `404`） |
+| `/session/close` | POST | Agent 声明 `sessionCapabilities.close` 时优雅关闭缓存 ACP 会话 |
+| `/session/delete` | POST | Agent 声明 `sessionCapabilities.delete` 时从 `session/list` 移除持久化会话 |
+
+`POST /session/close` 接收 `{ "threadId": "..." }`，并使用初始化阶段返回的
+真实 ACP `SessionId`。成功返回 `204`；无缓存会话返回 `404`；存在 active/queued
+turn、active setting 或 pending frontend/permission 工作时返回 `409`；Agent 未声明 close 时返回
+`501`；ACP close error 返回 `502`；有界 close 超时返回 `504`。成功、失败和超时
+都会移除本地会话及 pending frontend 状态；不支持 close 时保留会话以便继续复用。
+空闲回收和 LRU 容量淘汰也会先复用同一 graceful-close 路径，再丢弃空闲 entry。
+生命周期 close 或 eviction 占有 thread 期间，会话设置端点返回 `409`；普通设置
+仍可排在 prompt 后执行。
+
+`POST /session/delete` 接收 `{ "threadId": "..." }`，Agent 接受 ACP
+`session/delete` 后返回 `204`。active 或 pending 本地工作返回 `409`；未声明 delete
+返回 `501`；ACP error 返回 `502`；有界超时返回 `504`。Delete 的语义是从 Agent 的
+`session/list` 中移除会话，ACP 不保证底层所有 artifact 都被硬删除。终态 delete
+结果会清理缓存别名和本地 frontend 状态；不支持 delete 时保留缓存会话以便复用。
+
+ACP v1 content update 中的 `MessageId` 会映射到对应的 AG-UI 文本/推理
+消息生命周期，并与 AG-UI `runId`、Bridge turn ID、MCP `toolCallId` 保持独立；
+Bridge 生成的 synthetic event 使用自身的 fallback ID。
 
 ### 会话历史（`/sessions` + 恢复）
 
 当 ACP Agent 声明了 `session/list` 与 `loadSession` 能力时，桥以**无状态**方式透传——自身不存任何历史：
 
 - `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`，其中 `sessionId` 即用于恢复的 AG-UI `threadId`。
-- **恢复**会话：POST 一个 `threadId` 等于该 `sessionId`、且 `forwardedProps` 含 `{"acpResume": true}` 的 run。缓存未命中时桥发起 `session/load`，Agent 回放的历史会先以 AG-UI 事件流回前端，再进行新一轮对话。若 Agent 不支持 `loadSession`，桥会透明回退为新建会话。
+- **恢复**会话：POST 一个 `threadId` 等于该 `sessionId`、且 `forwardedProps` 含 `{"acpResume": true}` 的 run。只有这个显式 marker 会启用私有恢复路径；缓存未命中时桥发起 `session/load`，Agent 回放的历史会先以 AG-UI 事件流回前端，再进行新一轮对话。若不支持 `loadSession` 或 `session/load` 失败，桥返回非成功 AG-UI run error，绝不会回退为 `session/new`。
 
 
 `/approval` 请求体与状态码：
@@ -100,15 +122,15 @@ ACP Agent 在执行工具前会发 `requestPermission`，Bridge 把决策委托�
 
 | 策略                    | 行为                                                                          |
 | ----------------------- | ----------------------------------------------------------------------------- |
-| `AutoAllow`（默认）     | 批准所有 `requestPermission`                                                  |
-| `AutoDeny`              | 拒绝所有 `requestPermission`                                                  |
+| `AutoDeny`（默认）      | 拒绝所有 `requestPermission`                                                  |
+| `AutoAllow`             | 批准所有 `requestPermission`                                                  |
 | `Allowlist`             | 仅批准 `title` 在配置集合中的工具调用                                         |
 | `InterruptViaAgUiEvent` | 通过 `STATE_SNAPSHOT` 事件把决策交给前端，前端再走 `POST /approval` 答复     |
 
 自定义策略：
 
 ```rust
-use agent_client_protocol::schema::RequestPermissionRequest;
+use agent_client_protocol::schema::v1::RequestPermissionRequest;
 use agui_acp_bridge_core::{PermissionDecision, PermissionPolicy};
 use async_trait::async_trait;
 
@@ -140,6 +162,11 @@ let router = build_router(state);
 // axum::serve(listener, router).await?;
 ```
 
+`ProcessAcpClient` 会通过 ACP 2.0 的结构化配置传递 `command`、每个
+`with_args(...)` 参数和 `with_env(...)` 环境覆盖；含空格的 argv 会保持为
+单个参数，环境变量也会真正传给子进程。`SessionConfig.cwd` 仍是 ACP 会话的
+工作目录，不是进程启动配置。
+
 `InProcessAcpClient::new()` 替换 `ProcessAcpClient` 即开发模式。需要换策略或调超时时用 builder：
 
 ```rust
@@ -160,7 +187,7 @@ BridgeAppState::builder(client, PathBuf::from("."))
 | ------------------------ | ------------------------------------------------------------------------------------------------- |
 | `agui-acp-bridge-core`   | `AcpClient` trait、`ProcessAcpClient` / `InProcessAcpClient`、`Translator`、`BridgeConfig`        |
 | `agui-acp-bridge-policy` | `PermissionPolicy` 实现：`AutoAllow` / `AutoDeny` / `Allowlist` / `InterruptViaAgUiEvent`         |
-| `agui-acp-bridge-server` | `BridgeHandler`、`BridgeAppState`、`build_router`（axum 路由 + `/health` + `/approval`）          |
+| `agui-acp-bridge-server` | `BridgeHandler`、`BridgeAppState`、`build_router`、AG-UI SSE/会话路由、鉴权与 frontend-tool MCP |
 | `agui-acp-bridge-cli`    | `agui-acp-bridge` 二进制                                                                          |
 
 `crates/agui-acp-bridge-server/examples/` 下有三份端到端 demo：
@@ -173,13 +200,31 @@ cargo run -p agui-acp-bridge-server --example 03_custom_policy     -- ./my_agent
 
 ## 测试与开发
 
+Rust 检查（本地与 CI 使用同一组核心命令）：
+
 ```bash
-just ci      # build + clippy + fmt + test 全跑通才算 OK
-just test    # 仅跑测试
-just fmt     # 格式化
+cargo test --workspace --all-targets --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --all-targets --no-default-features --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-子进程集成测试需要 `acp-rust` 同级 checkout，缺失时自动跳过；可通过 `ACP_RUST_PATH` 指定其他位置。设计决策与每轮重构记录见 [`REFACTOR_PROGRESS.md`](./REFACTOR_PROGRESS.md)。
+Frontend 检查：
+
+```bash
+cd examples/copilotkit-acp-demo
+bun install --frozen-lockfile
+bun run type-check
+bun run lint
+bun run build
+```
+
+GitHub Actions 会在 Rust `1.88.0` 与 `stable` 上覆盖 default、all-features、
+no-default-features 测试，并执行 stable fmt/Clippy、Bun 前端检查/构建和依赖审计。
+前端 high advisories 只报告不阻断；critical advisories 会使 security job 失败。
+可选的子进程 smoke 测试使用同级 `acp-rust` checkout，缺失时跳过；可用
+`ACP_RUST_PATH` 指定其他位置。
 
 ## 依赖说明
 

@@ -11,7 +11,7 @@ name = "agui-acp-bridge"
 path = "src/main.rs"
 
 [features]
-default = ["unstable_session_model", "unstable_session_usage"]
+default = ["unstable_session_usage"]
 unstable_session_model = [
     "agui-acp-bridge-core/unstable_session_model",
     "agui-acp-bridge-server/unstable_session_model",

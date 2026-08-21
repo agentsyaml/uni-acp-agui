@@ -6,11 +6,14 @@
 
 mod support;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use agui_acp_bridge_policy::AutoAllow;
+use agui_acp_bridge_policy::{AutoAllow, InterruptViaAgUiEvent};
 use agui_acp_bridge_server::{
-    AcpClient, BridgeAppState, acp::CustomAgentInProcessClient, test_agents,
+    AcpClient, BridgeAppState, BridgeConfig, SessionConfig, acp::CustomAgentInProcessClient,
+    test_agents,
 };
 use axum::http::StatusCode;
 
@@ -27,6 +30,17 @@ where
         + 'static,
 {
     Arc::new(CustomAgentInProcessClient::new(factory))
+}
+
+fn session_config() -> SessionConfig {
+    SessionConfig {
+        cwd: PathBuf::from("/"),
+        policy: Arc::new(AutoAllow),
+        config: BridgeConfig::default(),
+        mcp_url: None,
+        mcp_headers: Vec::new(),
+        load_session_id: None,
+    }
 }
 
 #[tokio::test]
@@ -435,7 +449,7 @@ async fn validates_auto_deny_consults_policy_then_returns_cancelled() {
 }
 
 #[tokio::test]
-async fn validates_health_endpoint_reports_session_count() {
+async fn validates_health_endpoint_returns_minimal_body() {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use http_body_util::BodyExt;
@@ -460,13 +474,9 @@ async fn validates_health_endpoint_reports_session_count() {
         .expect("collect health body")
         .to_bytes();
     let text = String::from_utf8_lossy(&bytes);
-    assert!(
-        text.contains("\"status\":\"ok\""),
-        "health body must report status:ok, got: {text}"
-    );
-    assert!(
-        text.contains("\"sessions\":1"),
-        "health body must report 1 cached session after one prompt, got: {text}"
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        serde_json::json!({"status": "ok"})
     );
 }
 
@@ -653,10 +663,10 @@ async fn wait_for_state_snapshot(stream: &mut tokio::net::TcpStream) -> Option<s
         for line in accumulated.lines() {
             if let Some(payload) = line.strip_prefix("data:") {
                 let payload = payload.trim();
-                if payload.contains("\"type\":\"STATE_SNAPSHOT\"") {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-                        return Some(v);
-                    }
+                if payload.contains("\"type\":\"STATE_SNAPSHOT\"")
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+                {
+                    return Some(v);
                 }
             }
         }
@@ -714,6 +724,401 @@ async fn validates_defer_with_permission_timeout_falls_back_to_cancelled() {
         body.contains("\"type\":\"RUN_FINISHED\""),
         "after timeout the agent receives Cancelled and finishes the turn, body:\n{body}"
     );
+}
+
+#[tokio::test]
+async fn validates_cancel_drains_multiple_pending_permissions() {
+    let mut cfg = session_config();
+    cfg.policy = Arc::new(InterruptViaAgUiEvent);
+    cfg.config.cancel_grace_timeout = Duration::from_secs(1);
+    let handle = client_for(test_agents::run_multiple_pending_permission_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+    let mut prompt = handle.prompt("cancel two").await.expect("prompt opens");
+
+    let mut interrupt_count = 0;
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(2), prompt.events.recv())
+            .await
+            .expect("permission events must arrive")
+            .expect("prompt event stream must remain open");
+        match item {
+            agui_acp_bridge_server::BridgeStreamItem::Interrupt { .. } => {
+                interrupt_count += 1;
+                if interrupt_count == 2 {
+                    break;
+                }
+            }
+            agui_acp_bridge_server::BridgeStreamItem::SessionInit { .. }
+            | agui_acp_bridge_server::BridgeStreamItem::Update(_) => {}
+            other => panic!("unexpected item before permissions: {other:?}"),
+        }
+    }
+    assert_eq!(handle.pending_permissions().len(), 2);
+
+    handle.cancel().expect("cancel must be accepted");
+    assert_eq!(
+        handle.pending_permissions().len(),
+        0,
+        "cancel must drain every pending permission"
+    );
+
+    let mut saw_cancel_tail = false;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(2), prompt.events.recv())
+        .await
+        .expect("cancelled prompt must finish")
+    {
+        if matches!(
+            &item,
+            agui_acp_bridge_server::BridgeStreamItem::Update(
+                agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(_)
+            )
+        ) {
+            saw_cancel_tail = true;
+        }
+        if matches!(
+            item,
+            agui_acp_bridge_server::BridgeStreamItem::Finished { .. }
+        ) {
+            break;
+        }
+    }
+    assert!(
+        saw_cancel_tail,
+        "cancel must continue receiving final updates"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(2), prompt.finished)
+        .await
+        .expect("finished oneshot must resolve")
+        .expect("finished sender must remain")
+        .expect("prompt should return a stop reason");
+    assert_eq!(
+        result,
+        agent_client_protocol::schema::v1::StopReason::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn validates_immediate_cancel_wakes_prompt_start_path() {
+    let mut cfg = session_config();
+    cfg.config.cancel_grace_timeout = Duration::from_secs(1);
+    let handle = client_for(test_agents::run_cancel_aware_slow_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+    let prompt = handle
+        .prompt("cancel immediately")
+        .await
+        .expect("prompt opens");
+
+    // Cancel before yielding to the actor. This pins the prompt-start path
+    // where the cancellation waiter is registered and must not lose the wake.
+    handle.cancel().expect("cancel must be accepted");
+    let result = tokio::time::timeout(Duration::from_secs(2), prompt.finished)
+        .await
+        .expect("immediate cancel must finish")
+        .expect("finished sender must remain")
+        .expect("prompt should return a stop reason");
+    assert_eq!(
+        result,
+        agent_client_protocol::schema::v1::StopReason::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn validates_queued_turn_disconnect_cannot_cancel_active_turn() {
+    let mut cfg = session_config();
+    cfg.config.cancel_grace_timeout = Duration::from_secs(1);
+    let handle = client_for(test_agents::run_cancel_aware_slow_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+
+    let (first, first_turn) = handle
+        .prompt_with_turn("active")
+        .await
+        .expect("first prompt opens");
+    let (second, second_turn) = handle
+        .prompt_with_turn("queued")
+        .await
+        .expect("second prompt opens");
+    assert_ne!(
+        first_turn, second_turn,
+        "queued prompt turns must have distinct identities"
+    );
+
+    // This is the SSE-disconnect cleanup equivalent for the queued stream.
+    // Dropping/cancelling B must not send session/cancel for active A.
+    handle
+        .cancel_turn(second_turn)
+        .expect("queued turn cancel must be accepted");
+    drop(second);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), first.finished)
+        .await
+        .expect("active prompt must finish")
+        .expect("finished sender must remain")
+        .expect("prompt should return a stop reason");
+    assert_eq!(
+        result,
+        agent_client_protocol::schema::v1::StopReason::EndTurn,
+        "cancelling queued B must leave active A running"
+    );
+}
+
+#[tokio::test]
+async fn validates_prompt_queue_capacity_rejects_without_disturbing_active_turn() {
+    let mut cfg = session_config();
+    cfg.config.max_queued_turns = 1;
+    let handle = client_for(test_agents::run_cancel_aware_slow_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+
+    let (active, _) = handle
+        .prompt_with_turn("active")
+        .await
+        .expect("active prompt opens");
+    let rejected = handle.prompt_with_turn("over capacity").await;
+    assert!(matches!(
+        rejected,
+        Err(agui_acp_bridge_server::BridgeError::QueueCapacity {
+            max_queued_turns: 1
+        })
+    ));
+
+    let result = tokio::time::timeout(Duration::from_secs(2), active.finished)
+        .await
+        .expect("active prompt must finish")
+        .expect("finished sender must remain")
+        .expect("prompt should return a stop reason");
+    assert_eq!(
+        result,
+        agent_client_protocol::schema::v1::StopReason::EndTurn
+    );
+}
+
+#[tokio::test]
+async fn validates_capacity_permit_survives_setting_entry_until_release() {
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opens_for_client = opens.clone();
+    let client = client_for(move |stream| {
+        opens_for_client.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        test_agents::run_unresponsive_setting_agent(stream)
+    });
+    let state = BridgeAppState::builder(client, PathBuf::from("/"))
+        .with_config(BridgeConfig {
+            max_sessions: 1,
+            set_session_timeout: Duration::from_millis(200),
+            ..BridgeConfig::default()
+        })
+        .build();
+
+    let (status, _) = collect_sse_body(
+        state.clone(),
+        user_input("setting-holder", "run-1", "materialize"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let setting_state = state.clone();
+    let setting = tokio::spawn(async move {
+        setting_state
+            .set_session_config_option("setting-holder", "mode", "code")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let (rejected_status, rejected_body) = collect_sse_body(
+        state.clone(),
+        user_input("setting-contender", "run-1", "must reject"),
+    )
+    .await;
+    assert_eq!(rejected_status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(rejected_body.contains("ACP_SESSION_CAPACITY"));
+    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        !state.frontend_tools().has("setting-contender"),
+        "capacity failure must remove the speculative frontend entry"
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), setting)
+        .await
+        .expect("setting timeout must be bounded")
+        .expect("setting task must not panic");
+
+    let (status, body) = collect_sse_body(
+        state,
+        user_input("setting-after-release", "run-1", "can open now"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "capacity must be reusable after release: {body}"
+    );
+    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn validates_actor_exit_clears_queued_turns_and_closes_handle() {
+    let mut cfg = session_config();
+    cfg.config.set_session_timeout = Duration::from_millis(100);
+    cfg.config.max_queued_turns = 2;
+    let handle = client_for(test_agents::run_unresponsive_setting_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+
+    let setting = handle.set_config_option("mode", "code");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let queued = handle
+        .prompt_with_turn("queued behind setting")
+        .await
+        .expect("queued prompt admission should succeed before actor exit")
+        .0;
+
+    let _setting_result = tokio::time::timeout(Duration::from_secs(2), setting)
+        .await
+        .expect("setting actor timeout must finish");
+    let _queued_result = tokio::time::timeout(Duration::from_secs(2), queued.finished)
+        .await
+        .expect("queued stream must be released when actor exits");
+
+    assert!(handle.is_unusable());
+    assert!(matches!(
+        handle.prompt_with_turn("after actor exit").await,
+        Err(agui_acp_bridge_server::BridgeError::SessionClosed)
+    ));
+}
+
+#[tokio::test]
+async fn validates_permission_registration_after_cancel_is_cancelled() {
+    let mut cfg = session_config();
+    cfg.policy = Arc::new(InterruptViaAgUiEvent);
+    cfg.config.cancel_grace_timeout = Duration::from_secs(1);
+    let handle = client_for(test_agents::run_permission_after_cancel_agent)
+        .open_session(cfg)
+        .await
+        .expect("session opens");
+    let mut prompt = handle.prompt("cancel race").await.expect("prompt opens");
+
+    loop {
+        let item = tokio::time::timeout(Duration::from_secs(2), prompt.events.recv())
+            .await
+            .expect("first permission must arrive")
+            .expect("prompt event stream must remain open");
+        if matches!(
+            item,
+            agui_acp_bridge_server::BridgeStreamItem::Interrupt { .. }
+        ) {
+            break;
+        }
+    }
+    handle.cancel().expect("cancel must be accepted");
+    assert_eq!(handle.pending_permissions().len(), 0);
+
+    let mut late_interrupts = 0;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(2), prompt.events.recv())
+        .await
+        .expect("cancel race must finish")
+    {
+        if matches!(
+            item,
+            agui_acp_bridge_server::BridgeStreamItem::Interrupt { .. }
+        ) {
+            late_interrupts += 1;
+        }
+        if matches!(
+            item,
+            agui_acp_bridge_server::BridgeStreamItem::Finished { .. }
+        ) {
+            break;
+        }
+    }
+    assert_eq!(
+        late_interrupts, 0,
+        "late permission must not be re-registered"
+    );
+    assert_eq!(handle.pending_permissions().len(), 0);
+    let result = tokio::time::timeout(Duration::from_secs(2), prompt.finished)
+        .await
+        .expect("finished oneshot must resolve")
+        .expect("finished sender must remain")
+        .expect("prompt should return a stop reason");
+    assert_eq!(
+        result,
+        agent_client_protocol::schema::v1::StopReason::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn validates_cancel_grace_timeout_evicts_session_before_reuse() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opens_for_client = opens.clone();
+    let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+        let first = opens_for_client.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                test_agents::run_unresponsive_cancel_agent(stream).await
+            } else {
+                test_agents::run_single_chunk_agent(stream).await
+            }
+        })
+    }));
+    let state = BridgeAppState::builder(client, PathBuf::from("/"))
+        .with_config(BridgeConfig {
+            cancel_grace_timeout: Duration::from_millis(100),
+            ..BridgeConfig::default()
+        })
+        .build();
+    let app = agui_acp_bridge_server::build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let body =
+        serde_json::to_vec(&user_input("thread-unknown-after-cancel", "run-1", "hang")).unwrap();
+    let mut first_stream = raw_post(addr, "/", body, "Accept: text/event-stream\r\n").await;
+    let mut started = vec![0u8; 1024];
+    let _ = tokio::time::timeout(Duration::from_secs(2), first_stream.read(&mut started))
+        .await
+        .expect("first run must start");
+
+    let cancel_body =
+        serde_json::to_vec(&serde_json::json!({"threadId": "thread-unknown-after-cancel"}))
+            .unwrap();
+    let mut cancel_response = raw_post(addr, "/session/cancel", cancel_body, "").await;
+    assert_eq!(read_status_code(&mut cancel_response).await, StatusCode::OK);
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        drain_to_end_local(&mut first_stream),
+    )
+    .await
+    .expect("cancelled unresponsive run must terminate");
+
+    assert_eq!(state.session_count(), 0, "unknown session must be evicted");
+
+    let (status, second_body) = collect_sse_body(
+        state,
+        user_input("thread-unknown-after-cancel", "run-2", "fresh"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "new session must be usable");
+    assert!(
+        second_body.contains("only chunk") && second_body.contains("RUN_FINISHED"),
+        "same thread must create a fresh ACP session after timeout:\n{second_body}"
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -828,10 +1233,9 @@ async fn validates_approval_endpoint_returns_422_for_unknown_option_id() {
 #[tokio::test]
 async fn validates_concurrent_first_use_creates_exactly_one_session() {
     // Fan in 8 concurrent prompts on the same thread_id when no session
-    // exists yet. Without the per-key async lock in `session_for`, multiple
-    // would race past the cache-miss check, each open a session, and only
-    // one would survive `or_insert_with` — wasting agent processes.
-    let state = state_with_client(client_for(test_agents::run_single_chunk_agent));
+    // exists yet. The per-thread admission gate allows exactly one run to
+    // proceed; the rest fail fast rather than queueing behind it.
+    let state = state_with_client(client_for(|s| test_agents::run_slow_prompt_agent(s, 100)));
 
     let mut handles = Vec::new();
     for i in 0..8 {
@@ -839,19 +1243,71 @@ async fn validates_concurrent_first_use_creates_exactly_one_session() {
         handles.push(tokio::spawn(async move {
             let (status, body) =
                 collect_sse_body(s, user_input("thread-race", &format!("run-{i}"), "ping")).await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(body.contains("\"type\":\"RUN_FINISHED\""));
+            (i, status, body)
         }));
     }
+
+    let mut finished = 0;
+    let mut concurrent_errors = 0;
     for h in handles {
-        h.await.unwrap();
+        let (i, status, body) = h.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "run-{i} body:\n{body}");
+        assert_eq!(count_events(&body, "RUN_STARTED"), 1, "run-{i}: {body}");
+        assert!(
+            body.contains(&format!("\"runId\":\"run-{i}\"")),
+            "response must identify run-{i}:\n{body}"
+        );
+
+        let events = extract_event_types(&body);
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("RUN_STARTED"),
+            "run-{i} must start with RUN_STARTED: {body}"
+        );
+        assert_eq!(
+            count_events(&body, "RUN_FINISHED") + count_events(&body, "RUN_ERROR"),
+            1,
+            "run-{i} must have exactly one terminal event: {body}"
+        );
+
+        if count_events(&body, "RUN_FINISHED") == 1 {
+            finished += 1;
+            assert_eq!(events.last().map(String::as_str), Some("RUN_FINISHED"));
+            assert!(!body.contains("CONCURRENT_RUN"), "run-{i} body:\n{body}");
+        } else {
+            concurrent_errors += 1;
+            assert_eq!(events.last().map(String::as_str), Some("RUN_ERROR"));
+            assert!(
+                body.contains("\"code\":\"CONCURRENT_RUN\""),
+                "run-{i} must fail at admission: {body}"
+            );
+            assert!(!body.contains("RUN_FINISHED"), "run-{i} body:\n{body}");
+        }
     }
+
+    assert_eq!(finished, 1, "exactly one run must win admission");
+    assert_eq!(
+        concurrent_errors, 7,
+        "seven runs must be rejected immediately"
+    );
 
     assert_eq!(
         state.session_count(),
         1,
         "concurrent first-use must lazily create exactly one session, got {}",
         state.session_count()
+    );
+
+    let (status, body) =
+        collect_sse_body(state, user_input("thread-race", "run-after", "after")).await;
+    assert_eq!(status, StatusCode::OK, "sequential follow-up body:\n{body}");
+    assert!(
+        body.contains("\"runId\":\"run-after\"") && body.contains("\"type\":\"RUN_FINISHED\""),
+        "claim must be released for a later run:\n{body}"
+    );
+    assert!(
+        !body.contains("CONCURRENT_RUN"),
+        "follow-up must not be rejected:\n{body}"
     );
 }
 
@@ -935,7 +1391,30 @@ async fn validates_long_running_agent_cancelled_when_client_disconnects() {
     server.abort();
 }
 
-// --- Mode / Model surface (ACP `session/set_mode`, `session/set_model`) ---
+#[tokio::test]
+async fn validates_resident_session_rejects_non_v1_before_session_new() {
+    let result = client_for(test_agents::run_wrong_protocol_agent)
+        .open_session(session_config())
+        .await;
+    match result {
+        Err(agui_acp_bridge_server::BridgeError::ProtocolVersionMismatch { .. }) => {}
+        other => panic!("expected explicit protocol mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn validates_list_session_rejects_non_v1_before_session_list() {
+    let result = agui_acp_bridge_core::list_sessions_in_process_with(session_config(), |stream| {
+        Box::pin(test_agents::run_wrong_protocol_list_agent(stream))
+    })
+    .await;
+    match result {
+        Err(agui_acp_bridge_server::BridgeError::ProtocolVersionMismatch { .. }) => {}
+        other => panic!("expected explicit list protocol mismatch, got {other:?}"),
+    }
+}
+
+// --- Mode / Model / config-option surface ---
 
 #[cfg(feature = "unstable_session_model")]
 #[tokio::test]
@@ -976,9 +1455,34 @@ async fn validates_session_init_event_advertises_modes_and_models() {
         body.contains("\"availableModels\"") && body.contains("\"claude-sonnet\""),
         "expected availableModels with claude-sonnet entry, body:\n{body}"
     );
+    assert!(
+        body.contains("\"configOptions\""),
+        "expected configOptions in the stable session-init event, body:\n{body}"
+    );
+    assert!(
+        body.contains("\"id\":\"mode\"") && body.contains("\"id\":\"model\""),
+        "expected discovered mode/model config options, body:\n{body}"
+    );
 }
 
-#[cfg(feature = "unstable_session_model")]
+#[tokio::test]
+async fn validates_config_option_update_replaces_cached_snapshot() {
+    let state = state_with_client(client_for(test_agents::run_config_update_agent));
+    let (status, body) = collect_sse_body(
+        state.clone(),
+        user_input("thread-config-update", "run-config-update", "update"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    let options = state
+        .session_init_state("thread-config-update")
+        .and_then(|init| init.config_options)
+        .expect("config options must remain cached");
+    assert_eq!(options.len(), 1, "update must replace, not merge, options");
+    assert_eq!(options[0].id.0.as_ref(), "replacement");
+    assert!(body.contains("config updated"));
+}
+
 #[tokio::test]
 async fn validates_set_mode_endpoint_round_trips_through_agent() {
     use std::time::Duration;
@@ -1024,6 +1528,32 @@ async fn validates_set_mode_endpoint_round_trips_through_agent() {
         "current_mode_id must move to 'code' after set-mode"
     );
 
+    // The explicit server-facing route uses the same stable wire method.
+    let config_payload = serde_json::to_vec(&serde_json::json!({
+        "threadId": "thread-set-mode",
+        "configId": "model",
+        "value": "gpt-4o",
+    }))
+    .unwrap();
+    let mut config_resp = raw_post(addr, "/session/set-config-option", config_payload, "").await;
+    assert_eq!(read_status_code(&mut config_resp).await, StatusCode::OK);
+    let init = state
+        .session_init_state("thread-set-mode")
+        .expect("session must remain cached");
+    assert!(
+        init.config_options.as_ref().is_some_and(|options| {
+            options.iter().any(|option| {
+                option.id.0.as_ref() == "model"
+                    && matches!(
+                        &option.kind,
+                        agent_client_protocol::schema::v1::SessionConfigKind::Select(select)
+                            if select.current_value.0.as_ref() == "gpt-4o"
+                    )
+            })
+        }),
+        "set-config-option must replace the cached full list"
+    );
+
     // 4. Unknown mode → 422 (agent rejects)
     let bad =
         serde_json::to_vec(&serde_json::json!({"threadId": "thread-set-mode", "modeId": "wat"}))
@@ -1048,9 +1578,30 @@ async fn validates_set_mode_endpoint_round_trips_through_agent() {
     server.abort();
 }
 
-#[cfg(feature = "unstable_session_model")]
 #[tokio::test]
-async fn validates_set_model_endpoint_round_trips_through_agent() {
+async fn validates_mixed_mode_capabilities_fall_back_to_legacy_set_mode() {
+    let state = state_with_client(client_for(test_agents::run_mixed_mode_capabilities_agent));
+    let (status, body) = collect_sse_body(
+        state.clone(),
+        user_input("thread-mixed-mode", "run-1", "boot"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+
+    state
+        .set_session_mode("thread-mixed-mode", "code")
+        .await
+        .expect("legacy session/set_mode fallback must succeed");
+    assert_eq!(
+        state
+            .session_init_state("thread-mixed-mode")
+            .and_then(|init| init.modes.map(|m| m.current_mode_id)),
+        Some("code".to_string())
+    );
+}
+
+#[tokio::test]
+async fn validates_set_model_alias_uses_config_option_wire_method() {
     use std::time::Duration;
     use tokio::net::TcpListener;
 
@@ -1080,10 +1631,24 @@ async fn validates_set_model_endpoint_round_trips_through_agent() {
     let init = state
         .session_init_state("thread-set-model")
         .expect("session must exist");
+    #[cfg(feature = "unstable_session_model")]
     assert_eq!(
         init.models.as_ref().map(|m| m.current_model_id.as_str()),
         Some("claude-sonnet"),
         "current_model_id must move after set-model"
+    );
+    assert!(
+        init.config_options.as_ref().is_some_and(|options| {
+            options.iter().any(|option| {
+                option.id.0.as_ref() == "model"
+                    && matches!(
+                        &option.kind,
+                        agent_client_protocol::schema::v1::SessionConfigKind::Select(select)
+                            if select.current_value.0.as_ref() == "claude-sonnet"
+                    )
+            })
+        }),
+        "model alias must replace the complete config-option cache"
     );
 
     let bad = serde_json::to_vec(
@@ -1137,11 +1702,14 @@ async fn validates_session_init_endpoint_returns_modes_and_models() {
         body.contains("\"availableModels\"") && body.contains("\"gpt-4o\""),
         "GET /session/init body must include models, body:\n{body}"
     );
+    assert!(
+        body.contains("\"configOptions\"") && body.contains("\"id\":\"mode\""),
+        "GET /session/init body must include config options, body:\n{body}"
+    );
 
     server.abort();
 }
 
-#[cfg(feature = "unstable_session_model")]
 #[tokio::test]
 async fn validates_set_mode_then_next_prompt_session_init_reflects_change() {
     // End-to-end cache-coherence guarantee: after a successful
@@ -1195,7 +1763,6 @@ async fn validates_set_mode_then_next_prompt_session_init_reflects_change() {
     server.abort();
 }
 
-#[cfg(feature = "unstable_session_model")]
 #[tokio::test]
 async fn validates_session_init_event_uses_null_for_missing_modes_and_models() {
     // Schema-stability guarantee: even when the agent advertises neither
@@ -1219,19 +1786,23 @@ async fn validates_session_init_event_uses_null_for_missing_modes_and_models() {
     );
 }
 
-#[cfg(feature = "unstable_session_model")]
 #[tokio::test]
-async fn validates_set_mode_runs_concurrently_with_in_flight_prompt() {
-    // Regression for: actor used to handle commands serially, so a
-    // SetMode arriving during a long-running prompt would queue behind
-    // it and only execute after `finished` — a 60s prompt would make
-    // the picker permanently spinning. We now `tokio::spawn` SetMode
-    // off the dispatch loop so it round-trips while the prompt is
-    // still streaming.
+async fn validates_settings_wait_for_prompt_and_expired_call_is_not_applied() {
+    // Settings are actor-serial: a command sent while a prompt is active
+    // waits behind that prompt. If the HTTP caller times out first, the
+    // queued command must be discarded rather than applied later.
     use std::time::Duration;
     use tokio::net::TcpListener;
 
-    let state = state_with_client(client_for(test_agents::run_modes_models_agent));
+    let state = BridgeAppState::builder(
+        client_for(test_agents::run_modes_models_agent),
+        PathBuf::from("/"),
+    )
+    .with_config(BridgeConfig {
+        set_session_timeout: Duration::from_millis(50),
+        ..BridgeConfig::default()
+    })
+    .build();
     let app = agui_acp_bridge_server::build_router(state.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1246,44 +1817,131 @@ async fn validates_set_mode_runs_concurrently_with_in_flight_prompt() {
     let _ = tokio::time::timeout(Duration::from_secs(3), drain_to_end_local(&mut conn)).await;
     drop(conn);
 
-    // Open a second SSE connection. We immediately read just enough
-    // to know the stream started (RUN_STARTED), then POST set-mode
-    // BEFORE the prompt finishes. The mock agent's prompt completes
-    // quickly, but the structural property under test is that
-    // SetMode is dispatched off the actor loop — we assert end-to-end
-    // latency is well below `set_session_timeout`.
+    // Open a second SSE connection and read just enough to know the prompt
+    // is active. The fixture holds it for 250ms.
     let body2 = serde_json::to_vec(&user_input("thread-conc", "run-2", "stay")).unwrap();
     let mut blocked = raw_post(addr, "/", body2, "Accept: text/event-stream\r\n").await;
     use tokio::io::AsyncReadExt;
     let mut hdr = vec![0u8; 1024];
     let _ = tokio::time::timeout(Duration::from_secs(2), blocked.read(&mut hdr)).await;
 
+    // The setting request times out while the prompt is still running.
     let payload =
         serde_json::to_vec(&serde_json::json!({"threadId": "thread-conc", "modeId": "code"}))
             .unwrap();
-    let started = std::time::Instant::now();
     let mut resp = raw_post(addr, "/session/set-mode", payload, "").await;
     let code = read_status_code(&mut resp).await;
-    let elapsed = started.elapsed();
-    drop(blocked);
-
     assert_eq!(
         code,
-        StatusCode::OK,
-        "set-mode must succeed during in-flight prompt"
+        StatusCode::REQUEST_TIMEOUT,
+        "set-mode must wait for the actor and then time out"
     );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "set-mode took {elapsed:?}; this implies it queued behind the prompt"
-    );
+
+    // Let the prompt finish and give the actor a chance to observe that the
+    // timed-out setting responder was dropped. It must not apply "code".
+    let trailer = tokio::time::timeout(Duration::from_secs(3), drain_to_end_local(&mut blocked))
+        .await
+        .expect("prompt must finish after the setting timeout");
+    assert!(trailer.contains("\"type\":\"RUN_FINISHED\""));
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let init = state
         .session_init_state("thread-conc")
         .expect("session must exist");
     assert_eq!(
         init.modes.as_ref().map(|m| m.current_mode_id.as_str()),
-        Some("code"),
+        Some("ask"),
+        "a timed-out queued setting must not apply after the prompt"
     );
+
+    // A fresh setting after the prompt still works and updates the cache.
+    let payload =
+        serde_json::to_vec(&serde_json::json!({"threadId": "thread-conc", "modeId": "code"}))
+            .unwrap();
+    let mut resp = raw_post(addr, "/session/set-mode", payload, "").await;
+    assert_eq!(read_status_code(&mut resp).await, StatusCode::OK);
+    assert_eq!(
+        state
+            .session_init_state("thread-conc")
+            .and_then(|init| init.modes.map(|m| m.current_mode_id)),
+        Some("code".to_string())
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn validates_unresponsive_setting_rpc_is_bounded_and_evicts_session() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opens_for_client = opens.clone();
+    let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+        let first = opens_for_client.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                test_agents::run_unresponsive_setting_agent(stream).await
+            } else {
+                test_agents::run_single_chunk_agent(stream).await
+            }
+        })
+    }));
+    let state = BridgeAppState::builder(client, PathBuf::from("/"))
+        .with_config(BridgeConfig {
+            set_session_timeout: Duration::from_millis(100),
+            ..BridgeConfig::default()
+        })
+        .build();
+
+    let (status, body) = collect_sse_body(
+        state.clone(),
+        user_input("thread-setting-timeout", "run-1", "boot"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "initial prompt must succeed: {body}"
+    );
+
+    let app = agui_acp_bridge_server::build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let payload = serde_json::to_vec(
+        &serde_json::json!({"threadId": "thread-setting-timeout", "modeId": "code"}),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let mut response = raw_post(addr, "/session/set-mode", payload, "").await;
+    let code = read_status_code(&mut response).await;
+    let elapsed = started.elapsed();
+    assert_eq!(code, StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "unresponsive setting RPC must have a bounded return: {elapsed:?}"
+    );
+
+    // The actor-side timeout marks the session unusable; the next cache read
+    // evicts it instead of exposing a state that may have changed late.
+    assert!(
+        state.session_init_state("thread-setting-timeout").is_none(),
+        "timed-out setting session must be evicted"
+    );
+    assert_eq!(state.session_count(), 0);
+
+    let (status, fresh_body) = collect_sse_body(
+        state,
+        user_input("thread-setting-timeout", "run-2", "fresh"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fresh_body.contains("only chunk"));
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
 
     server.abort();
 }
@@ -1325,7 +1983,6 @@ async fn read_status_and_body(stream: &mut tokio::net::TcpStream) -> (StatusCode
     )
 }
 
-#[cfg(feature = "unstable_session_model")]
 async fn drain_to_end_local(stream: &mut tokio::net::TcpStream) -> String {
     use tokio::io::AsyncReadExt;
     let mut buf = Vec::new();

@@ -22,8 +22,8 @@ each run, which means CORS, auth headers, and middleware all stay server-side.
 
 ## Prerequisites
 
-- Rust 1.85+ (already required by the workspace)
-- [Bun](https://bun.sh/) ≥ 1.3 (or any Node 20+ + npm/pnpm/yarn)
+- Rust 1.88+ (already required by the workspace)
+- [Bun](https://bun.sh/) 1.3.14 (CI uses this version; compatible Bun 1.3+ also works)
 - [opencode](https://opencode.ai/) CLI installed and authenticated:
   ```bash
   bun install -g opencode-ai
@@ -52,18 +52,26 @@ bun run dev:bridge:hitl
 Each script just shells out to `cargo run -p agui-acp-bridge-cli -- ...` so you
 can also run those commands by hand from the workspace root.
 
-The bridge listens on `0.0.0.0:8080`. Health probe:
+The bridge listens on `127.0.0.1:8080`. Health probe:
 
 ```bash
 curl http://127.0.0.1:8080/health
-# → {"status":"ok","sessions":0}
+# → {"status":"ok"}
 ```
 
 ### 2. Start the Next.js app
 
 ```bash
-bun install   # first time
+bun install --frozen-lockfile
 bun run dev
+```
+
+Run the frontend checks/build when validating a change:
+
+```bash
+bun run type-check
+bun run lint
+bun run build
 ```
 
 Open <http://localhost:3000>.
@@ -95,6 +103,10 @@ API routes:
 - `POST /api/copilotkit` — `CopilotRuntime` mounting one `HttpAgent` named `default` against `http://127.0.0.1:8080/`.
 - `GET /api/bridge/health` — server-side proxy to the bridge `/health`.
 - `POST /api/bridge/approval` — server-side proxy to the bridge `/approval`.
+- `POST /api/bridge/session/close` — server-side proxy to the bridge
+  `/session/close` lifecycle endpoint.
+- `POST /api/bridge/session/delete` — server-side proxy to the bridge
+  `/session/delete` persistence endpoint.
 
 ## Where the wiring lives
 
@@ -113,7 +125,7 @@ API routes:
 - `opencode acp` requires a configured model provider. Without one, the SSE
   stream will end with a `RUN_ERROR`.
 - The bridge caps cached sessions at `--max-sessions` (default 128) and reaps
-  idle ones after `--idle-timeout` (default 30 min). A browser that mints a
+  idle ones after `--idle-timeout` (default 120s). A browser that mints a
   fresh `threadId` on every page refresh will therefore not accumulate agent
   processes without bound — old idle sessions are evicted LRU-first.
 

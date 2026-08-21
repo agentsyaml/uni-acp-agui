@@ -18,6 +18,7 @@ pub use acp::{
     AcpClient, AcpSessionHandle, CustomAgentInProcessClient, InProcessAcpClient, PromptStream,
     SessionConfig, SessionInitState,
 };
+pub use agent_client_protocol::schema::v1::SessionConfigOption;
 pub use config::BridgeConfig;
 pub use error::BridgeError;
 pub use file_ops::canonicalize_cwd;
@@ -27,7 +28,10 @@ pub use frontend_tools::{
 pub use message_state::MessageState;
 pub use policy::{PermissionDecision, PermissionPolicy};
 pub use process::ProcessAcpClient;
-pub use session::{MCP_SERVER_NAME, list_sessions_in_process_with, spawn_in_process_session_with};
+pub use session::{
+    MCP_SERVER_NAME, delete_session_in_process_with, list_sessions_in_process_with,
+    spawn_in_process_session_with,
+};
 pub use stream::{BridgeStreamItem, ModeOffering, SessionModesInit, SessionSummary};
 #[cfg(feature = "unstable_session_model")]
 pub use stream::{ModelOffering, SessionModelsInit};

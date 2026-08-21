@@ -79,7 +79,7 @@ async fn main() -> ExitCode {
 
     let state = BridgeAppState::new(client, PathBuf::from("."));
     let port = port_from_env();
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {

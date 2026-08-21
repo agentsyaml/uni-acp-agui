@@ -46,7 +46,8 @@ interface ConversationsContextValue {
    * Increments every time the user explicitly opens a past conversation.
    * The chat surface watches this to drive an explicit resume run (see
    * `useAcpResume`) — CopilotKit's own `connect` path does not reach a
-   * self-hosted bridge, so we trigger the `session/load` ourselves.
+   * self-hosted bridge, so `useAcpResume` triggers an explicit private
+   * `session/load` run itself.
    */
   resumeToken: number;
   /** Start a brand-new conversation (fresh threadId). */
@@ -78,10 +79,9 @@ export function useConversations(): ConversationsContextValue {
  * on the bridge → a new agent subprocess that lingers until the idle reaper.
  *
  * Resume: opening a past conversation sets the active threadId to that
- * conversation's ACP SessionId. When CopilotKit then connects (a bootstrap
- * with no user prompt), the bridge sees a thread it has no live session for
- * and issues `session/load`, replaying the conversation history. Detection is
- * purely protocol-shape based on the bridge side, so no client flag is needed.
+ * conversation's ACP SessionId. `useAcpResume` then sends an explicit
+ * `forwardedProps.acpResume=true` marker; ordinary bootstrap connections do
+ * not load history.
  */
 export function CopilotProvider({ children }: { children: ReactNode }) {
   // `useState` initializer runs once per mount. On the server it returns a

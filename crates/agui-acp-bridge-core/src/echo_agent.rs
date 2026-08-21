@@ -2,7 +2,7 @@
 #![allow(clippy::missing_errors_doc)]
 
 use crate::error::BridgeError;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
     SessionNotification, SessionUpdate, StopReason, TextContent,
@@ -65,11 +65,14 @@ pub async fn run_echo_agent(stream: DuplexStream) -> Result<(), BridgeError> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
-                message.respond_with_error(
-                    agent_client_protocol::util::internal_error("unhandled message"),
-                    cx,
-                )
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                }
             },
             agent_client_protocol::on_receive_dispatch!(),
         )

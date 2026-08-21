@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use agent_client_protocol::schema::{PermissionOptionId, RequestPermissionRequest};
+use agent_client_protocol::schema::v1::{PermissionOptionId, RequestPermissionRequest};
 use agui_acp_bridge_server::{
     AcpClient, BridgeAppState, PermissionDecision, PermissionPolicy, build_router,
 };

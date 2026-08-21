@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use agent_client_protocol::schema::{PermissionOptionId, RequestPermissionRequest};
+use agent_client_protocol::schema::v1::{PermissionOptionId, RequestPermissionRequest};
 use async_trait::async_trait;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,14 +1,15 @@
 "use client";
 
 /**
- * ACP session-mode / model context.
+ * ACP session configuration context.
  *
- * The bridge surfaces the agent's `SessionModeState` and (when the
- * `unstable_session_model` feature is on) `SessionModelState` via:
+ * The bridge surfaces the agent's stable ACP 2.0 `configOptions`, plus the
+ * legacy mode/model mirrors, via:
  *
  * 1. A `CUSTOM` event named `agent:session_init` emitted at the start of
  *    every prompt's SSE stream. Payload shape:
- *    `{ modes?: SessionModesInit, models?: SessionModelsInit }`.
+ *    `{ modes?: SessionModesInit, models?: SessionModelsInit,
+ *       configOptions?: SessionConfigOption[] }`.
  * 2. A synchronous `GET /session/init?threadId=...` discovery endpoint
  *    that returns the same shape (404 when no session has been opened
  *    for that thread).
@@ -56,14 +57,43 @@ export interface SessionModelsInit {
   availableModels: ModelOffering[];
 }
 
+export interface SessionConfigSelectOption {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+export interface SessionConfigSelectGroup {
+  group: string;
+  name: string;
+  options: SessionConfigSelectOption[];
+}
+
+export type SessionConfigSelectOptions =
+  | SessionConfigSelectOption[]
+  | SessionConfigSelectGroup[];
+
+/** JSON shape of an ACP `SessionConfigOption` after its flattened kind. */
+export interface SessionConfigOption {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  type: string;
+  currentValue: string | boolean;
+  options?: SessionConfigSelectOptions;
+}
+
 export interface AcpSessionState {
   /** Current ACP `SessionModeState` (or `null` when the agent does not advertise modes). */
   modes: SessionModesInit | null;
   /** Current ACP `SessionModelState` (or `null` when not advertised / unstable feature off). */
   models: SessionModelsInit | null;
-  /** Last error from a set-mode / set-model attempt (cleared on next success). */
+  /** Stable ACP 2.0 config options advertised by the agent. */
+  configOptions: SessionConfigOption[] | null;
+  /** Last error from a setting attempt (cleared on next success). */
   error: string | null;
-  /** Indicates an in-flight set-mode / set-model request. */
+  /** Indicates an in-flight setting request. */
   pending: boolean;
   /** Refresh from `GET /session/init`. Returns `true` on 200, `false` otherwise. */
   refresh: () => Promise<boolean>;
@@ -71,12 +101,14 @@ export interface AcpSessionState {
   setMode: (modeId: string) => Promise<boolean>;
   /** Issue ACP `session/set_model` via the bridge. Only meaningful when `models` is non-null. */
   setModel: (modelId: string) => Promise<boolean>;
+  /** Issue ACP `session/set_config_option` via the bridge. */
+  setConfigOption: (configId: string, value: string) => Promise<boolean>;
 }
 
 const Ctx = createContext<AcpSessionState | null>(null);
 
 /**
- * Client-side timeout for set-mode / set-model / refresh requests. The
+ * Client-side timeout for setting / refresh requests. The
  * bridge enforces its own timeout (`set_session_timeout`, default 30s) so
  * keep this slightly larger to let the bridge respond first; 35s strikes
  * the balance.
@@ -86,14 +118,81 @@ const FETCH_TIMEOUT_MS = 35_000;
 interface SessionInitPayload {
   modes?: SessionModesInit | null;
   models?: SessionModelsInit | null;
+  configOptions?: SessionConfigOption[] | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isSelectOption(value: unknown): value is SessionConfigSelectOption {
+  return (
+    isRecord(value) &&
+    typeof value.value === "string" &&
+    typeof value.name === "string" &&
+    (value.description === undefined || typeof value.description === "string")
+  );
+}
+
+function isSelectGroup(value: unknown): value is SessionConfigSelectGroup {
+  return (
+    isRecord(value) &&
+    typeof value.group === "string" &&
+    typeof value.name === "string" &&
+    Array.isArray(value.options) &&
+    value.options.every(isSelectOption)
+  );
+}
+
+function isSelectOptions(value: unknown): value is SessionConfigSelectOptions {
+  return (
+    Array.isArray(value) &&
+    value.every((item) =>
+      isRecord(item) && "options" in item
+        ? isSelectGroup(item)
+        : isSelectOption(item),
+    )
+  );
+}
+
+function isSessionConfigOption(value: unknown): value is SessionConfigOption {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.name !== "string" ||
+    typeof value.type !== "string" ||
+    (value.description !== undefined && typeof value.description !== "string") ||
+    (value.category !== undefined && typeof value.category !== "string")
+  ) {
+    return false;
+  }
+  if (value.type === "select") {
+    return typeof value.currentValue === "string" && isSelectOptions(value.options);
+  }
+  return value.type === "boolean" && typeof value.currentValue === "boolean";
+}
+
+function normalizeConfigOptions(value: unknown): SessionConfigOption[] | null {
+  if (!Array.isArray(value)) return null;
+  return value.filter(isSessionConfigOption);
 }
 
 export function AcpSessionProvider({ children }: { children: ReactNode }) {
   const { agent } = useAgent();
   const [modes, setModes] = useState<SessionModesInit | null>(null);
   const [models, setModels] = useState<SessionModelsInit | null>(null);
+  const [configOptions, setConfigOptions] = useState<SessionConfigOption[] | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+
+  const applySessionInit = useCallback((payload: SessionInitPayload) => {
+    setModes(payload.modes ?? null);
+    setModels(payload.models ?? null);
+    setConfigOptions(normalizeConfigOptions(payload.configOptions));
+    setError(null);
+  }, []);
 
   // We track threadId in a ref because subscribe()'s callbacks fire over
   // the lifetime of the agent and we want to read the latest value
@@ -111,17 +210,31 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
         const e = event as {
           type?: string;
           name?: string;
-          value?: SessionInitPayload;
+          value?: unknown;
         };
-        if (e.type !== "CUSTOM" || e.name !== "agent:session_init") return;
-        const payload = e.value ?? {};
-        setModes(payload.modes ?? null);
-        setModels(payload.models ?? null);
-        setError(null);
+        if (e.type !== "CUSTOM") return;
+        if (e.name === "agent:session_init") {
+          applySessionInit(
+            (isRecord(e.value) ? e.value : {}) as SessionInitPayload,
+          );
+          return;
+        }
+        if (e.name !== "acp.session_update" || !isRecord(e.value)) return;
+        if (
+          e.value.sessionUpdate !== "config_option_update" ||
+          !Array.isArray(e.value.configOptions)
+        ) {
+          return;
+        }
+        const next = normalizeConfigOptions(e.value.configOptions);
+        if (next) {
+          setConfigOptions(next);
+          setError(null);
+        }
       },
     });
     return () => subscription.unsubscribe();
-  }, [agent]);
+  }, [agent, applySessionInit]);
 
   const refresh = useCallback(async (): Promise<boolean> => {
     const threadId = agentRef.current?.threadId;
@@ -133,11 +246,13 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
         `/api/bridge/session/init?threadId=${encodeURIComponent(threadId)}`,
         { cache: "no-store", signal: ctl.signal },
       );
-      if (!res.ok) return false;
+      if (!res.ok) {
+        const body = await res.text();
+        setError(`session init HTTP ${res.status}: ${body || "(no body)"}`);
+        return false;
+      }
       const json = (await res.json()) as SessionInitPayload;
-      setModes(json.modes ?? null);
-      setModels(json.models ?? null);
-      setError(null);
+      applySessionInit(json);
       return true;
     } catch (err) {
       setError(String(err));
@@ -145,7 +260,7 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
     } finally {
       clearTimeout(timer);
     }
-  }, []);
+  }, [applySessionInit]);
 
   const setMode = useCallback(async (modeId: string): Promise<boolean> => {
     const threadId = agentRef.current?.threadId;
@@ -217,9 +332,68 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const setConfigOption = useCallback(
+    async (configId: string, value: string): Promise<boolean> => {
+      const threadId = agentRef.current?.threadId;
+      if (!threadId) {
+        setError("no active agent thread; send a message first");
+        return false;
+      }
+      setPending(true);
+      setError(null);
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const res = await fetch("/api/bridge/session/set-config-option", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ threadId, configId, value }),
+          signal: ctl.signal,
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          setError(
+            `set-config-option HTTP ${res.status}: ${body || "(no body)"}`,
+          );
+          return false;
+        }
+        // The route intentionally forwards only the bridge status. Re-read the
+        // bridge snapshot because an option change may also change other choices.
+        return await refresh();
+      } catch (err) {
+        setError(String(err));
+        return false;
+      } finally {
+        clearTimeout(timer);
+        setPending(false);
+      }
+    },
+    [refresh],
+  );
+
   const value = useMemo<AcpSessionState>(
-    () => ({ modes, models, error, pending, refresh, setMode, setModel }),
-    [modes, models, error, pending, refresh, setMode, setModel],
+    () => ({
+      modes,
+      models,
+      configOptions,
+      error,
+      pending,
+      refresh,
+      setMode,
+      setModel,
+      setConfigOption,
+    }),
+    [
+      modes,
+      models,
+      configOptions,
+      error,
+      pending,
+      refresh,
+      setMode,
+      setModel,
+      setConfigOption,
+    ],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

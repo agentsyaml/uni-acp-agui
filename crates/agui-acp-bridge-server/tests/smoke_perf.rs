@@ -45,12 +45,21 @@ where
     Arc::new(CustomAgentInProcessClient::new(factory))
 }
 
+struct DropFlag(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn test_session_config() -> SessionConfig {
     SessionConfig {
         cwd: PathBuf::from("/"),
         policy: Arc::new(AutoAllow),
         config: BridgeConfig::default(),
         mcp_url: None,
+        mcp_headers: Vec::new(),
         load_session_id: None,
     }
 }
@@ -136,7 +145,15 @@ async fn startup_timeout_bounds_a_slow_handshake() {
     // an error to the HTTP layer. We give the agent a 2s handshake delay and a
     // 200ms timeout, then assert the request returns quickly (well under the
     // delay) rather than blocking for the full 2s.
-    let client = client_for(|s| test_agents::run_slow_handshake_agent(s, 2_000));
+    let agent_dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_for_agent = agent_dropped.clone();
+    let client = client_for(move |s| {
+        let dropped = dropped_for_agent.clone();
+        async move {
+            let _drop_flag = DropFlag(dropped);
+            test_agents::run_slow_handshake_agent(s, 2_000).await
+        }
+    });
     let state = BridgeAppState::builder(client, PathBuf::from("/"))
         .with_config(BridgeConfig {
             open_session_timeout: Duration::from_millis(200),
@@ -179,6 +196,56 @@ async fn startup_timeout_bounds_a_slow_handshake() {
         state.session_count(),
         0,
         "a failed open_session must not leave a cached entry"
+    );
+    assert_eq!(
+        state.frontend_tools().thread_count(),
+        0,
+        "a failed session admission must not leave frontend registry state"
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while agent_dropped.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out handshake actor must be aborted, not detached");
+}
+
+#[tokio::test]
+async fn capacity_gate_does_not_cover_concurrent_handshakes() {
+    let state = BridgeAppState::builder(
+        client_for(|s| test_agents::run_slow_handshake_agent(s, 300)),
+        PathBuf::from("/"),
+    )
+    .with_config(BridgeConfig {
+        max_sessions: 2,
+        open_session_timeout: Duration::from_secs(2),
+        ..BridgeConfig::default()
+    })
+    .build();
+
+    let started = Instant::now();
+    let first = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            collect_sse_body(state, user_input("parallel-hs-a", "run", "hi")).await
+        })
+    };
+    let second = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            collect_sse_body(state, user_input("parallel-hs-b", "run", "hi")).await
+        })
+    };
+    let (first_status, _) = first.await.expect("first handshake task");
+    let (second_status, _) = second.await.expect("second handshake task");
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert!(
+        started.elapsed() < Duration::from_millis(550),
+        "capacity selection must not serialize 300ms handshakes: {:?}",
+        started.elapsed()
     );
 }
 
@@ -473,12 +540,16 @@ async fn load_many_concurrent_distinct_threads_all_finish() {
 }
 
 #[tokio::test]
-async fn load_concurrent_reuse_on_one_thread_is_serialized_cleanly() {
+async fn load_concurrent_reuse_on_one_thread_uses_admission_gate() {
     // Fan out 16 concurrent runs on a SINGLE thread_id against a stateful
-    // agent. The session actor processes prompts sequentially, so all 16 must
-    // complete cleanly, exactly one session is created, and the agent's turn
-    // counter advances by exactly 16 (no lost or double-counted turns).
-    let state = state_with_client(client_for(test_agents::run_stateful_session_agent));
+    // agent. The per-thread admission gate allows exactly one run through;
+    // the others fail fast rather than queueing behind it.
+    let state = state_with_client(client_for(|stream| async move {
+        // Keep the first session opening long enough for the batch to contend
+        // on the admission claim instead of relying on scheduler timing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        test_agents::run_stateful_session_agent(stream).await
+    }));
 
     let mut handles = Vec::new();
     for i in 0..16 {
@@ -486,13 +557,51 @@ async fn load_concurrent_reuse_on_one_thread_is_serialized_cleanly() {
         handles.push(tokio::spawn(async move {
             let (status, body) =
                 collect_sse_body(s, user_input("thread-serial", &format!("run-{i}"), "ping")).await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(body.contains("\"type\":\"RUN_FINISHED\""));
+            (i, status, body)
         }));
     }
+
+    let mut finished = 0;
+    let mut concurrent_errors = 0;
     for h in handles {
-        h.await.expect("task panicked");
+        let (i, status, body) = h.await.expect("task panicked");
+        assert_eq!(status, StatusCode::OK, "run-{i} body:\n{body}");
+        assert_eq!(count_events(&body, "RUN_STARTED"), 1, "run-{i}: {body}");
+        assert!(
+            body.contains(&format!("\"runId\":\"run-{i}\"")),
+            "response must identify run-{i}:\n{body}"
+        );
+
+        let events = extract_event_types(&body);
+        assert_eq!(
+            events.first().map(String::as_str),
+            Some("RUN_STARTED"),
+            "run-{i} must start with RUN_STARTED: {body}"
+        );
+        assert_eq!(
+            count_events(&body, "RUN_FINISHED") + count_events(&body, "RUN_ERROR"),
+            1,
+            "run-{i} must have exactly one terminal event: {body}"
+        );
+
+        if count_events(&body, "RUN_FINISHED") == 1 {
+            finished += 1;
+            assert_eq!(events.last().map(String::as_str), Some("RUN_FINISHED"));
+            assert!(body.contains("turn 1: ping"), "winning run body:\n{body}");
+            assert!(!body.contains("CONCURRENT_RUN"), "run-{i} body:\n{body}");
+        } else {
+            concurrent_errors += 1;
+            assert_eq!(events.last().map(String::as_str), Some("RUN_ERROR"));
+            assert!(
+                body.contains("\"code\":\"CONCURRENT_RUN\""),
+                "run-{i} must fail at admission: {body}"
+            );
+            assert!(!body.contains("RUN_FINISHED"), "run-{i} body:\n{body}");
+        }
     }
+
+    assert_eq!(finished, 1, "exactly one run must win admission");
+    assert_eq!(concurrent_errors, 15, "fifteen runs must be rejected");
 
     assert_eq!(
         state.session_count(),
@@ -500,16 +609,19 @@ async fn load_concurrent_reuse_on_one_thread_is_serialized_cleanly() {
         "concurrent runs on one thread must share exactly one session"
     );
 
-    // One more run: the turn counter must read 17, proving all 16 concurrent
-    // turns were processed exactly once on the shared session.
-    let (_, body) = collect_sse_body(
-        state.clone(),
-        user_input("thread-serial", "run-final", "last"),
-    )
-    .await;
+    // One more run must claim the now-free thread and reuse the one session.
+    let (status, body) =
+        collect_sse_body(state, user_input("thread-serial", "run-final", "last")).await;
+    assert_eq!(status, StatusCode::OK, "sequential follow-up body:\n{body}");
     assert!(
-        body.contains("turn 17: last"),
-        "all 16 concurrent turns must have advanced the shared session, body:\n{body}"
+        body.contains("\"runId\":\"run-final\"")
+            && body.contains("\"type\":\"RUN_FINISHED\"")
+            && body.contains("turn 2: last"),
+        "claim must be released and the session reused:\n{body}"
+    );
+    assert!(
+        !body.contains("CONCURRENT_RUN"),
+        "follow-up must not be rejected:\n{body}"
     );
 }
 
@@ -630,12 +742,12 @@ async fn realsocket_high_volume_stream_delivers_all_chunks_in_order() {
         if !payload.contains("\"type\":\"TEXT_MESSAGE_CONTENT\"") {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-            if let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str) {
-                for tok in delta.split(';').filter(|t| !t.is_empty()) {
-                    if let Ok(n) = tok.parse::<u32>() {
-                        seq.push(n);
-                    }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+            && let Some(delta) = v.get("delta").and_then(serde_json::Value::as_str)
+        {
+            for tok in delta.split(';').filter(|t| !t.is_empty()) {
+                if let Ok(n) = tok.parse::<u32>() {
+                    seq.push(n);
                 }
             }
         }
@@ -778,7 +890,7 @@ async fn max_sessions_evicts_lru_idle_session() {
 
 #[tokio::test]
 async fn max_sessions_zero_means_unlimited() {
-    // The default (0) preserves historical behaviour: no eviction.
+    // Zero is an explicit development override: no eviction.
     let client = client_for(test_agents::run_single_chunk_agent);
     let state = BridgeAppState::builder(client, PathBuf::from("/"))
         .with_config(BridgeConfig {
@@ -805,8 +917,13 @@ async fn max_sessions_does_not_evict_busy_sessions() {
     // A session with an in-flight (slow) prompt must NOT be evicted even when
     // the cap is reached — live work is never killed. We set cap = 1, start a
     // slow run on thread A, and while it is in flight start a run on thread B.
-    // Both must complete cleanly.
-    let client = client_for(|s| test_agents::run_slow_prompt_agent(s, 400));
+    // B must be rejected before a second ACP actor is opened.
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opens_for_agent = opens.clone();
+    let client = client_for(move |s| {
+        opens_for_agent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        test_agents::run_slow_prompt_agent(s, 400)
+    });
     let state = BridgeAppState::builder(client, PathBuf::from("/"))
         .with_config(BridgeConfig {
             max_sessions: 1,
@@ -831,14 +948,73 @@ async fn max_sessions_does_not_evict_busy_sessions() {
     let (sa, ba) = a.await.unwrap();
     let (sb, bb) = b.await.unwrap();
     assert_eq!(sa, StatusCode::OK);
-    assert_eq!(sb, StatusCode::OK);
+    assert_eq!(sb, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
         ba.contains("\"type\":\"RUN_FINISHED\""),
         "busy session A must complete cleanly, not be evicted mid-flight:\n{ba}"
     );
     assert!(
-        bb.contains("\"type\":\"RUN_FINISHED\""),
-        "session B must also complete:\n{bb}"
+        bb.contains("session capacity reached"),
+        "session B must explain the capacity rejection:\n{bb}"
+    );
+    assert!(
+        bb.contains("ACP_SESSION_CAPACITY"),
+        "session B must expose a non-success capacity error code:\n{bb}"
+    );
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "capacity rejection must not open a second ACP actor"
+    );
+    assert!(
+        !state.frontend_tools().has("busy-B"),
+        "capacity rejection must not leave a speculative frontend registry entry"
+    );
+}
+
+#[tokio::test]
+async fn max_sessions_hard_cap_bounds_concurrent_first_use() {
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opens_for_agent = opens.clone();
+    let client = client_for(move |s| {
+        opens_for_agent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        test_agents::run_slow_prompt_agent(s, 400)
+    });
+    let state = BridgeAppState::builder(client, PathBuf::from("/"))
+        .with_config(BridgeConfig {
+            max_sessions: 2,
+            ..BridgeConfig::default()
+        })
+        .build();
+
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let state = state.clone();
+        tasks.push(tokio::spawn(async move {
+            collect_sse_body(
+                state,
+                user_input(&format!("cap-concurrent-{i}"), "run", "wait"),
+            )
+            .await
+        }));
+    }
+
+    let mut rejected = 0;
+    for task in tasks {
+        let (status, _) = task.await.expect("concurrent request task");
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            rejected += 1;
+        }
+    }
+    assert!(
+        rejected > 0,
+        "the hard cap must reject excess busy sessions"
+    );
+    assert!(state.session_count() <= 2);
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "concurrent first-use must open at most the configured cap"
     );
 }
 

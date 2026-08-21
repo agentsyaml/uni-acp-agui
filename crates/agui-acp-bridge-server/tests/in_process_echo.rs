@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{ContentBlock, SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, StopReason};
 use agui_acp_bridge_core::{BridgeConfig, BridgeStreamItem, SessionConfig};
 use agui_acp_bridge_policy::AutoAllow;
 use agui_acp_bridge_server::{AcpClient, InProcessAcpClient};
@@ -19,6 +19,7 @@ fn test_session_config() -> SessionConfig {
         policy: Arc::new(AutoAllow),
         config: BridgeConfig::default(),
         mcp_url: None,
+        mcp_headers: Vec::new(),
         load_session_id: None,
     }
 }
@@ -66,13 +67,21 @@ async fn in_process_echo_round_trip_streams_chunks_and_finishes() {
             BridgeStreamItem::FrontendToolEnd { .. } => {
                 panic!("echo agent should not invoke frontend tools");
             }
-            BridgeStreamItem::SessionInit { modes, models } => {
+            BridgeStreamItem::SessionInit {
+                modes,
+                models,
+                config_options,
+            } => {
                 // Echo agent does not advertise any mode/model state; we
                 // still expect the session actor to emit a SessionInit at
                 // the start of every prompt so reconnecting clients always
                 // see the picker frame (even if it's empty).
                 assert!(modes.is_none(), "echo agent should not advertise modes");
                 assert!(models.is_none(), "echo agent should not advertise models");
+                assert!(
+                    config_options.is_none(),
+                    "echo agent should not advertise config options"
+                );
             }
         }
     }

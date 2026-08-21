@@ -3,12 +3,17 @@
 //! Implements `ReadTextFile` and `WriteTextFile` with path sandboxing
 //! to prevent directory traversal and symlink-based escapes.
 //!
+//! **Dormant ACP surface:** `session.rs` does not register these handlers while
+//! the bridge advertises no filesystem capability during `initialize`. The
+//! helpers remain correct and tested for a future, explicit capability gate;
+//! they are not currently reachable by an agent.
+//!
 //! # Sandbox model
 //!
-//! Every operation receives a `cwd` (the session's working directory) and a
-//! relative or absolute path provided by the agent. We resolve the path
-//! against `cwd`, **canonicalize** the result through the OS (resolving
-//! symlinks), and verify the canonical path is inside the canonical `cwd`.
+//! Every operation receives a `cwd` (the session's working directory) and an
+//! **absolute** path provided by the agent. We canonicalize the path through
+//! the OS (resolving symlinks), and verify the canonical path is inside the
+//! canonical `cwd`.
 //!
 //! For reads we canonicalize the full target. For writes, the target may
 //! not exist yet, so we canonicalize the **deepest existing ancestor** —
@@ -77,8 +82,8 @@ pub fn acp_cwd(cwd: &Path) -> PathBuf {
 ///
 /// Returns the canonical path on success. Errors with `PermissionDenied` if
 /// the resolved path escapes `cwd`, and propagates I/O errors otherwise.
-fn safe_resolve_read(cwd: &Path, relative: &str) -> Result<PathBuf, BridgeError> {
-    let candidate = join_for_resolve(cwd, relative);
+fn safe_resolve_read(cwd: &Path, path: &str) -> Result<PathBuf, BridgeError> {
+    let candidate = require_absolute(path)?;
     let canonical = std::fs::canonicalize(&candidate).map_err(BridgeError::Io)?;
     enforce_sandbox(cwd, &canonical, &candidate)?;
     Ok(canonical)
@@ -89,8 +94,8 @@ fn safe_resolve_read(cwd: &Path, relative: &str) -> Result<PathBuf, BridgeError>
 /// The target may not exist yet, but its deepest existing ancestor must be
 /// inside `cwd`. Returns the joined (un-canonicalized) target path so the
 /// caller can create directories and write the file.
-fn safe_resolve_write(cwd: &Path, relative: &str) -> Result<PathBuf, BridgeError> {
-    let candidate = join_for_resolve(cwd, relative);
+fn safe_resolve_write(cwd: &Path, path: &str) -> Result<PathBuf, BridgeError> {
+    let candidate = require_absolute(path)?;
 
     // Find the deepest existing ancestor and canonicalize it. That gives us
     // an OS-honest answer about where the path actually lives, including
@@ -119,12 +124,15 @@ fn safe_resolve_write(cwd: &Path, relative: &str) -> Result<PathBuf, BridgeError
     Ok(candidate)
 }
 
-fn join_for_resolve(cwd: &Path, relative: &str) -> PathBuf {
-    if Path::new(relative).is_absolute() {
-        PathBuf::from(relative)
-    } else {
-        cwd.join(relative)
+fn require_absolute(path: &str) -> Result<PathBuf, BridgeError> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("ACP filesystem paths must be absolute: {}", path.display()),
+        )));
     }
+    Ok(path.to_path_buf())
 }
 
 fn enforce_sandbox(cwd: &Path, canonical: &Path, original: &Path) -> Result<(), BridgeError> {
@@ -142,62 +150,64 @@ fn enforce_sandbox(cwd: &Path, canonical: &Path, original: &Path) -> Result<(), 
     Ok(())
 }
 
-/// Read a text file relative to `cwd`.
+/// Read a text file from an absolute ACP path under `cwd`.
 ///
-/// `cwd` MUST be canonicalized (see [`canonicalize_cwd`]). The agent path is
-/// resolved against `cwd`, canonicalized through the OS, and verified to be
-/// under `cwd` before any bytes are read.
-///
-/// If `limit` is provided, at most that many **bytes** are read from the
-/// file. The returned string is always cut at a UTF-8 character boundary so
-/// multi-byte codepoints (CJK, emoji) at the cap are dropped intact rather
-/// than split.
+/// `cwd` MUST be canonicalized (see [`canonicalize_cwd`]). `limit` is a
+/// maximum **line count**, matching ACP semantics. Reading starts at line 1;
+/// use [`read_text_file_range`] for a different starting line.
 pub async fn read_text_file(
     cwd: &Path,
     path: &str,
     limit: Option<usize>,
 ) -> Result<String, BridgeError> {
-    let full_path = safe_resolve_read(cwd, path)?;
-
-    let bytes = match limit {
-        Some(n) => {
-            // Stream-read up to `n` bytes so a `limit=1024` request against
-            // a 10 GB file does not allocate 10 GB.
-            use tokio::io::AsyncReadExt;
-            let file = tokio::fs::File::open(&full_path).await?;
-            let mut buf = Vec::with_capacity(n.min(8192));
-            file.take(n as u64).read_to_end(&mut buf).await?;
-            buf
-        }
-        None => tokio::fs::read(&full_path).await?,
-    };
-
-    // Validate UTF-8. If `limit` cut the file mid-character, drop the
-    // partial codepoint at the tail.
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok(s),
-        Err(err) => {
-            let valid_up_to = err.utf8_error().valid_up_to();
-            // The bytes after `valid_up_to` may be a partial multibyte char
-            // (when limit landed mid-codepoint) OR genuine invalid UTF-8
-            // (file is binary). For the limit case we want to retain the
-            // valid prefix; for genuine binary we still surface a clean
-            // truncation rather than panic. Use lossy fallback for the
-            // tail only if `limit` was set.
-            let mut bytes = err.into_bytes();
-            bytes.truncate(valid_up_to);
-            // SAFETY: `valid_up_to` bytes are valid UTF-8 by definition.
-            Ok(String::from_utf8(bytes).expect("valid_up_to is UTF-8 by construction"))
-        }
-    }
+    read_text_file_range(cwd, path, None, limit).await
 }
 
-/// Write a text file relative to `cwd`.
+/// Read at most `limit` lines beginning at the 1-based `line` offset.
+/// Newlines are preserved in the returned text.
+pub async fn read_text_file_range(
+    cwd: &Path,
+    path: &str,
+    line: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String, BridgeError> {
+    let start_line = line.unwrap_or(1);
+    if start_line == 0 {
+        return Err(BridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ACP read line is 1-based",
+        )));
+    }
+
+    let full_path = safe_resolve_read(cwd, path)?;
+    let file = tokio::fs::File::open(&full_path).await?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let max_lines = limit.unwrap_or(usize::MAX);
+    let mut current_line = 1usize;
+    let mut selected_lines = 0usize;
+    let mut content = String::new();
+    let mut buffer = String::new();
+
+    while selected_lines < max_lines {
+        buffer.clear();
+        if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buffer).await? == 0 {
+            break;
+        }
+        if current_line >= start_line {
+            content.push_str(&buffer);
+            selected_lines = selected_lines.saturating_add(1);
+        }
+        current_line = current_line.saturating_add(1);
+    }
+
+    Ok(content)
+}
+
+/// Write a text file from an absolute ACP path under `cwd`.
 ///
-/// `cwd` MUST be canonicalized (see [`canonicalize_cwd`]). The path is
-/// resolved against `cwd`; the deepest existing ancestor must be inside
-/// `cwd` (preventing symlink redirection of intermediate directories).
-/// Missing parent directories are then created and the file written.
+/// `cwd` MUST be canonicalized (see [`canonicalize_cwd`]). The deepest
+/// existing ancestor must be inside `cwd` (preventing symlink redirection of
+/// intermediate directories). Missing parent directories are then created.
 pub async fn write_text_file(cwd: &Path, path: &str, content: &str) -> Result<(), BridgeError> {
     let full_path = safe_resolve_write(cwd, path)?;
     if let Some(parent) = full_path.parent() {
@@ -257,6 +267,10 @@ mod tests {
         }
     }
 
+    fn absolute(dir: &TempDir, relative: &str) -> String {
+        dir.path().join(relative).to_string_lossy().into_owned()
+    }
+
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.raw_for_cleanup);
@@ -267,8 +281,20 @@ mod tests {
     async fn read_within_cwd_succeeds() {
         let dir = temp_cwd();
         std::fs::write(dir.path().join("foo.txt"), "hello").unwrap();
-        let out = read_text_file(dir.path(), "foo.txt", None).await.unwrap();
+        let out = read_text_file(dir.path(), &absolute(&dir, "foo.txt"), None)
+            .await
+            .unwrap();
         assert_eq!(out, "hello");
+    }
+
+    #[tokio::test]
+    async fn relative_paths_are_rejected() {
+        let dir = temp_cwd();
+        std::fs::write(dir.path().join("foo.txt"), "hello").unwrap();
+        let read = read_text_file(dir.path(), "foo.txt", None).await;
+        let write = write_text_file(dir.path(), "new.txt", "hello").await;
+        assert!(read.is_err(), "ACP read paths must be absolute");
+        assert!(write.is_err(), "ACP write paths must be absolute");
     }
 
     #[tokio::test]
@@ -288,7 +314,7 @@ mod tests {
     #[tokio::test]
     async fn read_with_parent_traversal_is_rejected() {
         let dir = temp_cwd();
-        let result = read_text_file(dir.path(), "../escape.txt", None).await;
+        let result = read_text_file(dir.path(), &absolute(&dir, "../escape.txt"), None).await;
         // The traversal target probably doesn't exist, but even if it does,
         // canonicalize will resolve it outside cwd. Either way: error.
         assert!(result.is_err(), "must reject parent traversal");
@@ -326,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn write_within_cwd_creates_file_and_parents() {
         let dir = temp_cwd();
-        write_text_file(dir.path(), "nested/deep/foo.txt", "ok")
+        write_text_file(dir.path(), &absolute(&dir, "nested/deep/foo.txt"), "ok")
             .await
             .unwrap();
         let actual = std::fs::read_to_string(dir.path().join("nested/deep/foo.txt")).unwrap();
@@ -336,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn write_with_parent_traversal_is_rejected() {
         let dir = temp_cwd();
-        let result = write_text_file(dir.path(), "../escape.txt", "boom").await;
+        let result = write_text_file(dir.path(), &absolute(&dir, "../escape.txt"), "boom").await;
         assert!(result.is_err(), "must reject parent traversal write");
     }
 
@@ -349,7 +375,7 @@ mod tests {
         std::fs::write(&target, "secret").unwrap();
         symlink(&target, dir.path().join("link.txt")).unwrap();
 
-        let result = read_text_file(dir.path(), "link.txt", None).await;
+        let result = read_text_file(dir.path(), &absolute(&dir, "link.txt"), None).await;
         let _ = std::fs::remove_file(&target);
         let err = result.expect_err("symlink must not bypass sandbox");
         assert!(
@@ -367,7 +393,8 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, dir.path().join("escape_dir")).unwrap();
 
-        let result = write_text_file(dir.path(), "escape_dir/foo.txt", "boom").await;
+        let result =
+            write_text_file(dir.path(), &absolute(&dir, "escape_dir/foo.txt"), "boom").await;
         let _ = std::fs::remove_dir_all(&outside);
         assert!(
             result.is_err(),
@@ -376,57 +403,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_text_file_with_limit_inside_multibyte_does_not_panic() {
-        // "Hello,世界" = "Hello," (6 ASCII) + "世" (3 bytes) + "界" (3 bytes)
+    async fn read_limit_counts_lines_and_preserves_multibyte_text() {
         let dir = temp_cwd();
-        std::fs::write(dir.path().join("hello.txt"), "Hello,世界").unwrap();
-
-        // limit=7 lands inside the first byte of "世" — must drop the
-        // partial codepoint and keep "Hello,".
-        let out = read_text_file(dir.path(), "hello.txt", Some(7))
+        std::fs::write(dir.path().join("lines.txt"), "one\n世界\nthree\n").unwrap();
+        let out = read_text_file(dir.path(), &absolute(&dir, "lines.txt"), Some(2))
             .await
-            .expect("read with limit must not error");
-        assert_eq!(out, "Hello,", "got {out:?}");
+            .unwrap();
+        assert_eq!(out, "one\n世界\n");
     }
 
     #[tokio::test]
-    async fn read_text_file_with_limit_on_boundary_returns_full_prefix() {
+    async fn read_line_and_limit_use_one_based_line_ranges() {
         let dir = temp_cwd();
-        std::fs::write(dir.path().join("hello.txt"), "Hello,世界").unwrap();
-        let out = read_text_file(dir.path(), "hello.txt", Some(9))
+        std::fs::write(dir.path().join("lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let out = read_text_file_range(dir.path(), &absolute(&dir, "lines.txt"), Some(2), Some(2))
             .await
             .unwrap();
-        assert_eq!(out, "Hello,世");
+        assert_eq!(out, "two\nthree\n");
     }
 
     #[tokio::test]
-    async fn read_text_file_with_limit_larger_than_file_returns_full() {
+    async fn read_line_zero_is_rejected() {
         let dir = temp_cwd();
-        std::fs::write(dir.path().join("hello.txt"), "abc").unwrap();
-        let out = read_text_file(dir.path(), "hello.txt", Some(1024))
-            .await
-            .unwrap();
-        assert_eq!(out, "abc");
+        std::fs::write(dir.path().join("lines.txt"), "one\n").unwrap();
+        let result =
+            read_text_file_range(dir.path(), &absolute(&dir, "lines.txt"), Some(0), Some(1)).await;
+        assert!(result.is_err(), "ACP line numbers are 1-based");
     }
 
     #[tokio::test]
-    async fn read_text_file_with_limit_does_not_read_more_than_requested() {
-        // Functional check that we're streaming, not reading-then-truncating.
-        // We can't easily prove the optimization without instrumentation,
-        // but we can at least confirm behavior with a 1MB file is fast and
-        // returns only the first byte requested.
+    async fn read_limit_zero_returns_no_lines() {
         let dir = temp_cwd();
-        let big = "a".repeat(1024 * 1024);
-        std::fs::write(dir.path().join("big.txt"), &big).unwrap();
-        let started = std::time::Instant::now();
-        let out = read_text_file(dir.path(), "big.txt", Some(8))
+        std::fs::write(dir.path().join("lines.txt"), "one\ntwo\n").unwrap();
+        let out = read_text_file(dir.path(), &absolute(&dir, "lines.txt"), Some(0))
             .await
             .unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(out, "aaaaaaaa");
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "limited read should be near-instant, took {elapsed:?}"
-        );
+        assert!(out.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { BRIDGE_URL } from "@/lib/agui-bridge";
+import { BRIDGE_URL, bridgeHeaders } from "@/lib/agui-bridge";
 
 /**
  * Server-side proxy for the bridge's `/approval` endpoint.
@@ -13,6 +13,7 @@ export async function POST(req: NextRequest) {
   const upstream = await fetch(target, {
     method: "POST",
     headers: {
+      ...bridgeHeaders(),
       "Content-Type": "application/json",
     },
     body,

@@ -1,5 +1,5 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { BRIDGE_URL } from "@/lib/agui-bridge";
+import { BRIDGE_URL, bridgeHeaders } from "@/lib/agui-bridge";
 
 /**
  * Server-side proxy for the bridge's `GET /session/init?threadId=...`
@@ -20,7 +20,10 @@ export async function GET(req: NextRequest) {
   try {
     const target = new URL("/session/init", BRIDGE_URL);
     target.searchParams.set("threadId", threadId);
-    const upstream = await fetch(target, { cache: "no-store" });
+    const upstream = await fetch(target, {
+      cache: "no-store",
+      headers: bridgeHeaders(),
+    });
     const text = await upstream.text();
     return new NextResponse(text || null, {
       status: upstream.status,

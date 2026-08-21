@@ -10,7 +10,7 @@ mod build_example;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{SessionUpdate, StopReason};
 use agui_acp_bridge_core::{
     AcpClient, BridgeConfig, BridgeStreamItem, ProcessAcpClient, SessionConfig,
 };
@@ -24,6 +24,7 @@ fn cfg(cwd: std::path::PathBuf) -> SessionConfig {
         policy: Arc::new(AutoAllow),
         config: BridgeConfig::default(),
         mcp_url: None,
+        mcp_headers: Vec::new(),
         load_session_id: None,
     }
 }

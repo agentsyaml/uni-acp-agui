@@ -25,7 +25,8 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, ImageContent, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
@@ -35,6 +36,7 @@ use agent_client_protocol::schema::{
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Dispatch};
 use agui_acp_bridge_core::BridgeError;
 use tokio::io::DuplexStream;
+use tokio::sync::Notify;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -77,14 +79,14 @@ pub async fn run_image_agent(stream: DuplexStream) -> Result<(), BridgeError> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -129,14 +131,14 @@ pub async fn run_failing_prompt_agent(stream: DuplexStream) -> Result<(), Bridge
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -210,14 +212,14 @@ pub async fn run_stateful_session_agent(stream: DuplexStream) -> Result<(), Brid
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -324,14 +326,14 @@ pub async fn run_mixed_updates_agent(stream: DuplexStream) -> Result<(), BridgeE
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -412,14 +414,304 @@ pub async fn run_request_permission_agent(stream: DuplexStream) -> Result<(), Br
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture that negotiates an unsupported ACP wire version. The bridge
+/// must reject it before issuing `session/new`.
+pub async fn run_wrong_protocol_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-wrong-protocol-test")
+        .on_receive_request(
+            async move |_req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(ProtocolVersion::V0)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// List-path counterpart to [`run_wrong_protocol_agent`]. It advertises
+/// `session/list`, but the bridge must reject the version before sending the
+/// list request.
+pub async fn run_wrong_protocol_list_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        ListSessionsRequest, SessionCapabilities, SessionListCapabilities,
+    };
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-wrong-list-protocol-test")
+        .on_receive_request(
+            async move |_req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(ProtocolVersion::V0).agent_capabilities(
+                        AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().list(SessionListCapabilities::default()),
+                        ),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: ListSessionsRequest, responder, _cx| {
+                let _ = req;
+                responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    "session/list must not be sent after a protocol mismatch",
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+fn permission_request(session_id: SessionId, tool_call_id: &str) -> RequestPermissionRequest {
+    let fields = ToolCallUpdateFields::new().title(tool_call_id.to_string());
+    RequestPermissionRequest::new(
+        session_id,
+        ToolCallUpdate::new(tool_call_id.to_string(), fields),
+        vec![
+            PermissionOption::new(
+                PermissionOptionId::new("allow"),
+                "Allow".to_string(),
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::new("deny"),
+                "Deny".to_string(),
+                PermissionOptionKind::RejectOnce,
+            ),
+        ],
+    )
+}
+
+/// Agent fixture that keeps two permission requests pending at once and only
+/// completes the prompt after both responses arrive.
+pub async fn run_multiple_pending_permission_agent(
+    stream: DuplexStream,
+) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-multiple-permissions-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                let session_id = req.session_id;
+                let first = cx.send_request(permission_request(session_id.clone(), "tc-1"));
+                let second = cx.send_request(permission_request(session_id.clone(), "tc-2"));
+                let cx_for_finish = cx.clone();
+                cx.spawn(async move {
+                    let _ = first.block_task().await;
+                    let _ = second.block_task().await;
+                    cx_for_finish.send_notification(SessionNotification::new(
+                        session_id,
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("cancel tail"),
+                        ))),
+                    ))?;
+                    responder.respond(PromptResponse::new(StopReason::Cancelled))
+                })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture that sends a second permission request only after the first
+/// one has been answered. Tests cancel after the first interrupt; the second
+/// request therefore races directly with post-cancel dispatch and must be
+/// answered cancelled without entering the pending map.
+pub async fn run_permission_after_cancel_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-permission-after-cancel-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                let session_id = req.session_id;
+                let second = permission_request(session_id.clone(), "tc-after-cancel");
+                let cx_after_first = cx.clone();
+                cx.send_request(permission_request(session_id, "tc-before-cancel"))
+                    .on_receiving_result(async move |_first| {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        cx_after_first.send_request(second).on_receiving_result(
+                            async move |_second| {
+                                responder.respond(PromptResponse::new(StopReason::Cancelled))
+                            },
+                        )
+                    })
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture that never returns the prompt response. It is used to verify
+/// the bridge's cancel grace timeout and session eviction path.
+pub async fn run_unresponsive_cancel_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-unresponsive-cancel-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: PromptRequest,
+                        _responder,
+                        _cx: ConnectionTo<agent_client_protocol::Client>| {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -472,14 +764,74 @@ pub async fn run_single_chunk_agent(stream: DuplexStream) -> Result<(), BridgeEr
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture that emits one text chunk and completes with the supplied ACP
+/// stop reason. Used to pin the bridge's terminal-event mapping.
+pub async fn run_stop_reason_agent(
+    stream: DuplexStream,
+    stop_reason: StopReason,
+) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-stop-reason-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("terminal tail"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(stop_reason))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -535,14 +887,92 @@ pub async fn run_slow_prompt_agent(stream: DuplexStream, delay_ms: u64) -> Resul
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture whose slow prompt observes `session/cancel` and returns
+/// `Cancelled`. It distinguishes cancelling the active turn from cancelling a
+/// queued turn in the bridge's turn-identity tests.
+pub async fn run_cancel_aware_slow_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::CancelNotification;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancelled_for_notification = cancelled.clone();
+    let cancelled_for_prompt = cancelled.clone();
+
+    Agent
+        .builder()
+        .name("agui-bridge-cancel-aware-slow-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            async move |_req: CancelNotification, _cx| {
+                cancelled_for_notification.store(true, Ordering::Release);
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                for _ in 0..100 {
+                    if cancelled_for_prompt.load(Ordering::Acquire) {
+                        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("active turn completed"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -606,14 +1036,14 @@ pub async fn run_long_running_agent(stream: DuplexStream) -> Result<(), BridgeEr
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -688,14 +1118,14 @@ pub async fn run_late_notification_agent(stream: DuplexStream) -> Result<(), Bri
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 // Forward Response messages to their awaiters; reject anything else.
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -705,27 +1135,24 @@ pub async fn run_late_notification_agent(stream: DuplexStream) -> Result<(), Bri
         .map_err(BridgeError::Acp)
 }
 
-/// Agent that advertises a `SessionModeState` and (when the
-/// `unstable_session_model` feature is on) a `SessionModelState` in
-/// `NewSessionResponse`, accepts ACP `session/set_mode` /
-/// `session/set_model` requests, and emits a `CurrentModeUpdate`
-/// notification when the bridge issues a successful `set_mode`.
+/// Agent that advertises a `SessionModeState` and select/value-id mode/model
+/// config options in `NewSessionResponse`. It accepts the stable
+/// `session/set_config_option` request and emits update notifications.
 ///
 /// Used to exercise the bridge's mode/model discovery + switch surface
-/// (`SessionInit` event, `/session/set-mode`, `/session/set-model`,
-/// `/session/init`).
+/// (`SessionInit` event, `/session/set-mode`, `/session/set-config-option`,
+/// the compatibility `/session/set-model` alias, and `/session/init`).
 ///
 /// The agent records the most recent set request so tests can assert it
 /// flowed through. Concurrency: the inner `Mutex`es are tiny and only
 /// touched on the dispatch loop, so contention is irrelevant.
-#[cfg(feature = "unstable_session_model")]
 pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeError> {
-    use agent_client_protocol::schema::{
-        CurrentModeUpdate, ModelInfo, SessionMode, SessionModeState, SessionModelState,
-        SetSessionModeRequest, SetSessionModeResponse, SetSessionModelRequest,
-        SetSessionModelResponse,
+    use agent_client_protocol::schema::v1::{
+        ConfigOptionUpdate, CurrentModeUpdate, SessionConfigKind, SessionConfigOption,
+        SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption, SessionMode,
+        SessionModeState, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+        SetSessionModeRequest, SetSessionModeResponse,
     };
-
     let (read, write) = tokio::io::split(stream);
     let transport = ByteStreams::new(write.compat_write(), read.compat());
 
@@ -735,7 +1162,39 @@ pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeEr
     let cm_for_new = current_mode.clone();
     let cmod_for_new = current_model.clone();
     let cm_for_set_mode = current_mode.clone();
-    let cmod_for_set_model = current_model.clone();
+    let cm_for_set_config = current_mode.clone();
+    let cmod_for_set_config = current_model.clone();
+
+    fn config_options_for(mode: &str, model: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    mode.to_string(),
+                    vec![
+                        SessionConfigSelectOption::new("ask", "Ask"),
+                        SessionConfigSelectOption::new("architect", "Architect"),
+                        SessionConfigSelectOption::new("code", "Code"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+            SessionConfigOption::new(
+                "model",
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    model.to_string(),
+                    vec![
+                        SessionConfigSelectOption::new("gpt-4o-mini", "GPT-4o mini"),
+                        SessionConfigSelectOption::new("gpt-4o", "GPT-4o"),
+                        SessionConfigSelectOption::new("claude-sonnet", "Claude Sonnet"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ]
+    }
 
     Agent
         .builder()
@@ -765,22 +1224,56 @@ pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeEr
                                 .description("Edit-the-codebase mode".to_string()),
                         ],
                     );
-                    let models = SessionModelState::new(
-                        cmod.lock().expect("model poisoned").clone(),
-                        vec![
-                            ModelInfo::new("gpt-4o-mini", "GPT-4o mini")
-                                .description("Fast, cheap".to_string()),
-                            ModelInfo::new("gpt-4o", "GPT-4o")
-                                .description("More capable".to_string()),
-                            ModelInfo::new("claude-sonnet", "Claude Sonnet")
-                                .description("Anthropic flagship".to_string()),
-                        ],
-                    );
-                    responder.respond(
+                    let mode = cm.lock().expect("mode poisoned").clone();
+                    let model = cmod.lock().expect("model poisoned").clone();
+                    let response =
                         NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
                             .modes(modes)
-                            .models(models),
-                    )
+                            .config_options(config_options_for(&mode, &model));
+                    responder.respond(response)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let cm = cm_for_set_config.clone();
+                let cmod = cmod_for_set_config.clone();
+                async move |req: SetSessionConfigOptionRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let config_id = req.config_id.0.to_string();
+                    let value = req
+                        .value
+                        .as_value_id()
+                        .map(|id| id.0.to_string())
+                        .unwrap_or_default();
+                    match config_id.as_str() {
+                        "mode" if ["ask", "architect", "code"].contains(&value.as_str()) => {
+                            *cm.lock().expect("mode poisoned") = value;
+                        }
+                        "model"
+                            if ["gpt-4o-mini", "gpt-4o", "claude-sonnet"]
+                                .contains(&value.as_str()) =>
+                        {
+                            *cmod.lock().expect("model poisoned") = value;
+                        }
+                        _ => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "unknown config option value",
+                                ),
+                            );
+                        }
+                    }
+                    let mode = cm.lock().expect("mode poisoned").clone();
+                    let model = cmod.lock().expect("model poisoned").clone();
+                    let options = config_options_for(&mode, &model);
+                    let _ = cx.send_notification(SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options.clone())),
+                    ));
+                    responder.respond(SetSessionConfigOptionResponse::new(options))
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -816,29 +1309,12 @@ pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeEr
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            {
-                let cmod = cmod_for_set_model.clone();
-                async move |req: SetSessionModelRequest,
-                            responder,
-                            _cx: ConnectionTo<agent_client_protocol::Client>| {
-                    let model_id = req.model_id.0.to_string();
-                    if !["gpt-4o-mini", "gpt-4o", "claude-sonnet"].contains(&model_id.as_str()) {
-                        return responder.respond_with_error(
-                            agent_client_protocol::util::internal_error(format!(
-                                "unknown model_id: {model_id}"
-                            )),
-                        );
-                    }
-                    *cmod.lock().expect("model poisoned") = model_id;
-                    responder.respond(SetSessionModelResponse::new())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
             async move |req: PromptRequest,
                         responder,
                         cx: ConnectionTo<agent_client_protocol::Client>| {
+                // Keep a prompt in flight long enough for setting tests to
+                // exercise the actor's serial command queue.
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 cx.send_notification(SessionNotification::new(
                     req.session_id.clone(),
                     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
@@ -850,13 +1326,297 @@ pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeEr
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent that advertises legacy modes alongside a non-mode config snapshot.
+/// The bridge must use `session/set_mode` instead of assuming every non-empty
+/// `config_options` list contains a mode option.
+pub async fn run_mixed_mode_capabilities_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        CurrentModeUpdate, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelect, SessionConfigSelectOption, SessionMode, SessionModeState,
+        SetSessionModeRequest, SetSessionModeResponse,
+    };
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+    let current_mode = std::sync::Arc::new(Mutex::new("ask".to_string()));
+    let current_mode_for_new = current_mode.clone();
+    let current_mode_for_set = current_mode.clone();
+
+    Agent
+        .builder()
+        .name("agui-bridge-mixed-mode-capabilities-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let current_mode = current_mode_for_new.clone();
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    let mode = current_mode.lock().expect("mode poisoned").clone();
+                    let modes = SessionModeState::new(
+                        mode,
+                        vec![
+                            SessionMode::new("ask", "Ask"),
+                            SessionMode::new("code", "Code"),
+                        ],
+                    );
+                    let model = SessionConfigOption::new(
+                        "model",
+                        "Model",
+                        SessionConfigKind::Select(SessionConfigSelect::new(
+                            "gpt-4o-mini",
+                            vec![SessionConfigSelectOption::new("gpt-4o-mini", "GPT-4o mini")],
+                        )),
+                    )
+                    .category(SessionConfigOptionCategory::Model);
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
+                            .modes(modes)
+                            .config_options(vec![model]),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let current_mode = current_mode_for_set.clone();
+                async move |req: SetSessionModeRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let mode = req.mode_id.0.to_string();
+                    if !["ask", "code"].contains(&mode.as_str()) {
+                        return responder.respond_with_error(
+                            agent_client_protocol::util::internal_error(format!(
+                                "unknown mode_id: {mode}"
+                            )),
+                        );
+                    }
+                    *current_mode.lock().expect("mode poisoned") = mode.clone();
+                    cx.send_notification(SessionNotification::new(
+                        req.session_id,
+                        SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(mode)),
+                    ))?;
+                    responder.respond(SetSessionModeResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("mixed mode ready"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture whose setting RPC never responds. The bridge must bound the
+/// actor-side wait and evict the now-uncertain session instead of reusing it.
+pub async fn run_unresponsive_setting_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+        SessionConfigSelectOption, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    };
+
+    fn mode_options(value: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    value.to_string(),
+                    vec![
+                        SessionConfigSelectOption::new("ask", "Ask"),
+                        SessionConfigSelectOption::new("code", "Code"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-unresponsive-setting-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(
+                    NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
+                        .config_options(mode_options("ask")),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: SetSessionConfigOptionRequest, _responder, _cx| {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                // The actor must close the connection before this response is
+                // reached; keeping the branch typed makes the fixture's
+                // behavior explicit without introducing a never type.
+                let _ = SetSessionConfigOptionResponse::new(mode_options("code"));
+                Ok(())
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("setting fixture ready"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent that emits a complete replacement `ConfigOptionUpdate` during the
+/// prompt. Used to prove the bridge does not merge stale option snapshots.
+pub async fn run_config_update_agent(stream: DuplexStream) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        ConfigOptionUpdate, SessionConfigKind, SessionConfigOption, SessionConfigSelect,
+        SessionConfigSelectOption,
+    };
+
+    fn options(id: &str, value: &str) -> Vec<SessionConfigOption> {
+        vec![SessionConfigOption::new(
+            id.to_string(),
+            "Config",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                value.to_string(),
+                vec![SessionConfigSelectOption::new(value.to_string(), "Value")],
+            )),
+        )]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+    Agent
+        .builder()
+        .name("agui-bridge-config-update-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(
+                    NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
+                        .config_options(options("initial", "before")),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options(
+                        "replacement",
+                        "after",
+                    ))),
+                ))?;
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("config updated"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -918,13 +1678,13 @@ pub async fn run_counting_agent(stream: DuplexStream, count: u32) -> Result<(), 
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -987,13 +1747,592 @@ pub async fn run_slow_handshake_agent(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Close behavior used by the lifecycle test agent.
+#[derive(Debug, Clone, Copy)]
+pub enum CloseBehavior {
+    Success,
+    Error,
+    Timeout,
+}
+
+/// ACP SessionIds received by a close-capable test agent.
+pub type SharedCloseSessionIds = std::sync::Arc<Mutex<Vec<String>>>;
+
+/// Coordination hooks for lifecycle claim race tests.
+#[derive(Clone, Debug)]
+pub struct LifecycleControl {
+    close_started: std::sync::Arc<Notify>,
+    allow_close: std::sync::Arc<Notify>,
+    setting_started: std::sync::Arc<Notify>,
+    setting_started_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    allow_setting: std::sync::Arc<Notify>,
+}
+
+impl LifecycleControl {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            close_started: std::sync::Arc::new(Notify::new()),
+            allow_close: std::sync::Arc::new(Notify::new()),
+            setting_started: std::sync::Arc::new(Notify::new()),
+            setting_started_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            allow_setting: std::sync::Arc::new(Notify::new()),
+        }
+    }
+
+    pub async fn wait_close_started(&self) {
+        self.close_started.notified().await;
+    }
+
+    pub async fn wait_setting_started(&self) {
+        self.setting_started.notified().await;
+    }
+
+    pub async fn wait_settings_started(&self, count: usize) {
+        loop {
+            let notified = self.setting_started.notified();
+            if self
+                .setting_started_count
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= count
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn release_close(&self) {
+        self.allow_close.notify_waiters();
+    }
+
+    pub fn release_setting(&self) {
+        self.allow_setting.notify_waiters();
+    }
+}
+
+impl Default for LifecycleControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Agent fixture that advertises `sessionCapabilities.close`, records the
+/// typed ACP SessionId in each close request, and returns the selected close
+/// outcome. The fixture also supports a normal prompt so endpoint admission
+/// tests can create a cached session through the real route.
+pub async fn run_close_agent(
+    stream: DuplexStream,
+    closed_ids: SharedCloseSessionIds,
+    behavior: CloseBehavior,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        CloseSessionRequest, CloseSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+    };
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-close-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version).agent_capabilities(
+                        AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                        ),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    "real-close-session-id",
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let closed_ids = closed_ids.clone();
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    closed_ids
+                        .lock()
+                        .expect("close ids poisoned")
+                        .push(req.session_id.0.to_string());
+                    match behavior {
+                        CloseBehavior::Success => responder.respond(CloseSessionResponse::new()),
+                        CloseBehavior::Error => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error("close failed"),
+                        ),
+                        CloseBehavior::Timeout => {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            responder.respond(CloseSessionResponse::new())
+                        }
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("close agent prompt"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Close-capable fixture with independently gated close and setting RPCs.
+/// Used to make lifecycle claim ordering deterministic in integration tests.
+pub async fn run_close_setting_agent(
+    stream: DuplexStream,
+    closed_ids: SharedCloseSessionIds,
+    control: LifecycleControl,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        CloseSessionRequest, CloseSessionResponse, SessionCapabilities, SessionCloseCapabilities,
+        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+        SessionConfigSelectOption, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    };
+
+    fn options(value: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    value.to_string(),
+                    vec![
+                        SessionConfigSelectOption::new("ask", "Ask"),
+                        SessionConfigSelectOption::new("code", "Code"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+            SessionConfigOption::new(
+                "model",
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "model-a",
+                    vec![SessionConfigSelectOption::new("model-a", "Model A")],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-close-setting-race-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version).agent_capabilities(
+                        AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().close(SessionCloseCapabilities::new()),
+                        ),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(
+                    NewSessionResponse::new(SessionId::from("real-close-session-id"))
+                        .config_options(options("ask")),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let closed_ids = closed_ids.clone();
+                let control = control.clone();
+                async move |req: CloseSessionRequest, responder, _cx| {
+                    closed_ids
+                        .lock()
+                        .expect("close ids poisoned")
+                        .push(req.session_id.0.to_string());
+                    let allowed = control.allow_close.notified();
+                    control.close_started.notify_waiters();
+                    allowed.await;
+                    responder.respond(CloseSessionResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                async move |_req: SetSessionConfigOptionRequest, responder, _cx| {
+                    let allowed = control.allow_setting.notified();
+                    control
+                        .setting_started_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
+                    control.setting_started.notify_waiters();
+                    allowed.await;
+                    responder.respond(SetSessionConfigOptionResponse::new(options("code")))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("close setting race prompt"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Delete behavior used by the session-delete lifecycle tests.
+#[derive(Debug, Clone, Copy)]
+pub enum DeleteBehavior {
+    Success,
+    Error,
+    Timeout,
+}
+
+/// ACP SessionIds received by a delete-capable test agent.
+pub type SharedDeleteSessionIds = std::sync::Arc<Mutex<Vec<String>>>;
+
+/// Agent fixture that advertises `sessionCapabilities.delete`, records the
+/// typed ACP SessionId in each delete request, and returns the selected
+/// outcome. It deliberately does not advertise `sessionCapabilities.list` so
+/// the bridge's delete capability check remains independent of listing.
+pub async fn run_delete_agent(
+    stream: DuplexStream,
+    deleted_ids: SharedDeleteSessionIds,
+    behavior: DeleteBehavior,
+) -> Result<(), BridgeError> {
+    run_delete_agent_with_session_id(stream, deleted_ids, behavior, "real-delete-session-id").await
+}
+
+/// Variant of [`run_delete_agent`] that lets a test model different cached
+/// ACP SessionIds under different logical thread keys.
+pub async fn run_delete_agent_with_session_id(
+    stream: DuplexStream,
+    deleted_ids: SharedDeleteSessionIds,
+    behavior: DeleteBehavior,
+    session_id: &'static str,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        DeleteSessionRequest, DeleteSessionResponse, SessionCapabilities, SessionDeleteCapabilities,
+    };
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-delete-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version).agent_capabilities(
+                        AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().delete(SessionDeleteCapabilities::new()),
+                        ),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(session_id)))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let deleted_ids = deleted_ids.clone();
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    deleted_ids
+                        .lock()
+                        .expect("delete ids poisoned")
+                        .push(req.session_id.0.to_string());
+                    match behavior {
+                        DeleteBehavior::Success => responder.respond(DeleteSessionResponse::new()),
+                        DeleteBehavior::Error => responder.respond_with_error(
+                            agent_client_protocol::util::internal_error("delete failed"),
+                        ),
+                        DeleteBehavior::Timeout => {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            responder.respond(DeleteSessionResponse::new())
+                        }
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("delete agent prompt"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Coordination hooks for delete admission and lifecycle-claim tests.
+#[derive(Clone, Debug)]
+pub struct DeleteLifecycleControl {
+    prompt_started: std::sync::Arc<Notify>,
+    allow_prompt: std::sync::Arc<Notify>,
+    setting_started: std::sync::Arc<Notify>,
+    allow_setting: std::sync::Arc<Notify>,
+    delete_started: std::sync::Arc<Notify>,
+    allow_delete: std::sync::Arc<Notify>,
+}
+
+impl DeleteLifecycleControl {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            prompt_started: std::sync::Arc::new(Notify::new()),
+            allow_prompt: std::sync::Arc::new(Notify::new()),
+            setting_started: std::sync::Arc::new(Notify::new()),
+            allow_setting: std::sync::Arc::new(Notify::new()),
+            delete_started: std::sync::Arc::new(Notify::new()),
+            allow_delete: std::sync::Arc::new(Notify::new()),
+        }
+    }
+
+    pub async fn wait_prompt_started(&self) {
+        self.prompt_started.notified().await;
+    }
+
+    pub async fn wait_setting_started(&self) {
+        self.setting_started.notified().await;
+    }
+
+    pub async fn wait_delete_started(&self) {
+        self.delete_started.notified().await;
+    }
+
+    pub fn release_prompt(&self) {
+        self.allow_prompt.notify_waiters();
+    }
+
+    pub fn release_setting(&self) {
+        self.allow_setting.notify_waiters();
+    }
+
+    pub fn release_delete(&self) {
+        self.allow_delete.notify_waiters();
+    }
+}
+
+impl Default for DeleteLifecycleControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Delete-capable fixture with independently gated prompt, setting, and
+/// delete requests.
+pub async fn run_delete_lifecycle_agent(
+    stream: DuplexStream,
+    deleted_ids: SharedDeleteSessionIds,
+    control: DeleteLifecycleControl,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        DeleteSessionRequest, DeleteSessionResponse, SessionCapabilities, SessionConfigKind,
+        SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+        SessionConfigSelectOption, SessionDeleteCapabilities, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse,
+    };
+
+    fn options(value: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    value.to_string(),
+                    vec![
+                        SessionConfigSelectOption::new("ask", "Ask"),
+                        SessionConfigSelectOption::new("code", "Code"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-delete-lifecycle-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version).agent_capabilities(
+                        AgentCapabilities::new().session_capabilities(
+                            SessionCapabilities::new().delete(SessionDeleteCapabilities::new()),
+                        ),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(
+                    NewSessionResponse::new(SessionId::from("real-delete-session-id"))
+                        .config_options(options("ask")),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let deleted_ids = deleted_ids.clone();
+                let control = control.clone();
+                async move |req: DeleteSessionRequest, responder, _cx| {
+                    deleted_ids
+                        .lock()
+                        .expect("delete ids poisoned")
+                        .push(req.session_id.0.to_string());
+                    control.delete_started.notify_waiters();
+                    control.allow_delete.notified().await;
+                    responder.respond(DeleteSessionResponse::new())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                async move |_: SetSessionConfigOptionRequest, responder, _cx| {
+                    control.setting_started.notify_waiters();
+                    control.allow_setting.notified().await;
+                    responder.respond(SetSessionConfigOptionResponse::new(options("code")))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                async move |req: PromptRequest,
+                            responder,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    control.prompt_started.notify_waiters();
+                    control.allow_prompt.notified().await;
+                    cx.send_notification(SessionNotification::new(
+                        req.session_id,
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new("delete lifecycle prompt"),
+                        ))),
+                    ))?;
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
@@ -1041,10 +2380,25 @@ pub async fn run_session_history_agent_with(
     stream: DuplexStream,
     store: SharedSessionStore,
 ) -> Result<(), BridgeError> {
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
-        SessionCapabilities, SessionInfo, SessionListCapabilities,
+        SessionCapabilities, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+        SessionConfigSelect, SessionConfigSelectOption, SessionInfo, SessionListCapabilities,
     };
+
+    fn history_config_options(value: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "history-mode",
+                "History mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    value.to_string(),
+                    vec![SessionConfigSelectOption::new("new", "New")],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+        ]
+    }
 
     let (read, write) = tokio::io::split(stream);
     let transport = ByteStreams::new(write.compat_write(), read.compat());
@@ -1080,7 +2434,10 @@ pub async fn run_session_history_agent_with(
                         .lock()
                         .expect("store poisoned")
                         .insert(id.clone(), (None, Vec::new()));
-                    responder.respond(NewSessionResponse::new(SessionId::from(id)))
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::from(id))
+                            .config_options(history_config_options("new")),
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1110,10 +2467,12 @@ pub async fn run_session_history_agent_with(
                     let sid = req.session_id.clone();
                     let history = {
                         let guard = store.lock().expect("store poisoned");
-                        guard
-                            .get(&sid.0.to_string())
-                            .map(|(_, h)| h.clone())
-                            .unwrap_or_default()
+                        let Some((_, history)) = guard.get(&sid.0.to_string()) else {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error("unknown session id"),
+                            );
+                        };
+                        history.clone()
                     };
                     // Replay the stored history as notifications before the
                     // load response (the contract `session/load` defines).
@@ -1125,7 +2484,9 @@ pub async fn run_session_history_agent_with(
                             )),
                         ))?;
                     }
-                    responder.respond(LoadSessionResponse::new())
+                    responder.respond(
+                        LoadSessionResponse::new().config_options(history_config_options("loaded")),
+                    )
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1172,13 +2533,13 @@ pub async fn run_session_history_agent_with(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
-            async move |message: Dispatch, cx: ConnectionTo<agent_client_protocol::Client>| {
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
                 match message {
-                    Dispatch::Response(result, router) => router.respond_with_result(result),
-                    other => other.respond_with_error(
-                        agent_client_protocol::util::internal_error("unhandled message"),
-                        cx,
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
                     ),
+                    Dispatch::Notification(_) => Ok(()),
                 }
             },
             agent_client_protocol::on_receive_dispatch!(),
