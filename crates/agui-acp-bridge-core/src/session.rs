@@ -23,10 +23,8 @@
 //!   `Allow`/`Deny` decisions respond inline; `Defer` decisions emit a
 //!   `BridgeStreamItem::Interrupt` and await an external resolution via
 //!   `AcpSessionHandle::resolve_permission` with `permission_timeout`.
-//! - Filesystem and terminal request handlers are dormant reject-only
-//!   handlers: the client does not advertise those capabilities during
-//!   `initialize`, so every such request receives method-not-found instead of
-//!   exposing partial implementations.
+//! - Filesystem and terminal request handlers are capability-gated by the
+//!   configured [`PermissionPolicy`] and the initialized platform backend.
 
 use std::path::PathBuf;
 use std::sync::{
@@ -39,18 +37,21 @@ use agent_client_protocol::schema::ProtocolVersion;
 #[cfg(feature = "unstable_session_model")]
 use agent_client_protocol::schema::v1::SessionConfigSelectOptions;
 use agent_client_protocol::schema::v1::{
-    CloseSessionRequest, ContentBlock, CreateTerminalRequest, DeleteSessionRequest, HttpHeader,
-    InitializeRequest, KillTerminalRequest, McpServer, McpServerHttp, NewSessionRequest,
-    NewSessionResponse, PromptRequest, ReadTextFileRequest, ReleaseTerminalRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionId, SessionMode, SessionModeState, SessionNotification, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalOutputRequest,
-    TextContent, WaitForTerminalExitRequest, WriteTextFileRequest,
+    BooleanConfigOptionCapabilities, ClientCapabilities, ClientSessionCapabilities,
+    CloseSessionRequest, ContentBlock, CreateTerminalRequest, DeleteSessionRequest,
+    FileSystemCapabilities, HttpHeader, InitializeRequest, KillTerminalRequest, McpServer,
+    McpServerHttp, NewSessionRequest, NewSessionResponse, PromptRequest, ReadTextFileRequest,
+    ReadTextFileResponse, ReleaseTerminalRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionId, SessionMode, SessionModeState,
+    SessionNotification, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    SetSessionModeRequest, StopReason, TerminalOutputRequest, WaitForTerminalExitRequest,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, RequestCancellation};
 use dashmap::DashMap;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::acp::{
@@ -63,6 +64,7 @@ use crate::policy::{PermissionDecision, PermissionPolicy};
 use crate::stream::{BridgeStreamItem, ModeOffering, SessionModesInit, SessionSummary};
 #[cfg(feature = "unstable_session_model")]
 use crate::stream::{ModelOffering, SessionModelsInit};
+use crate::terminal::TerminalRegistry;
 
 /// MCP server name advertised on `NewSessionRequest.mcp_servers`. Agents
 /// typically prefix the tool names they surface to their LLM with this
@@ -73,6 +75,13 @@ pub const MCP_SERVER_NAME: &str = "agui-acp-bridge";
 
 const COMMAND_BUFFER: usize = 8;
 const IN_PROCESS_DUPLEX_BUFFER: usize = 65_536;
+// ponytail: keep transient history/list budgets local until the existing
+// BridgeConfig surface grows dedicated values for these operations.
+const MAX_LOAD_HISTORY_EVENTS: usize = 4096;
+const MAX_LOAD_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LIST_SESSIONS: usize = 10_000;
+const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LIST_PAGES: usize = 1000;
 
 type EventSlot = Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>;
 
@@ -82,7 +91,92 @@ type EventSlot = Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>;
 /// dropped ("no active prompt"). When `Some`, the notification handler
 /// appends each update here instead; the actor flushes the buffer onto the
 /// first prompt's stream so the resuming client sees its prior conversation.
-type LoadBuffer = Arc<Mutex<Option<Vec<agent_client_protocol::schema::v1::SessionUpdate>>>>;
+#[derive(Debug, Default)]
+struct LoadHistory {
+    updates: Vec<agent_client_protocol::schema::v1::SessionUpdate>,
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl LoadHistory {
+    fn append(
+        &mut self,
+        update: agent_client_protocol::schema::v1::SessionUpdate,
+        bytes: usize,
+    ) -> Result<(), ()> {
+        if self.exceeded
+            || self.updates.len() >= MAX_LOAD_HISTORY_EVENTS
+            || bytes > MAX_LOAD_HISTORY_BYTES
+            || self.bytes > MAX_LOAD_HISTORY_BYTES - bytes
+        {
+            self.exceeded = true;
+            return Err(());
+        }
+        self.bytes += bytes;
+        self.updates.push(update);
+        Ok(())
+    }
+}
+
+type LoadBuffer = Arc<Mutex<Option<LoadHistory>>>;
+
+#[derive(Debug, Default)]
+struct BoundedSessionList {
+    summaries: Vec<SessionSummary>,
+    bytes: usize,
+}
+
+impl BoundedSessionList {
+    fn push(&mut self, summary: SessionSummary) -> Result<(), BridgeError> {
+        let bytes = serde_json::to_vec(&summary)
+            .map_err(BridgeError::Json)?
+            .len();
+        self.push_with_size(summary, bytes)
+    }
+
+    fn push_with_size(&mut self, summary: SessionSummary, bytes: usize) -> Result<(), BridgeError> {
+        if self.summaries.len() >= MAX_LIST_SESSIONS {
+            return Err(session_limit_error(
+                "session/list result exceeds the entry limit",
+            ));
+        }
+        if bytes > MAX_LIST_BYTES || self.bytes > MAX_LIST_BYTES - bytes {
+            return Err(session_limit_error(
+                "session/list result exceeds the byte limit",
+            ));
+        }
+        self.bytes += bytes;
+        self.summaries.push(summary);
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.summaries.len()
+    }
+
+    fn into_summaries(self) -> Vec<SessionSummary> {
+        self.summaries
+    }
+}
+
+fn next_list_cursor(pages: usize, next: Option<String>) -> Result<Option<String>, BridgeError> {
+    match next {
+        Some(next) if pages < MAX_LIST_PAGES => Ok(Some(next)),
+        Some(_) => Err(session_limit_error(
+            "session/list exceeded the page limit before the final page",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn session_limit_error(message: &'static str) -> BridgeError {
+    BridgeError::Acp(agent_client_protocol::Error::request_cancelled().data(message))
+}
+
+fn load_history_limit_error() -> agent_client_protocol::Error {
+    agent_client_protocol::Error::request_cancelled()
+        .data("session/load history exceeds the bridge event or byte limit")
+}
 
 pub(crate) async fn spawn_in_process_echo_session(
     cfg: SessionConfig,
@@ -285,6 +379,7 @@ where
 {
     let (result_tx, result_rx) = oneshot::channel::<Result<Vec<SessionSummary>, BridgeError>>();
     let cwd = cfg.cwd.clone();
+    let request_timeout = cfg.config.set_session_timeout;
 
     // A minimal client: we issue requests from the connection task and never
     // receive notifications/requests we care about, so the builder only needs
@@ -311,7 +406,7 @@ where
             let cwd = cwd.clone();
             let result_slot = result_tx;
             async move {
-                let outcome = list_sessions_inner(&cx, cwd).await;
+                let outcome = list_sessions_inner(&cx, cwd, request_timeout).await;
                 if let Some(tx) = result_slot.lock().expect("result slot poisoned").take() {
                     let _ = tx.send(outcome);
                 }
@@ -336,13 +431,14 @@ where
 /// connection down.
 pub(crate) async fn delete_session_via<T>(
     connector: T,
-    _cfg: SessionConfig,
+    cfg: SessionConfig,
     session_id: SessionId,
 ) -> Result<(), BridgeError>
 where
     T: ConnectTo<Client> + Send + 'static,
 {
     let (result_tx, result_rx) = oneshot::channel::<Result<(), BridgeError>>();
+    let request_timeout = cfg.config.set_session_timeout;
 
     let result_tx = std::sync::Mutex::new(Some(result_tx));
     let connect_result = agent_client_protocol::Client
@@ -365,7 +461,7 @@ where
         .connect_with(connector, move |cx: ConnectionTo<Agent>| {
             let result_slot = result_tx;
             async move {
-                let outcome = delete_session_inner(&cx, session_id).await;
+                let outcome = delete_session_inner(&cx, session_id, request_timeout).await;
                 if let Some(tx) = result_slot.lock().expect("result slot poisoned").take() {
                     let _ = tx.send(outcome);
                 }
@@ -388,14 +484,18 @@ where
 async fn list_sessions_inner(
     cx: &ConnectionTo<Agent>,
     _cwd: PathBuf,
+    request_timeout: Duration,
 ) -> Result<Vec<SessionSummary>, BridgeError> {
     use agent_client_protocol::schema::v1::ListSessionsRequest;
 
-    let init = cx
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
-        .block_task()
-        .await
-        .map_err(BridgeError::Acp)?;
+    let init = tokio::time::timeout(
+        request_timeout,
+        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task(),
+    )
+    .await
+    .map_err(|_| BridgeError::Timeout(request_timeout))?
+    .map_err(BridgeError::Acp)?;
 
     require_protocol_v1(init.protocol_version)?;
 
@@ -403,10 +503,10 @@ async fn list_sessions_inner(
         return Err(BridgeError::Unsupported("session/list".into()));
     }
 
-    let mut summaries: Vec<SessionSummary> = Vec::new();
+    let mut summaries = BoundedSessionList::default();
     let mut cursor: Option<String> = None;
     // Guard against a misbehaving agent returning an endless cursor chain.
-    let mut pages = 0u32;
+    let mut pages = 0usize;
     loop {
         // Intentionally do NOT filter by `cwd`: the history UI wants every
         // conversation the agent persists, and an exact-path filter is
@@ -418,10 +518,9 @@ async fn list_sessions_inner(
         if let Some(c) = cursor.take() {
             req = req.cursor(c);
         }
-        let resp = cx
-            .send_request(req)
-            .block_task()
+        let resp = tokio::time::timeout(request_timeout, cx.send_request(req).block_task())
             .await
+            .map_err(|_| BridgeError::Timeout(request_timeout))?
             .map_err(BridgeError::Acp)?;
 
         tracing::debug!(
@@ -431,35 +530,44 @@ async fn list_sessions_inner(
             "session/list page received"
         );
 
+        if resp.sessions.len() > MAX_LIST_SESSIONS.saturating_sub(summaries.len()) {
+            return Err(session_limit_error(
+                "session/list result exceeds the entry limit",
+            ));
+        }
         for info in resp.sessions {
             summaries.push(SessionSummary {
                 session_id: info.session_id.0.to_string(),
                 cwd: info.cwd.to_string_lossy().into_owned(),
                 title: info.title,
                 updated_at: info.updated_at,
-            });
+            })?;
         }
 
         pages += 1;
-        match resp.next_cursor {
-            Some(next) if pages < 1000 => cursor = Some(next),
-            _ => break,
+        match next_list_cursor(pages, resp.next_cursor)? {
+            Some(next) => cursor = Some(next),
+            None => break,
         }
     }
 
     tracing::info!(total = summaries.len(), "session/list complete");
-    Ok(summaries)
+    Ok(summaries.into_summaries())
 }
 
 async fn delete_session_inner(
     cx: &ConnectionTo<Agent>,
     session_id: SessionId,
+    request_timeout: Duration,
 ) -> Result<(), BridgeError> {
-    let init = cx
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
-        .block_task()
-        .await
-        .map_err(BridgeError::Acp)?;
+    let init = tokio::time::timeout(
+        request_timeout,
+        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task(),
+    )
+    .await
+    .map_err(|_| BridgeError::Timeout(request_timeout))?
+    .map_err(BridgeError::Acp)?;
 
     require_protocol_v1(init.protocol_version)?;
 
@@ -472,11 +580,15 @@ async fn delete_session_inner(
         return Err(BridgeError::Unsupported("session/delete".into()));
     }
 
-    cx.send_request(DeleteSessionRequest::new(session_id))
-        .block_task()
-        .await
-        .map(|_| ())
-        .map_err(BridgeError::Acp)
+    tokio::time::timeout(
+        request_timeout,
+        cx.send_request(DeleteSessionRequest::new(session_id))
+            .block_task(),
+    )
+    .await
+    .map_err(|_| BridgeError::Timeout(request_timeout))?
+    .map(|_| ())
+    .map_err(BridgeError::Acp)
 }
 
 struct SessionActorState {
@@ -544,14 +656,35 @@ async fn run_actor<T>(
         load_session_id,
     } = cfg;
     let permission_timeout = config.permission_timeout;
+    let filesystem_capabilities = policy.filesystem_capabilities();
+    let read_filesystem_enabled =
+        filesystem_capabilities.read_text_file && crate::file_ops::read_text_file_supported();
+    let write_filesystem_enabled =
+        filesystem_capabilities.write_text_file && crate::file_ops::write_text_file_supported();
+    let filesystem_capabilities = filesystem_capabilities
+        .read_text_file(read_filesystem_enabled)
+        .write_text_file(write_filesystem_enabled);
+    // Do not advertise terminal access unless the policy opts in and the
+    // platform-specific cwd/process backend initialized successfully.
+    let terminal_backend = if policy.terminal_capability() {
+        TerminalRegistry::new(cwd.clone()).ok()
+    } else {
+        None
+    };
+    let terminal_capability = terminal_backend.is_some();
     let cwd = Arc::new(cwd);
+    let filesystem_lock = Arc::new(AsyncMutex::new(()));
+    let (terminal_registry, terminal_registry_guard) = terminal_backend
+        .map(|(registry, guard)| (Some(registry), Some(guard)))
+        .unwrap_or((None, None));
 
     let pending_perms_for_handler = pending_permissions.clone();
     let pending_perms_for_drain = pending_permissions.clone();
     let turns_for_handler = turn_queue.clone();
     let turns_for_session = turn_queue.clone();
     let unusable_for_session = unusable.clone();
-
+    let read_filesystem_lock = filesystem_lock.clone();
+    let write_filesystem_lock = filesystem_lock.clone();
     let ready_tx = std::sync::Mutex::new(Some(ready_tx));
 
     let result = agent_client_protocol::Client
@@ -560,6 +693,23 @@ async fn run_actor<T>(
             {
                 let init_state = init_state.clone();
                 async move |notification: SessionNotification, _cx| {
+                    let load_state = load_buffer_for_notif
+                        .lock()
+                        .expect("load buffer poisoned")
+                        .as_ref()
+                        .map(|history| history.exceeded);
+                    if load_state == Some(true) {
+                        return Err(load_history_limit_error());
+                    }
+                    let load_bytes = if load_state == Some(false) {
+                        Some(
+                            serde_json::to_vec(&notification)
+                                .map_err(agent_client_protocol::Error::into_internal_error)?
+                                .len(),
+                        )
+                    } else {
+                        None
+                    };
                     // Keep the cached init state in sync with autonomous mode
                     // changes so the next prompt's SessionInit emission shows
                     // the right current mode. We still forward the
@@ -589,8 +739,12 @@ async fn run_actor<T>(
                     // the first prompt's stream.
                     {
                         let mut buf = load_buffer_for_notif.lock().expect("load buffer poisoned");
-                        if let Some(history) = buf.as_mut() {
-                            history.push(notification.update);
+                        if let Some(history) = buf.as_mut()
+                            && let Some(bytes) = load_bytes
+                        {
+                            if history.append(notification.update, bytes).is_err() {
+                                return Err(load_history_limit_error());
+                            }
                             return Ok(());
                         }
                     }
@@ -636,44 +790,227 @@ async fn run_actor<T>(
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: ReadTextFileRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let cwd = cwd.clone();
+                let filesystem_lock = read_filesystem_lock;
+                async move |req: ReadTextFileRequest, responder, cx| {
+                    if !read_filesystem_enabled {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+
+                    let cancellation = responder.cancellation();
+                    let cwd = cwd.clone();
+                    let filesystem_lock = filesystem_lock.clone();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = cancellation
+                            .run_until_cancelled(read_file_request(
+                                req,
+                                cwd,
+                                filesystem_lock,
+                                cancellation.clone(),
+                            ))
+                            .await;
+                        let result = if cancellation.is_cancelled() {
+                            Err(agent_client_protocol::Error::request_cancelled())
+                        } else {
+                            result
+                        };
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "filesystem read response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "filesystem read task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: WriteTextFileRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let cwd = cwd.clone();
+                let filesystem_lock = write_filesystem_lock;
+                async move |req: WriteTextFileRequest, responder, cx| {
+                    if !write_filesystem_enabled {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+
+                    let cancellation = responder.cancellation();
+                    let cwd = cwd.clone();
+                    let filesystem_lock = filesystem_lock.clone();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = write_file_request(
+                            req,
+                            cwd,
+                            filesystem_lock,
+                            cancellation.clone(),
+                        )
+                        .await;
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "filesystem write response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "filesystem write task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: CreateTerminalRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let registry = terminal_registry.clone();
+                async move |req: CreateTerminalRequest, responder, cx| {
+                    if !terminal_capability {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+                    let Some(registry) = registry.clone() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    };
+                    let cancellation = responder.cancellation();
+                    if let Err(error) = cx.spawn(async move {
+                        if let Err(error) = crate::terminal::create_request(
+                            req,
+                            registry,
+                            cancellation,
+                            responder,
+                        )
+                        .await
+                        {
+                            tracing::debug!(?error, "terminal create response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "terminal create task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: TerminalOutputRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let registry = terminal_registry.clone();
+                async move |req: TerminalOutputRequest, responder, cx| {
+                    if !terminal_capability {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+                    let Some(registry) = registry.clone() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    };
+                    let cancellation = responder.cancellation();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = crate::terminal::output_request(req, registry, cancellation).await;
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "terminal output response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "terminal output task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: WaitForTerminalExitRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let registry = terminal_registry.clone();
+                async move |req: WaitForTerminalExitRequest, responder, cx| {
+                    if !terminal_capability {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+                    let Some(registry) = registry.clone() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    };
+                    let cancellation = responder.cancellation();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = crate::terminal::wait_request(req, registry, cancellation).await;
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "terminal wait response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "terminal wait task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: KillTerminalRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let registry = terminal_registry.clone();
+                async move |req: KillTerminalRequest, responder, cx| {
+                    if !terminal_capability {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+                    let Some(registry) = registry.clone() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    };
+                    let cancellation = responder.cancellation();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = crate::terminal::kill_request(req, registry, cancellation).await;
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "terminal kill response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "terminal kill task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: ReleaseTerminalRequest, responder, _cx| {
-                responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+            {
+                let registry = terminal_registry.clone();
+                async move |req: ReleaseTerminalRequest, responder, cx| {
+                    if !terminal_capability {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    }
+                    let Some(registry) = registry.clone() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::method_not_found(),
+                        );
+                    };
+                    let cancellation = responder.cancellation();
+                    if let Err(error) = cx.spawn(async move {
+                        let result = crate::terminal::release_request(req, registry, cancellation).await;
+                        if let Err(error) = responder.respond_with_result(result) {
+                            tracing::debug!(?error, "terminal release response could not be sent");
+                        }
+                        Ok(())
+                    }) {
+                        tracing::debug!(?error, "terminal release task could not be spawned");
+                    }
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -698,6 +1035,9 @@ async fn run_actor<T>(
                     mcp_headers,
                     load_session_id,
                     &load_buffer,
+                    &init_state,
+                    filesystem_capabilities,
+                    terminal_capability,
                 )
                 .await
                 {
@@ -722,7 +1062,7 @@ async fn run_actor<T>(
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
                         SessionCommand::Prompt {
-                            text,
+                            prompt,
                             events_tx,
                             finished_tx,
                             turn,
@@ -751,7 +1091,7 @@ async fn run_actor<T>(
                             // subsequent prompts behave normally.
                             let replay = load_buffer.lock().expect("load buffer poisoned").take();
                             if let Some(history) = replay {
-                                for update in history {
+                                for update in history.updates {
                                     if events_tx
                                         .send(BridgeStreamItem::Update(update))
                                         .await
@@ -771,7 +1111,7 @@ async fn run_actor<T>(
                             let res = run_prompt_with_cancel(
                                 &cx,
                                 &session_id,
-                                text,
+                                prompt,
                                 &events_tx,
                                 turn.clone(),
                                 pending_permissions.clone(),
@@ -942,7 +1282,7 @@ async fn run_actor<T>(
                                 .await;
                             let replay = load_buffer.lock().expect("load buffer poisoned").take();
                             if let Some(history) = replay {
-                                for update in history {
+                                for update in history.updates {
                                     if events_tx
                                         .send(BridgeStreamItem::Update(update))
                                         .await
@@ -966,6 +1306,11 @@ async fn run_actor<T>(
             }
         })
         .await;
+
+    if let Some(registry) = terminal_registry.as_ref() {
+        registry.shutdown();
+    }
+    drop(terminal_registry_guard);
 
     // Every exit path below represents a dead actor. Mark the shared handle
     // first so new prompts fail closed, then release every queued admission
@@ -1024,20 +1369,116 @@ fn send_setting_ack(
     }
 }
 
+fn file_operation_error(error: BridgeError) -> agent_client_protocol::Error {
+    match crate::file_ops::error_kind(&error) {
+        crate::file_ops::FileErrorKind::InvalidParams => {
+            agent_client_protocol::Error::invalid_params()
+        }
+        crate::file_ops::FileErrorKind::ResourceNotFound => {
+            agent_client_protocol::Error::resource_not_found(None)
+        }
+        crate::file_ops::FileErrorKind::Internal => agent_client_protocol::Error::internal_error(),
+    }
+}
+
+fn request_path(path: &std::path::Path) -> Result<&str, agent_client_protocol::Error> {
+    path.to_str()
+        .ok_or_else(agent_client_protocol::Error::invalid_params)
+}
+
+fn request_line(value: Option<u32>) -> Result<Option<usize>, agent_client_protocol::Error> {
+    value
+        .map(|value| {
+            usize::try_from(value).map_err(|_| agent_client_protocol::Error::invalid_params())
+        })
+        .transpose()
+}
+
+async fn read_file_request(
+    request: ReadTextFileRequest,
+    cwd: Arc<PathBuf>,
+    filesystem_lock: Arc<AsyncMutex<()>>,
+    cancellation: RequestCancellation,
+) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+
+    let path = request_path(&request.path)?;
+    let line = request_line(request.line)?;
+    let limit = request_line(request.limit)?;
+    let _guard = filesystem_lock.lock().await;
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+
+    crate::file_ops::read_text_file_range(cwd.as_path(), path, line, limit)
+        .await
+        .map(ReadTextFileResponse::new)
+        .map_err(file_operation_error)
+}
+
+async fn write_file_request(
+    request: WriteTextFileRequest,
+    cwd: Arc<PathBuf>,
+    filesystem_lock: Arc<AsyncMutex<()>>,
+    cancellation: RequestCancellation,
+) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+    if request.content.len() > crate::file_ops::MAX_TEXT_FILE_BYTES {
+        return Err(agent_client_protocol::Error::invalid_params());
+    }
+
+    let path = request_path(&request.path)?;
+    let _guard = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            return Err(agent_client_protocol::Error::request_cancelled());
+        }
+        guard = filesystem_lock.lock() => guard,
+    };
+    if cancellation.is_cancelled() {
+        return Err(agent_client_protocol::Error::request_cancelled());
+    }
+
+    crate::file_ops::write_text_file(cwd.as_path(), path, &request.content)
+        .await
+        .map(|_| WriteTextFileResponse::new())
+        .map_err(file_operation_error)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn initialize(
     cx: &ConnectionTo<Agent>,
     cwd: PathBuf,
     mcp_url: Option<String>,
     mcp_headers: Vec<HttpHeader>,
-    load_session_id: Option<String>,
+    load_session_id: Option<SessionId>,
     load_buffer: &LoadBuffer,
+    init_state: &Mutex<SessionInitState>,
+    filesystem_capabilities: FileSystemCapabilities,
+    terminal_capability: bool,
 ) -> Result<(SessionId, SessionInitState, bool), BridgeError> {
     // Send the agent a conventional absolute cwd (no Windows `\\?\` verbatim
     // prefix) so its persisted session directory matches what other tools use
     // and directory-scoped `session/list` can find it later.
     let cwd = crate::file_ops::acp_cwd(&cwd);
     let init_response = cx
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .send_request(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                ClientCapabilities::new()
+                    .fs(filesystem_capabilities)
+                    .terminal(terminal_capability)
+                    .session(
+                        ClientSessionCapabilities::new().config_options(
+                            SessionConfigOptionsCapabilities::new()
+                                .boolean(BooleanConfigOptionCapabilities::new()),
+                        ),
+                    ),
+            ),
+        )
         .block_task()
         .await
         .map_err(BridgeError::Acp)?;
@@ -1080,20 +1521,20 @@ async fn initialize(
                 "agent does not advertise loadSession".into(),
             ));
         }
-        if sid.trim().is_empty() {
+        if sid.0.trim().is_empty() {
             return Err(BridgeError::ResumeFailed(
                 "session/load requires a non-empty session id".into(),
             ));
         }
 
         use agent_client_protocol::schema::v1::LoadSessionRequest;
-        let session_id = SessionId::from(sid);
+        let session_id = sid;
         // Arm the buffer so history notifications are captured rather
         // than dropped ("no active prompt").
         load_buffer
             .lock()
             .expect("load buffer poisoned")
-            .replace(Vec::new());
+            .replace(LoadHistory::default());
         let mut req = LoadSessionRequest::new(session_id.clone(), cwd.clone());
         if !mcp_servers.is_empty() {
             req = req.mcp_servers(mcp_servers.clone());
@@ -1101,13 +1542,35 @@ async fn initialize(
         let load = cx.send_request(req).block_task().await;
         match load {
             Ok(resp) => {
-                let init = init_state_from_load(&resp);
+                let exceeded = load_buffer
+                    .lock()
+                    .expect("load buffer poisoned")
+                    .as_ref()
+                    .is_some_and(|history| history.exceeded);
+                if exceeded {
+                    load_buffer.lock().expect("load buffer poisoned").take();
+                    return Err(BridgeError::ResumeFailed(
+                        "session/load history exceeds the bridge event or byte limit".into(),
+                    ));
+                }
+                let current = init_state.lock().expect("init_state poisoned").clone();
+                let init = init_state_from_load(&resp, &current);
                 return Ok((session_id, init, supports_close));
             }
             Err(error) => {
                 // A strict resume never falls through to session/new. Clear
                 // any replay notifications before surfacing the load error.
+                let exceeded = load_buffer
+                    .lock()
+                    .expect("load buffer poisoned")
+                    .as_ref()
+                    .is_some_and(|history| history.exceeded);
                 load_buffer.lock().expect("load buffer poisoned").take();
+                if exceeded {
+                    return Err(BridgeError::ResumeFailed(
+                        "session/load history exceeds the bridge event or byte limit".into(),
+                    ));
+                }
                 return Err(BridgeError::ResumeFailed(format!(
                     "session/load failed: {error}"
                 )));
@@ -1134,22 +1597,25 @@ fn mcp_http_server(url: String, headers: Vec<HttpHeader>) -> McpServer {
     McpServer::Http(McpServerHttp::new(MCP_SERVER_NAME, url).headers(headers))
 }
 
-/// Extract init state from a `LoadSessionResponse` (mirrors
-/// [`extract_init_state`] for `NewSessionResponse`).
+/// Merge the fields supplied by a `LoadSessionResponse` into state collected
+/// while replaying the loaded session. Absent response fields do not clear the
+/// replayed capability snapshot.
 fn init_state_from_load(
     resp: &agent_client_protocol::schema::v1::LoadSessionResponse,
+    current: &SessionInitState,
 ) -> SessionInitState {
-    SessionInitState {
-        modes: resp.modes.as_ref().map(modes_from_state),
-        #[cfg(feature = "unstable_session_model")]
-        models: resp
-            .config_options
-            .as_deref()
-            .and_then(models_from_config_options),
-        #[cfg(not(feature = "unstable_session_model"))]
-        models: None,
-        config_options: resp.config_options.clone(),
+    let mut init = current.clone();
+    if let Some(modes) = resp.modes.as_ref() {
+        init.modes = Some(modes_from_state(modes));
     }
+    if let Some(config_options) = resp.config_options.as_ref() {
+        init.config_options = Some(config_options.clone());
+        #[cfg(feature = "unstable_session_model")]
+        {
+            init.models = models_from_config_options(config_options);
+        }
+    }
+    init
 }
 
 /// Convert the stable model config option into the bridge's legacy serializable
@@ -1286,14 +1752,14 @@ async fn send_set_config_option(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     config_id: &str,
-    value: &str,
+    value: &SessionConfigOptionValue,
     init_state: Arc<Mutex<SessionInitState>>,
 ) -> Result<(), BridgeError> {
     let response: SetSessionConfigOptionResponse = cx
         .send_request(SetSessionConfigOptionRequest::new(
             session_id.clone(),
             config_id.to_string(),
-            value,
+            value.clone(),
         ))
         .block_task()
         .await
@@ -1318,7 +1784,7 @@ async fn send_set_config_option(
 async fn run_prompt_with_cancel(
     cx: &ConnectionTo<Agent>,
     session_id: &agent_client_protocol::schema::v1::SessionId,
-    text: String,
+    prompt: Vec<ContentBlock>,
     events_tx: &mpsc::Sender<BridgeStreamItem>,
     turn: Arc<TurnState>,
     pending_permissions: PendingPermissions,
@@ -1344,13 +1810,10 @@ async fn run_prompt_with_cancel(
     }
 
     let mut prompt_fut = std::pin::pin!(async {
-        cx.send_request(PromptRequest::new(
-            session_id.clone(),
-            vec![ContentBlock::Text(TextContent::new(text))],
-        ))
-        .block_task()
-        .await
-        .map_err(BridgeError::Acp)
+        cx.send_request(PromptRequest::new(session_id.clone(), prompt))
+            .block_task()
+            .await
+            .map_err(BridgeError::Acp)
     });
 
     let mut cancel_deadline = Box::pin(tokio::time::sleep(Duration::from_secs(
@@ -1772,6 +2235,585 @@ mod tests {
             .map_err(BridgeError::Acp)
     }
 
+    #[derive(Debug)]
+    struct FilesystemPolicy {
+        capabilities: FileSystemCapabilities,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::policy::PermissionPolicy for FilesystemPolicy {
+        async fn decide(
+            &self,
+            _request: &agent_client_protocol::schema::v1::RequestPermissionRequest,
+        ) -> PermissionDecision {
+            PermissionDecision::Deny
+        }
+
+        fn filesystem_capabilities(&self) -> FileSystemCapabilities {
+            self.capabilities.clone()
+        }
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct FilesystemProbe {
+        capabilities: Option<FileSystemCapabilities>,
+        read: Option<Result<String, i32>>,
+        write: Option<Result<(), i32>>,
+        read_after_write: Option<Result<String, i32>>,
+    }
+
+    async fn run_filesystem_probe(capabilities: FileSystemCapabilities) -> FilesystemProbe {
+        let raw =
+            std::env::temp_dir().join(format!("agui-filesystem-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&raw).unwrap();
+        let cwd = crate::file_ops::canonicalize_cwd(&raw).unwrap();
+        std::fs::write(cwd.join("roundtrip.txt"), "before\n世界\n").unwrap();
+
+        let probe = Arc::new(Mutex::new(FilesystemProbe::default()));
+        let probe_for_agent = probe.clone();
+        let path = cwd.join("roundtrip.txt").to_string_lossy().into_owned();
+        let cfg = SessionConfig {
+            cwd,
+            policy: Arc::new(FilesystemPolicy { capabilities }),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(run_filesystem_probe_agent(stream, path, probe_for_agent))
+        })
+        .await
+        .expect("filesystem session opens");
+        let mut prompt = handle.prompt("probe").await.expect("prompt opens");
+        while let Some(item) = prompt.events.recv().await {
+            if matches!(item, BridgeStreamItem::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
+        drop(handle);
+        let result = probe.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(raw);
+        result
+    }
+
+    async fn run_filesystem_probe_agent(
+        stream: tokio::io::DuplexStream,
+        path: String,
+        probe: Arc<Mutex<FilesystemProbe>>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PromptResponse,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+
+        Agent
+            .builder()
+            .name("agui-bridge-filesystem-test")
+            .on_receive_request(
+                {
+                    let probe = probe.clone();
+                    async move |req: InitializeRequest, responder, _cx| {
+                        probe.lock().unwrap().capabilities = Some(req.client_capabilities.fs);
+                        responder.respond(
+                            InitializeResponse::new(req.protocol_version)
+                                .agent_capabilities(AgentCapabilities::new()),
+                        )
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("filesystem-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let probe = probe.clone();
+                    async move |req: PromptRequest,
+                                responder,
+                                cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let session_id = req.session_id;
+                        let path = path.clone();
+                        let probe = probe.clone();
+                        let cx_for_requests = cx.clone();
+                        cx.spawn(async move {
+                            let read = cx_for_requests
+                                .send_request(ReadTextFileRequest::new(
+                                    session_id.clone(),
+                                    path.clone(),
+                                ))
+                                .block_task()
+                                .await;
+                            probe.lock().unwrap().read = Some(match read {
+                                Ok(response) => Ok(response.content),
+                                Err(error) => Err(error.code.into()),
+                            });
+
+                            let write = cx_for_requests
+                                .send_request(WriteTextFileRequest::new(
+                                    session_id.clone(),
+                                    path.clone(),
+                                    "after\n",
+                                ))
+                                .block_task()
+                                .await;
+                            let write_ok = write.is_ok();
+                            probe.lock().unwrap().write = Some(match write {
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(error.code.into()),
+                            });
+
+                            if write_ok {
+                                let read_after = cx_for_requests
+                                    .send_request(ReadTextFileRequest::new(session_id, path))
+                                    .block_task()
+                                    .await;
+                                probe.lock().unwrap().read_after_write = Some(match read_after {
+                                    Ok(response) => Ok(response.content),
+                                    Err(error) => Err(error.code.into()),
+                                });
+                            }
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(
+                                "unhandled request",
+                            )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Default, Clone)]
+    struct CancellationProbe {
+        first_write: Option<Result<(), i32>>,
+        second_write: Option<Result<(), i32>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_deterministic_write_cancellation_probe()
+    -> (CancellationProbe, (bool, bool), (bool, bool)) {
+        let raw =
+            std::env::temp_dir().join(format!("agui-filesystem-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&raw).unwrap();
+        let cwd = crate::file_ops::canonicalize_cwd(&raw).unwrap();
+        let first_target = cwd.join("first.txt");
+        let second_target = cwd.join("second.txt");
+        let first_path = first_target.to_string_lossy().into_owned();
+        let second_path = second_target.to_string_lossy().into_owned();
+        let gate = Arc::new(crate::file_ops::WriteGate {
+            path: first_target.clone(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        crate::file_ops::install_write_gate(gate.clone());
+        let started = gate.started.notified();
+        let probe = Arc::new(Mutex::new(CancellationProbe::default()));
+        let probe_for_agent = probe.clone();
+        let (cancel_done_tx, cancel_done_rx) = oneshot::channel();
+        let gate_for_agent = gate.clone();
+
+        let cfg = SessionConfig {
+            cwd,
+            policy: Arc::new(FilesystemPolicy {
+                capabilities: FileSystemCapabilities::new().write_text_file(true),
+            }),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(run_cancellation_agent(
+                stream,
+                first_path,
+                second_path,
+                gate_for_agent,
+                probe_for_agent,
+                cancel_done_tx,
+            ))
+        })
+        .await
+        .expect("filesystem cancellation session opens");
+
+        let mut prompt = handle.prompt("cancel").await.expect("prompt opens");
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("first write must reach the in-flight gate");
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel_done_rx)
+            .await
+            .expect("cancellation must be sent")
+            .expect("cancellation signal must remain connected");
+
+        let before_release = (first_target.exists(), second_target.exists());
+        gate.release.notify_waiters();
+
+        while let Some(item) = prompt.events.recv().await {
+            if matches!(item, BridgeStreamItem::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
+        drop(handle);
+        let result = probe.lock().unwrap().clone();
+        crate::file_ops::clear_write_gate();
+        let after_release = (first_target.exists(), second_target.exists());
+        let _ = std::fs::remove_dir_all(raw);
+        (result, before_release, after_release)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_cancellation_agent(
+        stream: tokio::io::DuplexStream,
+        first_path: String,
+        second_path: String,
+        gate: Arc<crate::file_ops::WriteGate>,
+        probe: Arc<Mutex<CancellationProbe>>,
+        cancel_done_tx: oneshot::Sender<()>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PromptResponse,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+
+        Agent
+            .builder()
+            .name("agui-bridge-filesystem-cancellation-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("cancel-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let first_path = first_path.clone();
+                    let second_path = second_path.clone();
+                    let gate = gate.clone();
+                    let probe = probe.clone();
+                    let cancel_done_tx = Arc::new(Mutex::new(Some(cancel_done_tx)));
+                    async move |req: PromptRequest,
+                                responder,
+                                cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let session_id = req.session_id;
+                        let first_path = first_path.clone();
+                        let second_path = second_path.clone();
+                        let gate = gate.clone();
+                        let probe = probe.clone();
+                        let cancel_done_tx = cancel_done_tx.clone();
+                        let cx_for_requests = cx.clone();
+                        cx.spawn(async move {
+                            let first = cx_for_requests.send_request(WriteTextFileRequest::new(
+                                session_id.clone(),
+                                first_path,
+                                "first",
+                            ));
+                            gate.started.notified().await;
+
+                            let second = cx_for_requests.send_request(WriteTextFileRequest::new(
+                                session_id,
+                                second_path,
+                                "second",
+                            ));
+                            let _ = first.cancel();
+                            let _ = second.cancel();
+                            if let Some(tx) = cancel_done_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+
+                            let second_result = second.block_task().await;
+                            probe.lock().unwrap().second_write = Some(match second_result {
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(error.code.into()),
+                            });
+                            let first_result = first.block_task().await;
+                            probe.lock().unwrap().first_write = Some(match first_result {
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(error.code.into()),
+                            });
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(
+                                "unhandled request",
+                            )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Clone)]
+    struct BoundaryPaths {
+        outside: String,
+        missing: String,
+        invalid_utf8: String,
+        ordinary_io: String,
+        oversized_write: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, Default, Clone)]
+    struct BoundaryProbe {
+        codes: Vec<i32>,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_filesystem_boundary_probe() -> (BoundaryProbe, bool) {
+        let raw =
+            std::env::temp_dir().join(format!("agui-filesystem-boundary-{}", uuid::Uuid::new_v4()));
+        let outside_raw = std::env::temp_dir().join(format!(
+            "agui-filesystem-boundary-outside-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&raw).unwrap();
+        std::fs::create_dir_all(&outside_raw).unwrap();
+        let cwd = crate::file_ops::canonicalize_cwd(&raw).unwrap();
+        let outside = crate::file_ops::canonicalize_cwd(&outside_raw).unwrap();
+        std::fs::write(outside.join("outside.txt"), "outside").unwrap();
+        std::fs::write(cwd.join("invalid.txt"), [0xff, 0xfe]).unwrap();
+        std::fs::write(cwd.join("not-a-directory"), "file").unwrap();
+        let paths = BoundaryPaths {
+            outside: outside.join("outside.txt").to_string_lossy().into_owned(),
+            missing: cwd.join("missing.txt").to_string_lossy().into_owned(),
+            invalid_utf8: cwd.join("invalid.txt").to_string_lossy().into_owned(),
+            ordinary_io: cwd
+                .join("not-a-directory")
+                .join("child.txt")
+                .to_string_lossy()
+                .into_owned(),
+            oversized_write: cwd.join("oversized.txt").to_string_lossy().into_owned(),
+        };
+        let probe = Arc::new(Mutex::new(BoundaryProbe::default()));
+        let probe_for_agent = probe.clone();
+        let cfg = SessionConfig {
+            cwd,
+            policy: Arc::new(FilesystemPolicy {
+                capabilities: FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true),
+            }),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(run_boundary_agent(stream, paths, probe_for_agent))
+        })
+        .await
+        .expect("filesystem boundary session opens");
+        let mut prompt = handle.prompt("boundary").await.expect("prompt opens");
+        while let Some(item) = prompt.events.recv().await {
+            if matches!(item, BridgeStreamItem::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
+        drop(handle);
+        let result = probe.lock().unwrap().clone();
+        let oversized_exists = raw.join("oversized.txt").exists();
+        let _ = std::fs::remove_dir_all(raw);
+        let _ = std::fs::remove_dir_all(outside_raw);
+        (result, oversized_exists)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_boundary_agent(
+        stream: tokio::io::DuplexStream,
+        paths: BoundaryPaths,
+        probe: Arc<Mutex<BoundaryProbe>>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PromptResponse,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+        Agent
+            .builder()
+            .name("agui-bridge-filesystem-boundary-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("boundary-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let probe = probe.clone();
+                    async move |req: PromptRequest,
+                                responder,
+                                cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let session_id = req.session_id;
+                        let paths = paths.clone();
+                        let probe = probe.clone();
+                        let cx_for_requests = cx.clone();
+                        cx.spawn(async move {
+                            let code = |result: Result<
+                                agent_client_protocol::schema::v1::ReadTextFileResponse,
+                                agent_client_protocol::Error,
+                            >| match result {
+                                Ok(_) => 0,
+                                Err(error) => error.code.into(),
+                            };
+                            let mut codes = Vec::with_capacity(6);
+                            codes.push(
+                                code(cx_for_requests
+                                    .send_request(ReadTextFileRequest::new(
+                                        session_id.clone(),
+                                        "relative.txt",
+                                    ))
+                                    .block_task()
+                                    .await),
+                            );
+                            codes.push(
+                                code(cx_for_requests
+                                    .send_request(ReadTextFileRequest::new(
+                                        session_id.clone(),
+                                        paths.outside,
+                                    ))
+                                    .block_task()
+                                    .await),
+                            );
+                            codes.push(
+                                code(cx_for_requests
+                                    .send_request(ReadTextFileRequest::new(
+                                        session_id.clone(),
+                                        paths.missing,
+                                    ))
+                                    .block_task()
+                                    .await),
+                            );
+                            codes.push(
+                                code(cx_for_requests
+                                    .send_request(ReadTextFileRequest::new(
+                                        session_id.clone(),
+                                        paths.invalid_utf8,
+                                    ))
+                                    .block_task()
+                                    .await),
+                            );
+
+                            let ordinary_io = cx_for_requests
+                                .send_request(WriteTextFileRequest::new(
+                                    session_id.clone(),
+                                    paths.ordinary_io,
+                                    "ordinary I/O error",
+                                ))
+                                .block_task()
+                                .await;
+                            codes.push(match ordinary_io {
+                                Ok(_) => 0,
+                                Err(error) => error.code.into(),
+                            });
+
+                            let oversized = cx_for_requests
+                                .send_request(WriteTextFileRequest::new(
+                                    session_id,
+                                    paths.oversized_write,
+                                    "x".repeat(crate::file_ops::MAX_TEXT_FILE_BYTES + 1),
+                                ))
+                                .block_task()
+                                .await;
+                            codes.push(match oversized {
+                                Ok(_) => 0,
+                                Err(error) => error.code.into(),
+                            });
+                            probe.lock().unwrap().codes = codes;
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(
+                                "unhandled request",
+                            )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
     #[test]
     fn successful_setting_ack_send_failure_marks_session_unusable() {
         let unusable = AtomicBool::new(false);
@@ -1782,6 +2824,112 @@ mod tests {
         // before the actor could deliver the result.
         assert!(!send_setting_ack(ack, Ok(()), &unusable));
         assert!(unusable.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn load_init_state_merges_replayed_capabilities_with_partial_response() {
+        use agent_client_protocol::schema::v1::{
+            LoadSessionResponse, SessionConfigKind, SessionConfigOption,
+            SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
+            SessionMode,
+        };
+
+        let replayed_options = vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "replayed-mode",
+                    vec![SessionConfigSelectOption::new(
+                        "replayed-mode",
+                        "Replayed mode",
+                    )],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+            SessionConfigOption::new(
+                "model",
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "replayed-model",
+                    vec![SessionConfigSelectOption::new(
+                        "replayed-model",
+                        "Replayed model",
+                    )],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ];
+        let replayed_mode = SessionModeState::new(
+            "replayed-mode",
+            vec![SessionMode::new("replayed-mode", "Replayed mode")],
+        );
+        let replayed = SessionInitState {
+            modes: Some(modes_from_state(&replayed_mode)),
+            #[cfg(feature = "unstable_session_model")]
+            models: models_from_config_options(&replayed_options),
+            #[cfg(not(feature = "unstable_session_model"))]
+            models: None,
+            config_options: Some(replayed_options.clone()),
+        };
+
+        let response_mode = SessionModeState::new(
+            "response-mode",
+            vec![SessionMode::new("response-mode", "Response mode")],
+        );
+        let merged =
+            init_state_from_load(&LoadSessionResponse::new().modes(response_mode), &replayed);
+        assert_eq!(
+            merged
+                .modes
+                .as_ref()
+                .map(|modes| modes.current_mode_id.as_str()),
+            Some("response-mode")
+        );
+        assert_eq!(merged.config_options, Some(replayed_options.clone()));
+        #[cfg(feature = "unstable_session_model")]
+        assert_eq!(
+            merged
+                .models
+                .as_ref()
+                .map(|models| models.current_model_id.as_str()),
+            Some("replayed-model")
+        );
+
+        let response_options = vec![
+            SessionConfigOption::new(
+                "model",
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "response-model",
+                    vec![SessionConfigSelectOption::new(
+                        "response-model",
+                        "Response model",
+                    )],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ];
+        let merged = init_state_from_load(
+            &LoadSessionResponse::new().config_options(response_options.clone()),
+            &replayed,
+        );
+        assert_eq!(
+            merged
+                .modes
+                .as_ref()
+                .map(|modes| modes.current_mode_id.as_str()),
+            Some("replayed-mode")
+        );
+        assert_eq!(merged.config_options, Some(response_options));
+        #[cfg(feature = "unstable_session_model")]
+        assert_eq!(
+            merged
+                .models
+                .as_ref()
+                .map(|models| models.current_model_id.as_str()),
+            Some("response-model")
+        );
     }
 
     #[test]
@@ -1846,5 +2994,220 @@ mod tests {
         );
         assert!(capabilities_ok.load(Ordering::SeqCst));
         assert_eq!(unsupported.load(Ordering::SeqCst), 7);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_and_write_capabilities_are_independent_and_roundtrip() {
+        if !crate::file_ops::read_text_file_supported() {
+            let unsupported = run_filesystem_probe(
+                FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true),
+            )
+            .await;
+            assert_eq!(
+                unsupported.capabilities,
+                Some(FileSystemCapabilities::default())
+            );
+            assert_eq!(unsupported.read, Some(Err(-32601)));
+            assert_eq!(unsupported.write, Some(Err(-32601)));
+            assert_eq!(unsupported.read_after_write, None);
+            return;
+        }
+
+        let both = run_filesystem_probe(
+            FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true),
+        )
+        .await;
+        assert_eq!(
+            both.capabilities,
+            Some(
+                FileSystemCapabilities::new()
+                    .read_text_file(true)
+                    .write_text_file(true)
+            )
+        );
+        assert_eq!(both.read, Some(Ok("before\n世界\n".into())));
+        assert_eq!(both.write, Some(Ok(())));
+        assert_eq!(both.read_after_write, Some(Ok("after\n".into())));
+
+        let read_only =
+            run_filesystem_probe(FileSystemCapabilities::new().read_text_file(true)).await;
+        assert_eq!(
+            read_only.capabilities,
+            Some(FileSystemCapabilities::new().read_text_file(true))
+        );
+        assert_eq!(read_only.read, Some(Ok("before\n世界\n".into())));
+        assert_eq!(read_only.write, Some(Err(-32601)));
+        assert_eq!(read_only.read_after_write, None);
+
+        let write_only =
+            run_filesystem_probe(FileSystemCapabilities::new().write_text_file(true)).await;
+        assert_eq!(
+            write_only.capabilities,
+            Some(FileSystemCapabilities::new().write_text_file(true))
+        );
+        assert_eq!(write_only.read, Some(Err(-32601)));
+        assert_eq!(write_only.write, Some(Ok(())));
+        assert_eq!(write_only.read_after_write, Some(Err(-32601)));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn unsupported_filesystem_capabilities_are_not_advertised() {
+        let probe = run_filesystem_probe(
+            FileSystemCapabilities::new()
+                .read_text_file(true)
+                .write_text_file(true),
+        )
+        .await;
+        assert_eq!(probe.capabilities, Some(FileSystemCapabilities::default()));
+        assert_eq!(probe.read, Some(Err(-32601)));
+        assert_eq!(probe.write, Some(Err(-32601)));
+        assert_eq!(probe.read_after_write, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn filesystem_requests_return_exact_boundary_error_codes() {
+        if !crate::file_ops::read_text_file_supported() {
+            return;
+        }
+        let (probe, oversized_exists) = run_filesystem_boundary_probe().await;
+        assert_eq!(
+            probe.codes,
+            vec![-32602, -32602, -32002, -32603, -32603, -32602]
+        );
+        assert!(
+            !oversized_exists,
+            "an oversized write must be rejected before touching disk"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_cancellation_is_deterministic_before_and_after_start() {
+        if !crate::file_ops::read_text_file_supported() {
+            return;
+        }
+        let (probe, before_release, after_release) =
+            run_deterministic_write_cancellation_probe().await;
+        assert_eq!(probe.first_write, Some(Ok(())));
+        assert_eq!(probe.second_write, Some(Err(-32800)));
+        assert_eq!(before_release, (false, false));
+        assert_eq!(after_release, (true, false));
+    }
+
+    #[test]
+    fn filesystem_handler_error_constructors_use_exact_acp_codes() {
+        assert_eq!(
+            i32::from(agent_client_protocol::Error::method_not_found().code),
+            -32601
+        );
+        assert_eq!(
+            i32::from(agent_client_protocol::Error::invalid_params().code),
+            -32602
+        );
+        assert_eq!(
+            i32::from(agent_client_protocol::Error::resource_not_found(None).code),
+            -32002
+        );
+        assert_eq!(
+            i32::from(agent_client_protocol::Error::internal_error().code),
+            -32603
+        );
+        assert_eq!(
+            i32::from(agent_client_protocol::Error::request_cancelled().code),
+            -32800
+        );
+    }
+
+    #[test]
+    fn load_history_limits_events_and_bytes_without_reordering() {
+        use agent_client_protocol::schema::v1::{CurrentModeUpdate, SessionUpdate};
+
+        let first = SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("first"));
+        let second = SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("second"));
+        let mut history = LoadHistory::default();
+        history.append(first.clone(), 1).expect("first fits");
+        history.append(second.clone(), 1).expect("second fits");
+        assert_eq!(history.updates, vec![first, second]);
+
+        for _ in 2..MAX_LOAD_HISTORY_EVENTS {
+            history
+                .append(
+                    SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("event")),
+                    1,
+                )
+                .expect("event fits");
+        }
+        assert!(
+            history
+                .append(
+                    SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("over")),
+                    1,
+                )
+                .is_err()
+        );
+        assert_eq!(history.updates.len(), MAX_LOAD_HISTORY_EVENTS);
+        assert!(history.exceeded);
+
+        let mut bytes = LoadHistory::default();
+        bytes
+            .append(
+                SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("bytes")),
+                MAX_LOAD_HISTORY_BYTES,
+            )
+            .expect("byte limit itself fits");
+        assert!(
+            bytes
+                .append(
+                    SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new("over")),
+                    1,
+                )
+                .is_err()
+        );
+        assert_eq!(bytes.bytes, MAX_LOAD_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn session_list_limits_entries_bytes_and_pages_with_errors() {
+        let summary = |id: &str| SessionSummary {
+            session_id: id.into(),
+            cwd: "/".into(),
+            title: None,
+            updated_at: None,
+        };
+        let mut entries = BoundedSessionList::default();
+        for index in 0..MAX_LIST_SESSIONS {
+            entries
+                .push_with_size(summary(&index.to_string()), 1)
+                .expect("entry fits");
+        }
+        let entry_error = entries
+            .push_with_size(summary("over"), 1)
+            .expect_err("entry limit must be reported");
+        assert_eq!(
+            i32::from(match entry_error {
+                BridgeError::Acp(error) => error.code,
+                other => panic!("unexpected error: {other:?}"),
+            }),
+            -32800
+        );
+        assert_eq!(entries.len(), MAX_LIST_SESSIONS);
+
+        let mut bytes = BoundedSessionList::default();
+        bytes
+            .push_with_size(summary("bytes"), MAX_LIST_BYTES)
+            .expect("byte limit itself fits");
+        assert!(bytes.push_with_size(summary("over"), 1).is_err());
+        assert_eq!(bytes.len(), 1);
+
+        assert!(next_list_cursor(MAX_LIST_PAGES - 1, Some("next".into())).is_ok());
+        assert!(next_list_cursor(MAX_LIST_PAGES, Some("next".into())).is_err());
+        assert!(next_list_cursor(MAX_LIST_PAGES, None).is_ok());
     }
 }

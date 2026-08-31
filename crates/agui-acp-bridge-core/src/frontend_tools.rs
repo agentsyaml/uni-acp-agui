@@ -24,19 +24,11 @@
 //! - a map of pending `tool_call_id → oneshot` so the `/tool-response` route
 //!   can resolve calls posted back by the browser.
 //!
-//! The registry also keeps a global reverse index `tool_call_id → thread_id`
-//! so [`FrontendToolRegistry::resolve_anywhere`] resolves in O(1) regardless
-//! of how many threads are live. The index is maintained automatically on
-//! [`ThreadEntry::register_pending`] /
-//! [`ThreadEntry::register_pending_on_active_sender`] /
-//! [`ThreadEntry::resolve_pending`] / [`ThreadEntry::drop`], so callers never
-//! need to manage it.
-//!
 //! Dropping a [`ThreadEntry`] (e.g. session reaped) drains all pending
 //! oneshots with an error so the MCP handler tasks exit promptly instead of
 //! hanging on a closed channel.
 
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -95,30 +87,6 @@ impl FrontendToolResponse {
     }
 }
 
-/// Shared reverse-index handle threaded through every `ThreadEntry` so
-/// `register_pending` / `resolve_pending` can keep the global index in
-/// sync without holding a strong cycle back to the registry.
-#[derive(Debug, Default)]
-struct ReverseIndex {
-    /// `tool_call_id → thread_id`. Populated on `register_pending`,
-    /// removed on `resolve_pending` or `drain_pending`.
-    map: DashMap<String, String>,
-}
-
-impl ReverseIndex {
-    fn lookup(&self, tool_call_id: &str) -> Option<String> {
-        self.map.get(tool_call_id).map(|v| v.clone())
-    }
-
-    fn insert(&self, tool_call_id: String, thread_id: String) {
-        self.map.insert(tool_call_id, thread_id);
-    }
-
-    fn remove(&self, tool_call_id: &str) {
-        self.map.remove(tool_call_id);
-    }
-}
-
 /// Per-thread registry entry: tool list + active prompt sender + pending calls.
 #[derive(Debug)]
 pub struct ThreadEntry {
@@ -126,12 +94,6 @@ pub struct ThreadEntry {
     tools: Mutex<Vec<FrontendToolDef>>,
     active_sender: Mutex<Option<mpsc::Sender<BridgeStreamItem>>>,
     pending: DashMap<String, oneshot::Sender<FrontendToolResponse>>,
-    /// Weak back-reference into the registry's reverse index. `Weak` so a
-    /// reaped registry doesn't keep stale entries alive; if upgrade fails
-    /// we silently skip the index update — the registry is going away too.
-    /// `None` for stand-alone entries created via [`ThreadEntry::orphaned`]
-    /// (test fixtures).
-    reverse_index: Weak<ReverseIndex>,
 }
 
 impl Default for ThreadEntry {
@@ -141,19 +103,17 @@ impl Default for ThreadEntry {
             tools: Mutex::new(Vec::new()),
             active_sender: Mutex::new(None),
             pending: DashMap::new(),
-            reverse_index: Weak::new(),
         }
     }
 }
 
 impl ThreadEntry {
-    fn new_in_registry(thread_id: String, reverse_index: Weak<ReverseIndex>) -> Self {
+    fn new_in_registry(thread_id: String) -> Self {
         Self {
             thread_id,
             tools: Mutex::new(Vec::new()),
             active_sender: Mutex::new(None),
             pending: DashMap::new(),
-            reverse_index,
         }
     }
 
@@ -249,22 +209,43 @@ impl ThreadEntry {
         // since we mint UUIDs ourselves), the older Sender just gets
         // dropped and its waiter receives Closed — safer than panicking.
         self.pending.insert(tool_call_id.clone(), tx);
-        if let Some(idx) = self.reverse_index.upgrade() {
-            idx.insert(tool_call_id, self.thread_id.clone());
-        }
         rx
+    }
+
+    /// Guard a registered pending call so cancellation of the MCP request
+    /// removes it without waiting for the frontend-tool timeout.
+    pub fn pending_call_guard(
+        self: &Arc<Self>,
+        tool_call_id: impl Into<String>,
+    ) -> PendingCallGuard {
+        PendingCallGuard {
+            entry: self.clone(),
+            tool_call_id: tool_call_id.into(),
+            end_sender: None,
+            completed: false,
+        }
+    }
+
+    /// Guard a registered pending call and close its AG-UI lifecycle if the
+    /// MCP request is cancelled before the handler can send `FrontendToolEnd`.
+    pub fn pending_call_guard_with_sender(
+        self: &Arc<Self>,
+        tool_call_id: impl Into<String>,
+        end_sender: mpsc::Sender<BridgeStreamItem>,
+    ) -> PendingCallGuard {
+        PendingCallGuard {
+            entry: self.clone(),
+            tool_call_id: tool_call_id.into(),
+            end_sender: Some(end_sender),
+            completed: false,
+        }
     }
 
     /// Resolve a parked tool call by id. Returns `true` if a pending entry
     /// existed and was successfully notified.
     pub fn resolve_pending(&self, tool_call_id: &str, response: FrontendToolResponse) -> bool {
         match self.pending.remove(tool_call_id) {
-            Some((_, tx)) => {
-                if let Some(idx) = self.reverse_index.upgrade() {
-                    idx.remove(tool_call_id);
-                }
-                tx.send(response).is_ok()
-            }
+            Some((_, tx)) => tx.send(response).is_ok(),
             None => false,
         }
     }
@@ -294,12 +275,8 @@ impl ThreadEntry {
     /// tasks awaiting them exit immediately.
     fn drain_pending(&self, reason: &str) {
         let keys: Vec<String> = self.pending.iter().map(|e| e.key().clone()).collect();
-        let idx = self.reverse_index.upgrade();
         for k in keys {
             if let Some((_, tx)) = self.pending.remove(&k) {
-                if let Some(ref idx) = idx {
-                    idx.remove(&k);
-                }
                 let _ = tx.send(FrontendToolResponse::error(format!(
                     "frontend tool aborted: {reason}"
                 )));
@@ -324,6 +301,48 @@ impl Drop for ThreadEntry {
     }
 }
 
+/// RAII cleanup for a pending MCP `tools/call` request.
+#[must_use = "dropping this guard cancels the pending frontend tool call"]
+#[derive(Debug)]
+pub struct PendingCallGuard {
+    entry: Arc<ThreadEntry>,
+    tool_call_id: String,
+    end_sender: Option<mpsc::Sender<BridgeStreamItem>>,
+    completed: bool,
+}
+
+impl PendingCallGuard {
+    /// Mark the lifecycle complete after the handler has sent its end item.
+    pub fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for PendingCallGuard {
+    fn drop(&mut self) {
+        let _ = self.entry.pending.remove(&self.tool_call_id);
+        if !self.completed
+            && let Some(sender) = &self.end_sender
+        {
+            let item = BridgeStreamItem::FrontendToolEnd {
+                tool_call_id: self.tool_call_id.clone(),
+            };
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(item)) = sender.try_send(item) {
+                let sender = sender.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = sender.send(item).await;
+                    });
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = sender.blocking_send(item);
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Shared, cheap-to-clone registry of per-thread frontend-tool state.
 #[derive(Debug, Clone, Default)]
 pub struct FrontendToolRegistry {
@@ -333,7 +352,6 @@ pub struct FrontendToolRegistry {
 #[derive(Debug, Default)]
 struct RegistryInner {
     threads: DashMap<String, Arc<ThreadEntry>>,
-    reverse_index: Arc<ReverseIndex>,
 }
 
 impl FrontendToolRegistry {
@@ -347,20 +365,24 @@ impl FrontendToolRegistry {
         if let Some(existing) = self.inner.threads.get(thread_id) {
             return existing.clone();
         }
-        let weak_index = Arc::downgrade(&self.inner.reverse_index);
         self.inner
             .threads
             .entry(thread_id.to_string())
-            .or_insert_with(|| {
-                Arc::new(ThreadEntry::new_in_registry(
-                    thread_id.to_string(),
-                    weak_index,
-                ))
-            })
+            .or_insert_with(|| Arc::new(ThreadEntry::new_in_registry(thread_id.to_string())))
             .clone()
     }
 
-    /// Whether a thread entry exists. Used by the MCP route to gate access.
+    /// Look up a thread entry without creating one.
+    #[must_use]
+    pub fn get(&self, thread_id: &str) -> Option<Arc<ThreadEntry>> {
+        self.inner
+            .threads
+            .get(thread_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Whether a thread entry exists. Use [`Self::get`] when the entry is
+    /// needed so the lookup and use share one non-creating snapshot.
     #[must_use]
     pub fn has(&self, thread_id: &str) -> bool {
         self.inner.threads.contains_key(thread_id)
@@ -377,22 +399,18 @@ impl FrontendToolRegistry {
             .unwrap_or(0)
     }
 
-    /// Resolve a pending call without knowing its thread up-front.
-    ///
-    /// Uses the registry-wide reverse index for an O(1) lookup keyed by
-    /// `tool_call_id`. Returns `true` if a pending entry existed and was
-    /// consumed.
-    pub fn resolve_anywhere(&self, tool_call_id: &str, response: FrontendToolResponse) -> bool {
-        let Some(thread_id) = self.inner.reverse_index.lookup(tool_call_id) else {
+    /// Resolve a pending call only in its owning thread. Returns `true` if a
+    /// pending entry existed and was consumed.
+    pub fn resolve_for_thread(
+        &self,
+        thread_id: &str,
+        tool_call_id: &str,
+        response: FrontendToolResponse,
+    ) -> bool {
+        let Some(entry) = self.get(thread_id) else {
             return false;
         };
-        let Some(entry) = self.inner.threads.get(&thread_id) else {
-            // Thread vanished between index lookup and now (reaped). Clean
-            // up the dangling index entry so a retry doesn't keep matching.
-            self.inner.reverse_index.remove(tool_call_id);
-            return false;
-        };
-        entry.value().resolve_pending(tool_call_id, response)
+        entry.resolve_pending(tool_call_id, response)
     }
 
     /// Drop a thread entry. Called when its session is reaped.
@@ -406,13 +424,6 @@ impl FrontendToolRegistry {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.inner.threads.len()
-    }
-
-    /// Number of entries in the reverse index. Test-only.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn reverse_index_len(&self) -> usize {
-        self.inner.reverse_index.map.len()
     }
 }
 
@@ -469,38 +480,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_anywhere_finds_across_threads() {
+    async fn resolve_for_thread_stays_within_the_owning_thread() {
         let registry = FrontendToolRegistry::new();
-        let _ = registry.entry("ta");
+        let entry_a = registry.entry("ta");
         let entry_b = registry.entry("tb");
+        let rx_a = entry_a.register_pending("call-a".into());
         let rx = entry_b.register_pending("call-2".into());
-        assert!(registry.resolve_anywhere("call-2", FrontendToolResponse::ok("x")));
+        assert!(!registry.resolve_for_thread("tb", "call-a", FrontendToolResponse::ok("wrong")));
+        assert_eq!(entry_a.pending_len(), 1);
+        assert_eq!(entry_b.pending_len(), 1);
+        assert!(registry.resolve_for_thread("tb", "call-2", FrontendToolResponse::ok("x")));
+        assert!(registry.resolve_for_thread("ta", "call-a", FrontendToolResponse::ok("a")));
         assert_eq!(rx.await.expect("oneshot").content, "x");
+        assert_eq!(rx_a.await.expect("oneshot").content, "a");
     }
 
     #[tokio::test]
-    async fn reverse_index_is_maintained_on_register_and_resolve() {
+    async fn unknown_thread_lookup_does_not_create_registry_state() {
         let registry = FrontendToolRegistry::new();
-        let entry = registry.entry("t1");
-        assert_eq!(registry.reverse_index_len(), 0);
-
-        let rx = entry.register_pending("call-rev".into());
-        assert_eq!(registry.reverse_index_len(), 1);
-
-        assert!(registry.resolve_anywhere("call-rev", FrontendToolResponse::ok("ok")));
-        assert_eq!(
-            registry.reverse_index_len(),
-            0,
-            "index entry must clear after resolve"
-        );
-        let _ = rx.await.expect("oneshot");
+        assert_eq!(registry.thread_count(), 0);
+        assert!(registry.get("unknown").is_none());
+        assert!(!registry.resolve_for_thread("unknown", "call", FrontendToolResponse::ok("x")));
+        assert_eq!(registry.thread_count(), 0);
     }
 
     #[test]
     fn resolve_unknown_returns_false() {
         let registry = FrontendToolRegistry::new();
         let _ = registry.entry("t1");
-        assert!(!registry.resolve_anywhere("nope", FrontendToolResponse::ok("x")));
+        assert!(!registry.resolve_for_thread("t1", "nope", FrontendToolResponse::ok("x")));
     }
 
     #[tokio::test]
@@ -512,11 +520,6 @@ mod tests {
         let resp = rx.await.expect("oneshot");
         assert!(resp.is_error);
         assert!(resp.content.contains("thread closed"));
-        assert_eq!(
-            registry.reverse_index_len(),
-            0,
-            "drop_thread must clear reverse index entries"
-        );
     }
 
     #[tokio::test]
@@ -627,10 +630,63 @@ mod tests {
         assert_eq!(entry.pending_len(), 0);
     }
 
+    #[tokio::test]
+    async fn cancelled_pending_call_guard_removes_entry_promptly() {
+        let registry = FrontendToolRegistry::new();
+        let entry = registry.entry("t1");
+        let _rx = entry.register_pending("call-cancel".into());
+        let guard = entry.pending_call_guard("call-cancel");
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(entry.pending_len(), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(entry.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_mcp_guard_closes_frontend_tool_lifecycle_when_channel_is_full() {
+        let registry = FrontendToolRegistry::new();
+        let entry = registry.entry("t1");
+        let (sender, mut events) = mpsc::channel::<BridgeStreamItem>(1);
+        entry.set_active_sender(Some(sender.clone()));
+        sender
+            .try_send(BridgeStreamItem::FrontendToolCall {
+                tool_call_id: "queued".into(),
+                tool_name: "queued".into(),
+                arguments: Value::Null,
+            })
+            .expect("fill bounded channel");
+        let (_, _receiver) = entry
+            .register_pending_on_active_sender("call-cancel-end".into())
+            .expect("active sender");
+
+        let guard = entry.pending_call_guard_with_sender("call-cancel-end", sender);
+        drop(guard);
+
+        assert_eq!(entry.pending_len(), 0);
+        assert!(matches!(
+            events.recv().await,
+            Some(BridgeStreamItem::FrontendToolCall { .. })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("fallback end send")
+                .expect("frontend lifecycle end item"),
+            BridgeStreamItem::FrontendToolEnd { ref tool_call_id }
+                if tool_call_id == "call-cancel-end"
+        ));
+    }
+
     #[test]
-    fn orphaned_entry_skips_index_silently() {
-        // A stand-alone entry has no registry — register/resolve must
-        // still work locally without panicking.
+    fn orphaned_entry_resolves_locally() {
+        // A stand-alone entry has no registry — register/resolve must still
+        // work locally without panicking.
         let entry = ThreadEntry::orphaned();
         assert_eq!(entry.thread_id(), "");
         let _rx = entry.register_pending("orphan-1".into());

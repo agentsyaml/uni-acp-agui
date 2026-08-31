@@ -6,8 +6,8 @@ import { useConversations } from "@/components/copilot-provider";
 import { useAcpResume } from "@/hooks/use-acp-resume";
 
 export default function ChatPage() {
-  // The active thread comes from the conversation switcher. Passing it as an
-  // explicit `threadId` makes CopilotChat treat the thread as caller-managed.
+  // The active AG-UI thread comes from the conversation switcher. It remains
+  // distinct from the ACP SessionId used by an explicit resume.
   const { threadId } = useConversations();
 
   // Drive an explicit `session/load` resume run when a past conversation is

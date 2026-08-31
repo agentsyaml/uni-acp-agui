@@ -43,7 +43,11 @@ AG-UI 客户端 ──POST /──► BridgeHandler ──prompt()──► AcpS
      └─────── SSE ───────────┘
 ```
 
-`thread_id` 与 `AcpSessionHandle` 一一绑定，同一 thread 的多轮对话复用同一个会话。Agent 通过 stdio 流式输出 `SessionUpdate`，由 `Translator` 翻译成 AG-UI 事件按序写到 SSE。流以 `RUN_FINISHED` 或 `RUN_ERROR` 终止。
+Bridge 已实现显式映射：`thread_id` 是 AG-UI 的 bridge conversation key，并与一个
+`AcpSessionHandle` 一一绑定；handle 中真实的 ACP `SessionId` 是独立身份。
+同一 thread 的多轮对话复用同一个会话。Agent 通过 stdio 流式输出
+`SessionUpdate`，由 `Translator` 翻译成 AG-UI 事件按序写到 SSE。流以
+`RUN_FINISHED` 或 `RUN_ERROR` 终止。
 
 ## CLI
 
@@ -89,7 +93,9 @@ turn、active setting 或 pending frontend/permission 工作时返回 `409`；Ag
 `session/delete` 后返回 `204`。active 或 pending 本地工作返回 `409`；未声明 delete
 返回 `501`；ACP error 返回 `502`；有界超时返回 `504`。Delete 的语义是从 Agent 的
 `session/list` 中移除会话，ACP 不保证底层所有 artifact 都被硬删除。终态 delete
-结果会清理缓存别名和本地 frontend 状态；不支持 delete 时保留缓存会话以便复用。
+结果只清理精确的 bridge-owned `threadId` 映射和本地 frontend 状态；缓存未命中
+（包括看起来像 ACP ID 的 thread ID）返回 `404` 且不发送 wire 请求。不支持
+delete 时保留缓存会话以便复用。
 
 ACP v1 content update 中的 `MessageId` 会映射到对应的 AG-UI 文本/推理
 消息生命周期，并与 AG-UI `runId`、Bridge turn ID、MCP `toolCallId` 保持独立；
@@ -99,8 +105,17 @@ Bridge 生成的 synthetic event 使用自身的 fallback ID。
 
 当 ACP Agent 声明了 `session/list` 与 `loadSession` 能力时，桥以**无状态**方式透传——自身不存任何历史：
 
-- `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`，其中 `sessionId` 即用于恢复的 AG-UI `threadId`。
-- **恢复**会话：POST 一个 `threadId` 等于该 `sessionId`、且 `forwardedProps` 含 `{"acpResume": true}` 的 run。只有这个显式 marker 会启用私有恢复路径；缓存未命中时桥发起 `session/load`，Agent 回放的历史会先以 AG-UI 事件流回前端，再进行新一轮对话。若不支持 `loadSession` 或 `session/load` 失败，桥返回非成功 AG-UI run error，绝不会回退为 `session/new`。
+- `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`，其中
+  `sessionId` 是 ACP 身份，不是 AG-UI `threadId`。
+- **恢复**会话：选择一个独立的 AG-UI `threadId`，并 POST 一个
+  `forwardedProps` 含 `{"acpResume":{"sessionId":"<ACP sessionId>"}}` 的
+  run。只有这个 typed marker 会启用私有恢复路径；布尔或格式错误的 marker 返回
+  `ACP_RESUME_SESSION_ID_REQUIRED` 且不会打开 actor。缓存未命中时桥只用提供的
+  ACP `sessionId` 发起 `session/load`，Agent 回放的历史会先以 AG-UI 事件流回前端，
+  再进行新一轮对话。缓存命中时提供的 ACP ID 必须与该 thread 的映射一致，否则
+  返回 `ACP_RESUME_FAILED`。若不支持 `loadSession` 或 `session/load` 失败，桥返回
+  非成功 AG-UI resume error，绝不会回退为 `session/new`；不存在 ACP-ID alias 或
+  fallback cleanup 路径。
 
 
 `/approval` 请求体与状态码：

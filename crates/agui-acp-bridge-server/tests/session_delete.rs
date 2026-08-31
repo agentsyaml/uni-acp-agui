@@ -119,7 +119,7 @@ async fn forwards_real_session_id_and_cleans_cached_state() {
 }
 
 #[tokio::test]
-async fn cache_miss_deletes_known_or_unknown_ids_without_listing() {
+async fn cache_miss_returns_not_found_without_wire_delete() {
     let deleted_ids = Arc::new(Mutex::new(Vec::new()));
     let state = delete_state(
         deleted_ids.clone(),
@@ -128,21 +128,18 @@ async fn cache_miss_deletes_known_or_unknown_ids_without_listing() {
     );
 
     assert_eq!(
-        delete_request(state.clone(), "persisted-session").await,
-        StatusCode::NO_CONTENT
+        delete_request(state.clone(), "real-delete-session-id").await,
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         delete_request(state, "persisted-session").await,
-        StatusCode::NO_CONTENT
+        StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        deleted_ids.lock().expect("delete ids poisoned").as_slice(),
-        ["persisted-session", "persisted-session"]
-    );
+    assert!(deleted_ids.lock().expect("delete ids poisoned").is_empty());
 }
 
 #[tokio::test]
-async fn aliases_are_removed_together_and_frontend_state_is_dropped() {
+async fn deleting_one_thread_removes_only_its_exact_mapping() {
     let deleted_ids = Arc::new(Mutex::new(Vec::new()));
     let state = delete_state(
         deleted_ids.clone(),
@@ -161,11 +158,21 @@ async fn aliases_are_removed_together_and_frontend_state_is_dropped() {
         delete_request(state.clone(), "alias-a").await,
         StatusCode::NO_CONTENT
     );
+    assert_eq!(state.session_count(), 1);
+    assert_eq!(state.frontend_tools().thread_count(), 1);
+    assert_eq!(
+        deleted_ids.lock().expect("delete ids poisoned").as_slice(),
+        ["real-delete-session-id"]
+    );
+    assert_eq!(
+        delete_request(state.clone(), "alias-b").await,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(state.session_count(), 0);
     assert_eq!(state.frontend_tools().thread_count(), 0);
     assert_eq!(
         deleted_ids.lock().expect("delete ids poisoned").as_slice(),
-        ["real-delete-session-id"]
+        ["real-delete-session-id", "real-delete-session-id"]
     );
 }
 
@@ -360,7 +367,7 @@ async fn lifecycle_claim_blocks_replacement_until_delete_finishes() {
 }
 
 #[tokio::test]
-async fn canonical_session_id_claim_blocks_resume_alias_during_delete() {
+async fn delete_claim_is_exact_thread_only() {
     let deleted_ids = Arc::new(Mutex::new(Vec::new()));
     let control = DeleteLifecycleControl::new();
     let state = lifecycle_state(deleted_ids.clone(), control.clone());
@@ -381,23 +388,21 @@ async fn canonical_session_id_claim_blocks_resume_alias_during_delete() {
         .await
         .expect("delete must reach the agent");
 
-    let mut resume = user_input(
-        "real-delete-session-id",
-        "run-resume-replacement",
-        "must be rejected",
-    );
+    let mut resume = user_input("real-delete-session-id", "run-resume", "must not alias");
     resume.messages.clear();
-    resume.forwarded_props = serde_json::json!({ "acpResume": true });
+    resume.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": "real-delete-session-id"}
+    });
     let (status, body) = collect_sse_body(state.clone(), resume).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("CONCURRENT_RUN"),
-        "canonical session-id run was admitted: {body}"
+        body.contains("ACP_RESUME_UNSUPPORTED"),
+        "ACP-looking thread must not claim the logical thread: {body}"
     );
     assert_eq!(
         state.session_count(),
         1,
-        "resume must not load or insert a canonical alias"
+        "resume must not insert an ACP-id alias"
     );
     assert_eq!(
         deleted_ids.lock().expect("delete ids poisoned").as_slice(),

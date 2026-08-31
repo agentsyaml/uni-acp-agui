@@ -16,17 +16,20 @@ type Fetch =
   | { kind: "unsupported" }
   | { kind: "error"; message: string };
 
+const HISTORY_FETCH_TIMEOUT_MS = 30_000;
+
 /**
  * Conversation-history sidebar backed by the bridge's `GET /sessions`
- * (ACP `session/list`). Selecting an entry resumes it via `session/load`;
- * "New chat" starts a fresh conversation.
+ * (ACP `session/list`). Selecting an entry resumes it via `session/load` on a
+ * separate AG-UI thread; "New chat" starts a fresh conversation.
  *
  * The bridge stores no history — this list reflects exactly what the ACP
  * agent persists, so it survives reloads and is shared across clients of the
  * same agent.
  */
 export function ConversationHistory() {
-  const { threadId, newConversation, openConversation } = useConversations();
+  const { threadId, resumeSessionId, newConversation, openConversation } =
+    useConversations();
   const [state, setState] = useState<Fetch>({ kind: "loading" });
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -39,15 +42,25 @@ export function ConversationHistory() {
   // synchronously in the effect body.
   useEffect(() => {
     let cancelled = false;
+    let timedOut = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, HISTORY_FETCH_TIMEOUT_MS);
     void (async () => {
       try {
-        const res = await fetch("/api/bridge/sessions", { cache: "no-store" });
+        const res = await fetch("/api/bridge/sessions", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
         if (cancelled) return;
         if (res.status === 501) {
           setState({ kind: "unsupported" });
           return;
         }
         if (!res.ok) {
+          if (cancelled) return;
           setState({ kind: "error", message: `HTTP ${res.status}` });
           return;
         }
@@ -55,13 +68,22 @@ export function ConversationHistory() {
         if (cancelled) return;
         setState({ kind: "ok", sessions: json.sessions ?? [] });
       } catch (err) {
-        if (!cancelled) setState({ kind: "error", message: String(err) });
+        if (!cancelled) {
+          setState({
+            kind: "error",
+            message: timedOut ? "request timed out" : String(err),
+          });
+        }
+      } finally {
+        clearTimeout(timer);
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort();
+      clearTimeout(timer);
     };
-  }, [threadId, reloadKey]);
+  }, [threadId, resumeSessionId, reloadKey]);
 
   return (
     <aside className="w-64 shrink-0 border-r border-[var(--border)] flex flex-col">
@@ -102,7 +124,7 @@ export function ConversationHistory() {
 
         {state.kind === "ok" &&
           state.sessions.map((s) => {
-            const active = s.sessionId === threadId;
+            const active = s.sessionId === resumeSessionId;
             const label = s.title?.trim() || s.sessionId.slice(0, 8);
             return (
               <button

@@ -20,11 +20,24 @@ use agui_rs_core::types::{
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use support::{collect_sse_body, user_input};
+use support::{collect_sse_body, count_events, extract_event_types, user_input};
 
 fn fresh_state() -> BridgeAppState {
     let client: Arc<dyn AcpClient> = Arc::new(InProcessAcpClient::new());
     BridgeAppState::new(client, PathBuf::from("/"))
+}
+
+fn assert_one_terminal_event(body: &str, expected: &str) {
+    let terminal_count = count_events(body, "RUN_FINISHED") + count_events(body, "RUN_ERROR");
+    assert_eq!(
+        terminal_count, 1,
+        "expected one terminal event, body:\n{body}"
+    );
+    assert_eq!(
+        extract_event_types(body).last().map(String::as_str),
+        Some(expected),
+        "terminal event must be last, body:\n{body}"
+    );
 }
 
 #[tokio::test]
@@ -54,6 +67,8 @@ async fn echo_roundtrip_emits_run_lifecycle_events() {
         body.contains("\"type\":\"RUN_FINISHED\""),
         "missing RUN_FINISHED in body:\n{body}"
     );
+    assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+    assert_one_terminal_event(&body, "RUN_FINISHED");
 }
 
 #[tokio::test]
@@ -122,6 +137,33 @@ async fn empty_messages_emits_clean_noop_run() {
         !body.contains("\"type\":\"RUN_ERROR\""),
         "noop run must NOT emit RUN_ERROR:\n{body}"
     );
+    assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+    assert_one_terminal_event(&body, "RUN_FINISHED");
+}
+
+#[tokio::test]
+async fn input_state_is_request_context_without_generic_state_snapshot() {
+    for (label, state_value) in [
+        ("non-null", serde_json::json!({"requestContext": true})),
+        ("null-default", Value::Null),
+    ] {
+        let mut input = user_input(
+            &format!("thread-input-state-{label}"),
+            &format!("run-input-state-{label}"),
+            "hello",
+        );
+        input.state = state_value;
+
+        let (status, body) = collect_sse_body(fresh_state(), input).await;
+        assert_eq!(status, StatusCode::OK, "{label} state body:\n{body}");
+        assert_eq!(
+            count_events(&body, "STATE_SNAPSHOT"),
+            0,
+            "input state must not become a generic STATE_SNAPSHOT: {label}\n{body}"
+        );
+        assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+        assert_one_terminal_event(&body, "RUN_FINISHED");
+    }
 }
 
 #[tokio::test]
@@ -254,7 +296,7 @@ async fn same_thread_concurrency_is_rejected_and_next_run_can_execute() {
 }
 
 #[tokio::test]
-async fn non_text_block_emits_custom_event_then_run_finished() {
+async fn non_text_block_emits_raw_event_then_run_finished() {
     let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(|s| {
         test_agents::run_image_agent(s)
     }));
@@ -269,12 +311,17 @@ async fn non_text_block_emits_custom_event_then_run_finished() {
         "missing RUN_STARTED:\n{body}"
     );
     assert!(
-        body.contains("\"type\":\"CUSTOM\""),
-        "non-text content block must surface as CUSTOM event:\n{body}"
+        body.contains("\"type\":\"RAW\""),
+        "non-text content block must surface as RAW event:\n{body}"
     );
     assert!(
-        body.contains("acp.session_update"),
-        "custom event name must be acp.session_update:\n{body}"
+        body.contains("\"source\":\"acp\""),
+        "raw event source must be acp:\n{body}"
+    );
+    assert!(
+        body.contains("\"sessionUpdate\":\"agent_message_chunk\"")
+            && body.contains("\"mimeType\":\"image/png\""),
+        "raw event must preserve the ACP image update payload:\n{body}"
     );
     assert!(
         body.contains("\"type\":\"RUN_FINISHED\""),
@@ -309,4 +356,6 @@ async fn acp_error_propagates_as_run_error_event() {
         !body.contains("\"type\":\"RUN_FINISHED\""),
         "errored run must NOT emit RUN_FINISHED:\n{body}"
     );
+    assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+    assert_one_terminal_event(&body, "RUN_ERROR");
 }

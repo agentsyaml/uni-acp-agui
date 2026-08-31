@@ -108,6 +108,27 @@ API routes:
 - `POST /api/bridge/session/delete` — server-side proxy to the bridge
   `/session/delete` persistence endpoint.
 
+### Mutating-route CSRF boundary
+
+The mutating bridge routes (`POST`/`DELETE`, including `/api/copilotkit`) reject
+`Sec-Fetch-Site: cross-site` before reading or forwarding a request body. When a
+request has an `Origin`, it must be an exact trusted app origin; malformed
+origins return `400` and other origin failures return `403`. Requests without
+`Origin` remain available to server-side proxy calls and non-browser CLI tools.
+
+Local development defaults to the fixed single-user origins
+`http://localhost:3000`, `http://127.0.0.1:3000`, and `http://[::1]:3000`, with an
+additional exact match against the request URL. For a non-default port or a
+reverse proxy, set a comma-separated explicit allowlist, for example:
+
+```bash
+AGUI_APP_ORIGINS=https://my-app.example.com
+```
+
+Do not use `*`. The route does not trust `X-Forwarded-Host` or
+`X-Forwarded-Proto`; configure `AGUI_APP_ORIGINS` when the proxy's public origin
+cannot be reliably reconstructed by Next.
+
 ## Where the wiring lives
 
 - `src/lib/agui-bridge.ts` — single source of truth for the bridge URL + the
@@ -125,9 +146,9 @@ API routes:
 - `opencode acp` requires a configured model provider. Without one, the SSE
   stream will end with a `RUN_ERROR`.
 - The bridge caps cached sessions at `--max-sessions` (default 128) and reaps
-  idle ones after `--idle-timeout` (default 120s). A browser that mints a
-  fresh `threadId` on every page refresh will therefore not accumulate agent
-  processes without bound — old idle sessions are evicted LRU-first.
+  idle ones after `--idle-timeout` (default 120s). The demo persists its
+  AG-UI `threadId`; selecting saved history keeps the ACP `sessionId` separate
+  and sends it through the typed private resume marker.
 
 ## License
 

@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agui_acp_bridge_core::{BridgeConfig, PermissionPolicy};
-use agui_acp_bridge_policy::{Allowlist, AutoAllow, AutoDeny, InterruptViaAgUiEvent};
+use agui_acp_bridge_policy::{
+    Allowlist, AutoAllow, AutoDeny, FilesystemAccessPolicy, InterruptViaAgUiEvent,
+};
 use agui_acp_bridge_server::{
     AcpClient, BridgeAppState, InProcessAcpClient, ProcessAcpClient, build_router,
 };
@@ -63,6 +65,18 @@ impl PolicyKind {
             }
             PolicyKind::Interrupt => Arc::new(InterruptViaAgUiEvent),
         })
+    }
+}
+
+fn apply_filesystem_flags(
+    policy: Arc<dyn PermissionPolicy>,
+    allow_read: bool,
+    allow_write: bool,
+) -> Arc<dyn PermissionPolicy> {
+    if allow_read || allow_write {
+        Arc::new(FilesystemAccessPolicy::new(policy, allow_read, allow_write))
+    } else {
+        policy
     }
 }
 
@@ -105,6 +119,14 @@ struct Cli {
     /// multiple titles, or pass a comma-separated list.
     #[arg(long, value_delimiter = ',')]
     allow: Vec<String>,
+
+    /// Allow live ACP sessions to read text files under `--cwd`.
+    #[arg(long = "allow-fs-read")]
+    allow_fs_read: bool,
+
+    /// Allow live ACP sessions to create or overwrite text files under `--cwd`.
+    #[arg(long = "allow-fs-write")]
+    allow_fs_write: bool,
 
     /// Permission-request timeout in seconds. Applies to `--policy interrupt`
     /// (deferred decisions); after this many seconds with no resolution the
@@ -180,6 +202,12 @@ struct Cli {
     #[arg(long)]
     public_url: Option<String>,
 
+    /// Explicit origin allowed on MCP requests. Repeat for multiple origins.
+    /// Missing Origin headers remain allowed for non-browser agents; with no
+    /// configured origins, every present Origin is rejected.
+    #[arg(long = "mcp-allowed-origin")]
+    mcp_allowed_origins: Vec<String>,
+
     /// Agent command and its arguments.
     ///
     /// The first positional value is the binary path; subsequent values are
@@ -249,7 +277,11 @@ async fn run(cli: Cli) -> Result<()> {
         Arc::new(process)
     };
 
-    let policy = cli.policy.build(cli.allow.clone())?;
+    let policy = apply_filesystem_flags(
+        cli.policy.build(cli.allow.clone())?,
+        cli.allow_fs_read,
+        cli.allow_fs_write,
+    );
 
     let config = BridgeConfig {
         permission_timeout: Duration::from_secs(cli.permission_timeout),
@@ -266,7 +298,9 @@ async fn run(cli: Cli) -> Result<()> {
 
     let state = BridgeAppState::builder(client, cli.cwd.clone())
         .with_config(config)
-        .with_policy(policy);
+        .with_policy(policy)
+        .with_mcp_allowed_origins(cli.mcp_allowed_origins.clone())
+        .map_err(anyhow::Error::msg)?;
     let state = if let Some(token) = bearer_token {
         state.with_bearer_token(token).map_err(anyhow::Error::msg)?
     } else {
@@ -401,6 +435,8 @@ mod tests {
         assert_eq!(cli.max_queued_turns, 32);
         assert_eq!(cli.host, "127.0.0.1".parse::<IpAddr>().unwrap());
         assert!(matches!(cli.policy, PolicyKind::AutoDeny));
+        assert!(!cli.allow_fs_read);
+        assert!(!cli.allow_fs_write);
     }
 
     #[test]
@@ -447,6 +483,55 @@ mod tests {
             "--in-process",
         ]);
         assert_eq!(cli.allow, vec!["Read file", "List directory", "Write file"]);
+    }
+
+    #[test]
+    fn cli_parses_repeated_mcp_allowed_origins() {
+        let cli = Cli::parse_from([
+            "agui-acp-bridge",
+            "--in-process",
+            "--mcp-allowed-origin",
+            "https://one.example",
+            "--mcp-allowed-origin",
+            "https://two.example:8443",
+        ]);
+        assert_eq!(
+            cli.mcp_allowed_origins,
+            vec!["https://one.example", "https://two.example:8443"]
+        );
+    }
+
+    #[test]
+    fn cli_parses_filesystem_flags_independently() {
+        let read = Cli::parse_from(["agui-acp-bridge", "--in-process", "--allow-fs-read"]);
+        assert!(read.allow_fs_read);
+        assert!(!read.allow_fs_write);
+
+        let write = Cli::parse_from(["agui-acp-bridge", "--in-process", "--allow-fs-write"]);
+        assert!(!write.allow_fs_read);
+        assert!(write.allow_fs_write);
+
+        let both = Cli::parse_from([
+            "agui-acp-bridge",
+            "--in-process",
+            "--allow-fs-read",
+            "--allow-fs-write",
+        ]);
+        assert!(both.allow_fs_read);
+        assert!(both.allow_fs_write);
+    }
+
+    #[test]
+    fn filesystem_flags_are_applied_after_policy_build() {
+        let policy = apply_filesystem_flags(Arc::new(AutoDeny), true, false);
+        let capabilities = policy.filesystem_capabilities();
+        assert!(capabilities.read_text_file);
+        assert!(!capabilities.write_text_file);
+
+        let policy = apply_filesystem_flags(Arc::new(AutoDeny), false, false);
+        let capabilities = policy.filesystem_capabilities();
+        assert!(!capabilities.read_text_file);
+        assert!(!capabilities.write_text_file);
     }
 
     #[test]

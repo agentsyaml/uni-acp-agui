@@ -18,12 +18,15 @@
 //! **same** `thread_id` are rejected at the AG-UI admission boundary. The
 //! DashMaps protect the run claim and lazy-creation races.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use agent_client_protocol::schema::v1::{
-    HttpHeader, SessionConfigOptionCategory, SessionId, StopReason,
+    HttpHeader, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionId, StopReason,
 };
 use agui_rs_core::events::{Event, factory};
 use agui_rs_core::types::{Message, RunAgentInput, UserMessageContent};
@@ -93,7 +96,107 @@ pub enum SetSessionStatus {
 pub struct SetSessionConfigOptionBody {
     pub thread_id: String,
     pub config_id: String,
-    pub value: String,
+    #[serde(deserialize_with = "deserialize_string_or_boolean")]
+    pub value: serde_json::Value,
+}
+
+fn deserialize_string_or_boolean<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Bool(_) | serde_json::Value::String(_) => Ok(value),
+        _ => Err(serde::de::Error::custom(
+            "value must be a JSON string or boolean",
+        )),
+    }
+}
+
+fn typed_config_option_value(value: serde_json::Value) -> SessionConfigOptionValue {
+    match value {
+        serde_json::Value::Bool(value) => SessionConfigOptionValue::boolean(value),
+        serde_json::Value::String(value) => SessionConfigOptionValue::value_id(value),
+        _ => unreachable!("config option input was validated during deserialization"),
+    }
+}
+
+fn config_option_value_type_matches(
+    option: &SessionConfigOption,
+    value: &SessionConfigOptionValue,
+) -> bool {
+    matches!(
+        (&option.kind, value),
+        (
+            SessionConfigKind::Boolean(_),
+            SessionConfigOptionValue::Boolean { .. }
+        ) | (
+            SessionConfigKind::Select(_),
+            SessionConfigOptionValue::ValueId { .. }
+        )
+    )
+}
+
+fn config_option_value_matches(
+    option: &SessionConfigOption,
+    value: &SessionConfigOptionValue,
+) -> bool {
+    if !config_option_value_type_matches(option, value) {
+        return false;
+    }
+    match (&option.kind, value) {
+        (SessionConfigKind::Boolean(_), SessionConfigOptionValue::Boolean { .. }) => true,
+        (SessionConfigKind::Select(select), SessionConfigOptionValue::ValueId { value }) => {
+            match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .any(|option| option.value.0.as_ref() == value.0.as_ref()),
+                SessionConfigSelectOptions::Grouped(groups) => groups.iter().any(|group| {
+                    group
+                        .options
+                        .iter()
+                        .any(|option| option.value.0.as_ref() == value.0.as_ref())
+                }),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn validate_discovered_config_option(
+    config_id: &str,
+    option: &SessionConfigOption,
+    value: &SessionConfigOptionValue,
+) -> Result<(), SetSessionStatus> {
+    if !config_option_value_type_matches(option, value) {
+        Err(SetSessionStatus::Acp(format!(
+            "config option `{config_id}` does not accept this value type"
+        )))
+    } else if config_option_value_matches(option, value) {
+        Ok(())
+    } else {
+        Err(SetSessionStatus::Acp(format!(
+            "config option `{config_id}` does not advertise this value"
+        )))
+    }
+}
+
+fn validate_legacy_mode(
+    modes: Option<&agui_acp_bridge_core::SessionModesInit>,
+    mode_id: &str,
+) -> Result<(), SetSessionStatus> {
+    let Some(modes) = modes else {
+        return Err(SetSessionStatus::Acp(
+            "agent did not advertise a legacy mode capability".into(),
+        ));
+    };
+    if !modes.available_modes.iter().any(|mode| mode.id == mode_id) {
+        return Err(SetSessionStatus::Acp(format!(
+            "mode `{mode_id}` is not advertised"
+        )));
+    }
+    Ok(())
 }
 
 /// JSON body for the server-facing cancel route.
@@ -137,12 +240,14 @@ pub enum CloseSessionStatus {
     SessionClosed,
 }
 
-/// Outcome of deleting a persisted ACP session. A missing cache entry is not
-/// an error because ACP deletion is idempotent for a session id candidate.
+/// Outcome of deleting a persisted ACP session mapped to an exact AG-UI
+/// thread. A missing bridge mapping is a local not-found response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteSessionStatus {
-    /// The request did not contain a non-empty thread/session id.
+    /// The request did not contain a non-empty AG-UI thread id.
     InvalidInput,
+    /// No bridge-owned session is mapped to the supplied AG-UI thread id.
+    NotFound,
     /// A run, setting, queued turn, or pending frontend/permission operation
     /// prevents deletion.
     Busy,
@@ -265,6 +370,20 @@ async fn bearer_middleware(
     } else {
         unauthorized()
     }
+}
+
+async fn bridge_security_middleware(
+    allowed_origins: Arc<HashSet<String>>,
+    bearer_token: Option<Arc<str>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if crate::mcp_endpoint::is_mcp_path(request.uri().path())
+        && !crate::mcp_endpoint::origin_is_allowed(request.headers(), &allowed_origins)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    bearer_middleware(bearer_token, request, next).await
 }
 
 /// Map one ACP prompt stop reason to the bridge's single AG-UI terminal event.
@@ -403,6 +522,7 @@ enum SessionAdmissionError {
     Http(AgUiError),
     ResumeUnsupported(String),
     ResumeFailed(String),
+    ResumeMappingMismatch(String),
 }
 
 fn resume_open_error(error: BridgeError) -> SessionAdmissionError {
@@ -410,6 +530,7 @@ fn resume_open_error(error: BridgeError) -> SessionAdmissionError {
         BridgeError::ResumeUnsupported(message) => {
             SessionAdmissionError::ResumeUnsupported(message)
         }
+        BridgeError::Unsupported(message) => SessionAdmissionError::ResumeUnsupported(message),
         BridgeError::ResumeFailed(message) => SessionAdmissionError::ResumeFailed(message),
         other => SessionAdmissionError::ResumeFailed(format!("acp open_session failed: {other}")),
     }
@@ -449,6 +570,60 @@ impl SessionEntry {
         PromptGuard {
             entry: self.clone(),
         }
+    }
+}
+
+/// Per-thread gate for lazy session creation.
+///
+/// `users` counts callers that have retained this gate, including callers
+/// queued on `lock`. A gate is only removed after its last user releases it;
+/// otherwise a failed creator could remove the map entry while an older
+/// waiter still held an Arc to the old mutex, allowing a new caller to create
+/// a second gate for the same thread.
+struct SessionCreateGate {
+    lock: tokio::sync::Mutex<()>,
+    users: AtomicUsize,
+    closing: AtomicBool,
+}
+
+impl SessionCreateGate {
+    fn new() -> Self {
+        Self {
+            lock: tokio::sync::Mutex::new(()),
+            users: AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    /// Retain the gate unless its last user has started removing it.
+    fn try_retain(&self) -> bool {
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        self.users.fetch_add(1, Ordering::AcqRel);
+        if self.closing.load(Ordering::Acquire) {
+            self.users.fetch_sub(1, Ordering::AcqRel);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+/// One retained reference to a [`SessionCreateGate`].
+struct SessionCreateGuard {
+    inner: Arc<Inner>,
+    thread_id: String,
+    gate: Arc<SessionCreateGate>,
+}
+
+impl Drop for SessionCreateGuard {
+    fn drop(&mut self) {
+        if self.gate.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.gate.closing.store(true, Ordering::Release);
+        }
+        self.inner
+            .remove_session_create_gate(&self.thread_id, &self.gate);
     }
 }
 
@@ -511,11 +686,10 @@ struct Inner {
     /// because settings intentionally queue behind an active prompt, while
     /// close/reaper/LRU must still treat the setting as busy.
     active_settings: DashMap<String, usize>,
-    /// Per-thread async locks for the lazy session-creation critical section.
-    /// Concurrent `session_for("x")` calls hold the same `Mutex<()>`, so the
-    /// expensive `open_session` happens exactly once per thread id even
-    /// under high request fan-in for the same thread.
-    create_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Reference-counted per-thread gates for the lazy session-creation
+    /// critical section. A gate remains mapped while queued callers still
+    /// hold it, including after a failed creation.
+    create_locks: DashMap<String, Arc<SessionCreateGate>>,
     /// Serializes the short semaphore/idle-victim selection section. This is
     /// never held across ACP actor creation or handshake.
     capacity_gate: tokio::sync::Mutex<()>,
@@ -537,6 +711,10 @@ struct Inner {
     /// Optional bearer credential protecting every route except exact
     /// `GET/HEAD /health`. The value is never included in debug output.
     bearer_token: Option<Arc<str>>,
+    /// Canonical origins allowed on requests to the MCP endpoint. An empty
+    /// set allows requests without an Origin header but rejects every present
+    /// Origin header.
+    mcp_allowed_origins: HashSet<String>,
     /// Handle to the background reaper task; aborted when `Inner` drops so
     /// graceful shutdown doesn't leak a tokio worker.
     reaper: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -579,6 +757,38 @@ impl Drop for ThreadClaimGuard {
 }
 
 impl Inner {
+    async fn acquire_session_create_gate(self: &Arc<Self>, thread_id: &str) -> SessionCreateGuard {
+        loop {
+            let gate = self
+                .create_locks
+                .entry(thread_id.to_string())
+                .or_insert_with(|| Arc::new(SessionCreateGate::new()))
+                .clone();
+            if gate.try_retain() {
+                return SessionCreateGuard {
+                    inner: self.clone(),
+                    thread_id: thread_id.to_string(),
+                    gate,
+                };
+            }
+
+            // A closing gate is removed by its last user. Help complete that
+            // cleanup here, then retry against the replacement gate.
+            self.remove_session_create_gate(thread_id, &gate);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn remove_session_create_gate(&self, thread_id: &str, expected: &Arc<SessionCreateGate>) {
+        if !expected.closing.load(Ordering::Acquire) || expected.users.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        let _ = self
+            .create_locks
+            .remove_if(thread_id, |_, current| Arc::ptr_eq(current, expected));
+    }
+
     fn try_claim(
         self: &Arc<Self>,
         thread_id: &str,
@@ -758,6 +968,7 @@ impl BridgeAppState {
                 frontend_tools: FrontendToolRegistry::new(),
                 self_url: None,
                 bearer_token: None,
+                mcp_allowed_origins: HashSet::new(),
                 reaper: std::sync::Mutex::new(None),
             }),
         }
@@ -777,6 +988,7 @@ impl BridgeAppState {
             policy: Arc::new(AutoDeny),
             self_url: None,
             bearer_token: None,
+            mcp_allowed_origins: HashSet::new(),
         }
     }
 
@@ -825,6 +1037,55 @@ impl BridgeAppState {
         )
         .await
         .map_err(|_| BridgeError::Timeout(self.inner.config.open_session_timeout))?
+    }
+
+    async fn validated_resume_cwd(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PathBuf, SessionAdmissionError> {
+        let summaries = match self.list_sessions().await {
+            Ok(summaries) => summaries,
+            Err(BridgeError::Unsupported(message)) => {
+                return Err(SessionAdmissionError::ResumeUnsupported(message));
+            }
+            Err(error) => {
+                return Err(SessionAdmissionError::ResumeFailed(format!(
+                    "acp session/list failed: {error}"
+                )));
+            }
+        };
+        let session_id_text = session_id.0.to_string();
+        let Some(summary) = summaries
+            .into_iter()
+            .find(|summary| summary.session_id == session_id_text)
+        else {
+            return Err(SessionAdmissionError::ResumeFailed(format!(
+                "ACP session `{session_id_text}` was not found in session/list"
+            )));
+        };
+
+        let reported_cwd = Path::new(&summary.cwd);
+        if !reported_cwd.is_absolute() {
+            return Err(SessionAdmissionError::ResumeFailed(
+                "listed ACP session has a non-absolute cwd".into(),
+            ));
+        }
+        let canonical_cwd = std::fs::canonicalize(reported_cwd).map_err(|error| {
+            SessionAdmissionError::ResumeFailed(format!(
+                "listed ACP session cwd could not be canonicalized: {error}"
+            ))
+        })?;
+        if !canonical_cwd.is_absolute() {
+            return Err(SessionAdmissionError::ResumeFailed(
+                "listed ACP session has a non-absolute cwd".into(),
+            ));
+        }
+        if !canonical_cwd.starts_with(&self.inner.cwd) {
+            return Err(SessionAdmissionError::ResumeFailed(
+                "listed ACP session cwd is outside the bridge root".into(),
+            ));
+        }
+        Ok(canonical_cwd)
     }
 
     /// Resolve a deferred permission request for any cached session.
@@ -945,18 +1206,22 @@ impl BridgeAppState {
         let timeout = self.inner.config.set_session_timeout;
         let snapshot = entry.handle.init_state();
         let result = if let Some(config_options) = snapshot.config_options {
-            if let Some(config_id) = config_options.iter().find_map(|option| {
-                (option.category.as_ref() == Some(&SessionConfigOptionCategory::Mode))
-                    .then(|| option.id.0.to_string())
-            }) {
+            if let Some(option) = config_options
+                .iter()
+                .find(|option| option.category.as_ref() == Some(&SessionConfigOptionCategory::Mode))
+            {
+                let config_id = option.id.0.to_string();
+                let value = SessionConfigOptionValue::value_id(mode_id.clone());
+                validate_discovered_config_option(&config_id, option, &value)?;
                 tokio::time::timeout(
                     timeout,
-                    entry.handle.set_config_option(config_id, mode_id.clone()),
+                    entry.handle.set_config_option_value(config_id, value),
                 )
                 .await
             } else if snapshot.modes.is_some() {
                 // Mixed-capability agents may advertise an unrelated config
                 // snapshot while retaining the legacy session/set_mode path.
+                validate_legacy_mode(snapshot.modes.as_ref(), &mode_id)?;
                 tokio::time::timeout(timeout, entry.handle.set_mode(mode_id)).await
             } else {
                 return Err(SetSessionStatus::Acp(
@@ -964,6 +1229,7 @@ impl BridgeAppState {
                 ));
             }
         } else {
+            validate_legacy_mode(snapshot.modes.as_ref(), &mode_id)?;
             tokio::time::timeout(timeout, entry.handle.set_mode(mode_id)).await
         };
         match result {
@@ -1012,8 +1278,17 @@ impl BridgeAppState {
                 "agent did not advertise a model config option".into(),
             ));
         };
-        match tokio::time::timeout(timeout, entry.handle.set_config_option(config_id, model_id))
-            .await
+        let option = config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == config_id.as_str())
+            .expect("model config option was found by category");
+        let value = SessionConfigOptionValue::value_id(model_id);
+        validate_discovered_config_option(&config_id, option, &value)?;
+        match tokio::time::timeout(
+            timeout,
+            entry.handle.set_config_option_value(config_id, value),
+        )
+        .await
         {
             Ok(Ok(())) => {
                 entry.touch();
@@ -1037,6 +1312,23 @@ impl BridgeAppState {
         config_id: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<(), SetSessionStatus> {
+        self.set_session_config_option_value(
+            thread_id,
+            config_id,
+            SessionConfigOptionValue::value_id(value.into()),
+        )
+        .await
+    }
+
+    /// Send a typed `session/set_config_option` request using the complete
+    /// option list discovered during session initialization.
+    pub async fn set_session_config_option_value(
+        &self,
+        thread_id: &str,
+        config_id: impl Into<String>,
+        value: SessionConfigOptionValue,
+    ) -> Result<(), SetSessionStatus> {
+        let config_id = config_id.into();
         let _setting_guard = self.enter_setting(thread_id)?;
         let entry = self
             .inner
@@ -1044,8 +1336,26 @@ impl BridgeAppState {
             .get(thread_id)
             .map(|e| e.clone())
             .ok_or(SetSessionStatus::NotFound)?;
+        let Some(config_options) = entry.handle.init_state().config_options else {
+            return Err(SetSessionStatus::Acp(
+                "agent did not advertise config options".into(),
+            ));
+        };
+        let Some(option) = config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == config_id.as_str())
+        else {
+            return Err(SetSessionStatus::Acp(format!(
+                "agent did not advertise config option `{config_id}`"
+            )));
+        };
+        validate_discovered_config_option(&config_id, option, &value)?;
         let timeout = self.inner.config.set_session_timeout;
-        match tokio::time::timeout(timeout, entry.handle.set_config_option(config_id, value)).await
+        match tokio::time::timeout(
+            timeout,
+            entry.handle.set_config_option_value(config_id, value),
+        )
+        .await
         {
             Ok(Ok(())) => {
                 entry.touch();
@@ -1142,74 +1452,36 @@ impl BridgeAppState {
 
     /// Delete a persisted ACP session through a transient connection.
     ///
-    /// The bridge resolves `thread_id` against its cache first, so a logical
-    /// thread key never replaces the real ACP SessionId returned by
-    /// `session/new`/`session/load`. On a cache miss the input is sent directly
-    /// as an ACP SessionId candidate; ACP deletion is idempotent and no
-    /// `session/list` preflight is performed.
+    /// Delete only the ACP session mapped to the exact AG-UI thread id. A
+    /// cache miss is local `404`; it never treats the thread id as an ACP id
+    /// and never opens a transient ACP connection.
     pub async fn delete_session(&self, thread_id: &str) -> Result<(), DeleteSessionStatus> {
         if thread_id.trim().is_empty() {
             return Err(DeleteSessionStatus::InvalidInput);
         }
 
-        let mut lifecycle_guards = Vec::new();
-        lifecycle_guards.push(
-            self.try_claim_lifecycle(thread_id, "session-delete")
-                .ok_or(DeleteSessionStatus::Busy)?,
-        );
-
-        let exact_entry = self
+        let _lifecycle_guard = self
+            .try_claim_lifecycle(thread_id, "session-delete")
+            .ok_or(DeleteSessionStatus::Busy)?;
+        let Some(entry) = self
             .inner
             .sessions
             .get(thread_id)
-            .map(|entry| entry.clone());
-        let candidate_id = SessionId::from(thread_id.to_owned());
-        let target_entry = exact_entry.clone().or_else(|| {
-            self.inner
-                .sessions
-                .iter()
-                .find(|entry| entry.value().handle.session_id() == &candidate_id)
-                .map(|entry| entry.value().clone())
-        });
-        let target_id = target_entry
-            .as_ref()
-            .map(|entry| entry.handle.session_id().clone())
-            .unwrap_or(candidate_id);
-        let target_key = target_id.0.to_string();
-        if target_key != thread_id {
-            lifecycle_guards.push(
-                self.try_claim_lifecycle(&target_key, "session-delete")
-                    .ok_or(DeleteSessionStatus::Busy)?,
-            );
-        }
+            .map(|entry| entry.clone())
+        else {
+            return Err(DeleteSessionStatus::NotFound);
+        };
 
-        let aliases = self
-            .inner
-            .sessions
-            .iter()
-            .filter(|entry| entry.value().handle.session_id() == &target_id)
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect::<Vec<_>>();
-
-        for (alias, _) in &aliases {
-            if alias != thread_id && alias != &target_key {
-                lifecycle_guards.push(
-                    self.try_claim_lifecycle(alias, "session-delete")
-                        .ok_or(DeleteSessionStatus::Busy)?,
-                );
-            }
-        }
-
-        if aliases.iter().any(|(alias, entry)| {
-            entry.active_prompts() > 0
-                || !entry.handle.turn_queue_empty()
-                || !entry.handle.pending_permissions().is_empty()
-                || self.inner.active_settings.contains_key(alias)
-                || self.inner.frontend_tools.pending_len(alias) > 0
-        }) {
+        if entry.active_prompts() > 0
+            || !entry.handle.turn_queue_empty()
+            || !entry.handle.pending_permissions().is_empty()
+            || self.inner.active_settings.contains_key(thread_id)
+            || self.inner.frontend_tools.pending_len(thread_id) > 0
+        {
             return Err(DeleteSessionStatus::Busy);
         }
 
+        let target_id = entry.handle.session_id().clone();
         let result = tokio::time::timeout(
             self.inner.config.set_session_timeout,
             self.inner
@@ -1226,26 +1498,14 @@ impl BridgeAppState {
         };
 
         if let Some(status) = status {
-            if !matches!(status, DeleteSessionStatus::Unsupported) {
-                for (alias, entry) in &aliases {
-                    remove_session_if_same(&self.inner, alias, entry);
-                }
-            } else if let Some(entry) = target_entry.as_ref() {
+            if matches!(status, DeleteSessionStatus::Unsupported) {
                 entry.touch();
+            } else {
+                remove_session_if_same(&self.inner, thread_id, &entry);
             }
-            drop(target_entry);
-            drop(exact_entry);
-            drop(aliases);
-            drop(lifecycle_guards);
             Err(status)
         } else {
-            for (alias, entry) in &aliases {
-                remove_session_if_same(&self.inner, alias, entry);
-            }
-            drop(target_entry);
-            drop(exact_entry);
-            drop(aliases);
-            drop(lifecycle_guards);
+            remove_session_if_same(&self.inner, thread_id, &entry);
             Ok(())
         }
     }
@@ -1357,6 +1617,14 @@ impl BridgeAppState {
         self.inner.bearer_token.clone()
     }
 
+    pub(crate) fn mcp_origin_allowed(&self, headers: &HeaderMap) -> bool {
+        crate::mcp_endpoint::origin_is_allowed(headers, &self.inner.mcp_allowed_origins)
+    }
+
+    pub(crate) fn mcp_allowed_origins(&self) -> Arc<HashSet<String>> {
+        Arc::new(self.inner.mcp_allowed_origins.clone())
+    }
+
     fn mcp_headers(&self) -> Vec<HttpHeader> {
         self.inner
             .bearer_token
@@ -1365,16 +1633,18 @@ impl BridgeAppState {
             .unwrap_or_default()
     }
 
-    /// Resolve a frontend tool call posted back from the browser.
-    /// Returns `true` if a pending entry existed and was consumed.
+    /// Resolve a frontend tool call posted back from the browser in its
+    /// owning thread. Returns `true` if a pending entry existed and was
+    /// consumed.
     pub fn resolve_frontend_tool(
         &self,
+        thread_id: &str,
         tool_call_id: &str,
         response: FrontendToolResponse,
     ) -> bool {
         self.inner
             .frontend_tools
-            .resolve_anywhere(tool_call_id, response)
+            .resolve_for_thread(thread_id, tool_call_id, response)
     }
 
     fn session_config_for(&self, thread_token: &str) -> SessionConfig {
@@ -1399,7 +1669,16 @@ impl BridgeAppState {
     fn session_config_for_with(
         &self,
         thread_token: &str,
-        load_session_id: Option<String>,
+        load_session_id: Option<SessionId>,
+    ) -> SessionConfig {
+        self.session_config_for_with_cwd(thread_token, self.inner.cwd.clone(), load_session_id)
+    }
+
+    fn session_config_for_with_cwd(
+        &self,
+        thread_token: &str,
+        cwd: PathBuf,
+        load_session_id: Option<SessionId>,
     ) -> SessionConfig {
         let mcp_url = self
             .inner
@@ -1411,7 +1690,7 @@ impl BridgeAppState {
             .map(|_| self.mcp_headers())
             .unwrap_or_default();
         SessionConfig {
-            cwd: self.inner.cwd.clone(),
+            cwd,
             policy: self.inner.policy.clone(),
             config: self.inner.config.clone(),
             mcp_url,
@@ -1511,7 +1790,7 @@ impl BridgeAppState {
     async fn session_for_resume(
         &self,
         thread_id: &str,
-        resume: Option<String>,
+        resume: Option<SessionId>,
     ) -> Result<Arc<SessionEntry>, SessionAdmissionError> {
         // Fast path: already cached.
         if let Some(existing) = self.inner.sessions.get(thread_id) {
@@ -1519,24 +1798,25 @@ impl BridgeAppState {
                 let expected = existing.clone();
                 drop(existing);
                 self.evict_unusable(thread_id, &expected);
+            } else if resume
+                .as_ref()
+                .is_some_and(|session_id| existing.handle.session_id() != session_id)
+            {
+                return Err(SessionAdmissionError::ResumeMappingMismatch(
+                    "requested ACP session does not match the cached thread mapping".into(),
+                ));
             } else {
                 existing.touch();
                 return Ok(existing.clone());
             }
         }
 
-        // Slow path: serialise concurrent first-time creators on the same
-        // thread id behind a per-key async mutex. The mutex is allocated
-        // lazily (one Arc per active id). All waiters get the same Arc;
-        // a third caller arriving while the second still holds the guard
-        // queues behind it because the entry is still in `create_locks`.
-        let lock = self
-            .inner
-            .create_locks
-            .entry(thread_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
+        // Slow path: serialize concurrent first-time creators on the same
+        // thread id behind a reference-counted per-key async mutex. The gate
+        // stays in `create_locks` until every queued waiter has released it,
+        // including waiters that follow a failed creation.
+        let create_gate = self.inner.acquire_session_create_gate(thread_id).await;
+        let _guard = create_gate.gate.lock.lock().await;
 
         // Re-check inside the critical section: another waiter may have
         // already populated the entry while we were queued for the lock.
@@ -1545,11 +1825,30 @@ impl BridgeAppState {
                 let expected = existing.clone();
                 drop(existing);
                 self.evict_unusable(thread_id, &expected);
+            } else if resume
+                .as_ref()
+                .is_some_and(|session_id| existing.handle.session_id() != session_id)
+            {
+                return Err(SessionAdmissionError::ResumeMappingMismatch(
+                    "requested ACP session does not match the cached thread mapping".into(),
+                ));
             } else {
                 existing.touch();
                 return Ok(existing.clone());
             }
         }
+
+        let resume_requested = resume.is_some();
+        let load_cwd = match resume.as_ref() {
+            Some(session_id) => match self.validated_resume_cwd(session_id).await {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    self.inner.frontend_tools.drop_thread(thread_id);
+                    return Err(error);
+                }
+            },
+            None => self.inner.cwd.clone(),
+        };
 
         // Reserve a real live-session permit before opening the ACP actor. The
         // semaphore/idle-selection gate is released before this handshake, so
@@ -1558,20 +1857,17 @@ impl BridgeAppState {
             Ok(permit) => permit,
             Err(reason) => {
                 self.inner.frontend_tools.drop_thread(thread_id);
-                drop(_guard);
-                self.inner.create_locks.remove(thread_id);
                 return Err(SessionAdmissionError::Http(AgUiError::other(format!(
                     "ACP_SESSION_CAPACITY: {reason}"
                 ))));
             }
         };
 
-        let resume_requested = resume.is_some();
         let handle_result = tokio::time::timeout(
             self.inner.config.open_session_timeout,
             self.inner
                 .client
-                .open_session(self.session_config_for_with(thread_id, resume)),
+                .open_session(self.session_config_for_with_cwd(thread_id, load_cwd, resume)),
         )
         .await;
 
@@ -1581,8 +1877,6 @@ impl BridgeAppState {
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
                 self.inner.frontend_tools.drop_thread(thread_id);
-                drop(_guard);
-                self.inner.create_locks.remove(thread_id);
                 return Err(if resume_requested {
                     resume_open_error(e)
                 } else {
@@ -1593,8 +1887,6 @@ impl BridgeAppState {
             }
             Err(_) => {
                 self.inner.frontend_tools.drop_thread(thread_id);
-                drop(_guard);
-                self.inner.create_locks.remove(thread_id);
                 let message = format!(
                     "acp open_session timed out after {:?}",
                     self.inner.config.open_session_timeout
@@ -1610,8 +1902,6 @@ impl BridgeAppState {
         self.inner
             .sessions
             .insert(thread_id.to_string(), entry.clone());
-        drop(_guard);
-        self.inner.create_locks.remove(thread_id);
         Ok(entry)
     }
 }
@@ -1718,6 +2008,20 @@ impl RunHandler for BridgeHandler {
             return Ok(guarded_event_stream(evs, run_guard));
         }
 
+        let requested_resume = match acp_resume_session_id(&input.forwarded_props) {
+            Ok(session_id) => session_id,
+            Err(message) => {
+                let evs = vec![
+                    Ok(factory::run_started(thread_id, run_id)),
+                    Ok(run_error_with_code(
+                        "ACP_RESUME_SESSION_ID_REQUIRED",
+                        message,
+                    )),
+                ];
+                return Ok(guarded_event_stream(evs, run_guard));
+            }
+        };
+
         // Extract before touching the frontend-tool registry so unsupported
         // multipart input is rejected without creating any session-side state.
         let trailing = extract_trailing_user_text(&input.messages);
@@ -1727,6 +2031,29 @@ impl RunHandler for BridgeHandler {
                 Ok(run_error_with_code(
                     "UNSUPPORTED_INPUT",
                     "ACP bridge accepts text-only user input; multipart content is unsupported",
+                )),
+            ];
+            return Ok(guarded_event_stream(evs, run_guard));
+        }
+
+        // A cached explicit-resume mismatch is a rejected run, not speculative
+        // admission. Check it before replacing the live thread's frontend
+        // tools so the cached SessionEntry and registry remain untouched.
+        let cached_resume_mismatch = requested_resume.as_ref().is_some_and(|session_id| {
+            self.state
+                .inner
+                .sessions
+                .get(&thread_id)
+                .is_some_and(|entry| {
+                    !entry.handle.is_unusable() && entry.handle.session_id() != session_id
+                })
+        });
+        if cached_resume_mismatch {
+            let evs = vec![
+                Ok(factory::run_started(thread_id, run_id)),
+                Ok(run_error_with_code(
+                    "ACP_RESUME_FAILED",
+                    "requested ACP session does not match the cached thread mapping",
                 )),
             ];
             return Ok(guarded_event_stream(evs, run_guard));
@@ -1769,7 +2096,7 @@ impl RunHandler for BridgeHandler {
                  fresh thread_id to force re-discovery."
             );
         }
-        registry_entry.set_tools(new_tools);
+        registry_entry.set_tools(new_tools.clone());
 
         // The trailing-only result above follows the ACP protocol semantics:
         // only a `User` message at the **tail** of `messages[]` represents a
@@ -1787,12 +2114,11 @@ impl RunHandler for BridgeHandler {
         // method below reuses a live entry, but performs a strict
         // session/load on a cache miss (including an entry that becomes
         // unusable before admission).
-        let requested_resume = acp_resume_requested(&input.forwarded_props);
-        let wants_resume = requested_resume;
+        let wants_resume = requested_resume.is_some();
 
         let entry_result = if wants_resume {
             self.state
-                .session_for_resume(&thread_id, Some(thread_id.clone()))
+                .session_for_resume(&thread_id, requested_resume)
                 .await
         } else {
             self.state.session_for(&thread_id).await
@@ -1815,6 +2141,13 @@ impl RunHandler for BridgeHandler {
                 ];
                 return Ok(guarded_event_stream(evs, run_guard));
             }
+            Err(SessionAdmissionError::ResumeMappingMismatch(message)) => {
+                let evs = vec![
+                    Ok(factory::run_started(thread_id, run_id)),
+                    Ok(run_error_with_code("ACP_RESUME_FAILED", message)),
+                ];
+                return Ok(guarded_event_stream(evs, run_guard));
+            }
             Err(SessionAdmissionError::Http(error)) => {
                 // The registry entry is created before session admission so
                 // the first MCP tools/list sees the requested tool set. A
@@ -1823,6 +2156,13 @@ impl RunHandler for BridgeHandler {
                 return Err(error);
             }
         };
+
+        // `session_for_resume` may evict an unusable cached session. That
+        // eviction drops the registry entry while this run still holds its
+        // old Arc, so reacquire the map entry after admission and restore the
+        // current tool list before the replacement session can call MCP.
+        let registry_entry = self.state.inner.frontend_tools.entry(&thread_id);
+        registry_entry.set_tools(new_tools);
         let user_text = match trailing {
             TrailingUser::Text(text) => text,
             TrailingUser::NonUserTail | TrailingUser::Empty => {
@@ -1854,11 +2194,15 @@ impl RunHandler for BridgeHandler {
             TrailingUser::NonText => unreachable!("multipart input was rejected above"),
         };
 
+        let translated_buffer = self.state.inner.config.event_buffer.max(1);
+        let frontend_stream = install_frontend_sender(&registry_entry, translated_buffer);
         let prompt_guard = entry.enter_prompt();
         let session = entry.handle.clone();
 
+        // Install the MCP route before submitting the ACP command. The agent
+        // is allowed to issue tools/call as soon as it receives that command,
+        // before prompt_with_turn() returns to this task.
         let prompt_result = session.prompt_with_turn(user_text).await;
-        let translated_buffer = self.state.inner.config.event_buffer.max(1);
         let stream = match prompt_result {
             Ok((prompt_stream, turn_id)) => build_event_stream(
                 thread_id,
@@ -1869,12 +2213,16 @@ impl RunHandler for BridgeHandler {
                     state: self.state.clone(),
                     registry_entry,
                     turn_id,
+                    frontend_stream,
                 },
                 translated_buffer,
                 prompt_guard,
                 run_guard,
             ),
             Err(err) => {
+                // Dropping the setup clears the sender and aborts any MCP
+                // call that raced with prompt creation or request teardown.
+                drop(frontend_stream);
                 // Session is dead: evict it from the cache so the next
                 // request on this thread_id rebuilds a fresh session
                 // instead of replaying SessionClosed forever (until
@@ -1920,12 +2268,29 @@ enum TrailingUser {
     Text(String),
 }
 
-fn acp_resume_requested(forwarded_props: &serde_json::Value) -> bool {
-    forwarded_props
+fn acp_resume_session_id(
+    forwarded_props: &serde_json::Value,
+) -> Result<Option<SessionId>, &'static str> {
+    let Some(marker) = forwarded_props
         .as_object()
         .and_then(|props| props.get("acpResume"))
-        .and_then(|value| value.as_bool())
-        == Some(true)
+    else {
+        return Ok(None);
+    };
+
+    match marker {
+        serde_json::Value::Object(value) => {
+            let Some(session_id) = value.get("sessionId").and_then(serde_json::Value::as_str)
+            else {
+                return Err("forwardedProps.acpResume.sessionId must be a non-empty string");
+            };
+            if session_id.trim().is_empty() {
+                return Err("forwardedProps.acpResume.sessionId must be a non-empty string");
+            }
+            Ok(Some(SessionId::from(session_id.to_owned())))
+        }
+        _ => Err("forwardedProps.acpResume.sessionId must be a non-empty string"),
+    }
 }
 
 /// Inspect the trailing message of `messages[]` per the bridge's
@@ -1965,6 +2330,32 @@ struct EventStreamContext {
     state: BridgeAppState,
     registry_entry: Arc<agui_acp_bridge_core::frontend_tools::ThreadEntry>,
     turn_id: TurnId,
+    /// The MCP channel and its conditional sender cleanup are installed
+    /// before the ACP prompt command is submitted. This closes the first-tool
+    /// window without changing the per-thread registry ownership rules.
+    frontend_stream: FrontendStreamSetup,
+}
+
+struct FrontendStreamSetup {
+    mcp_tool_rx: mpsc::Receiver<BridgeStreamItem>,
+    clear_on_drop: ClearOnDrop,
+}
+
+fn install_frontend_sender(
+    registry_entry: &Arc<agui_acp_bridge_core::frontend_tools::ThreadEntry>,
+    translated_buffer: usize,
+) -> FrontendStreamSetup {
+    // The receiver is moved into the SSE task after prompt creation; the
+    // bounded buffer absorbs a call made in that short handoff window.
+    let (mcp_tool_tx, mcp_tool_rx) = mpsc::channel::<BridgeStreamItem>(translated_buffer);
+    registry_entry.set_active_sender(Some(mcp_tool_tx.clone()));
+    FrontendStreamSetup {
+        mcp_tool_rx,
+        clear_on_drop: ClearOnDrop {
+            entry: registry_entry.clone(),
+            sender: mcp_tool_tx,
+        },
+    }
 }
 
 fn build_event_stream(
@@ -1981,18 +2372,14 @@ fn build_event_stream(
         state,
         registry_entry,
         turn_id,
+        frontend_stream,
     } = context;
+    let FrontendStreamSetup {
+        mcp_tool_rx,
+        clear_on_drop,
+    } = frontend_stream;
     let (tx, rx) = tokio::sync::mpsc::channel::<AgUiResult<Event>>(translated_buffer);
     let slow_consumer_timeout = state.inner.config.slow_consumer_timeout;
-
-    // The MCP endpoint needs a live `Sender<BridgeStreamItem>` to dispatch
-    // tool-call events into the active prompt's actor channel. We bridge
-    // the MCP endpoint and this stream by giving the registry an mpsc
-    // sender; we forward FrontendToolCall items into translator output
-    // here (in the same loop that handles ACP-side updates).
-    let (mcp_tool_tx, mut mcp_tool_rx) =
-        tokio::sync::mpsc::channel::<BridgeStreamItem>(translated_buffer);
-    registry_entry.set_active_sender(Some(mcp_tool_tx.clone()));
 
     tokio::spawn(async move {
         // Hold the guard for the duration of the prompt so the reaper
@@ -2006,10 +2393,8 @@ fn build_event_stream(
         // overlapping newer run on the same thread_id (page refresh, a
         // CopilotKit follow-up run, a reconnect) keeps its own sender and
         // its in-flight tool calls don't get stranded into a timeout.
-        let _clear_on_drop = ClearOnDrop {
-            entry: registry_entry.clone(),
-            sender: mcp_tool_tx,
-        };
+        let _clear_on_drop = clear_on_drop;
+        let mut mcp_tool_rx = mcp_tool_rx;
         let session_for_stream = session;
 
         if send_prompt_sse(
@@ -2437,7 +2822,9 @@ fn build_history_stream(
 /// it only nulls the slot if it still holds the sender this run installed.
 /// This prevents an older run's teardown from wiping a newer overlapping
 /// run's sender on the same `thread_id`, which would otherwise strand the
-/// newer run's in-flight frontend tool calls until they time out.
+/// newer run's in-flight frontend tool calls until they time out. The same
+/// guard also covers cancellation or prompt-creation failure before the SSE
+/// task takes ownership of the setup.
 struct ClearOnDrop {
     entry: Arc<agui_acp_bridge_core::frontend_tools::ThreadEntry>,
     sender: tokio::sync::mpsc::Sender<BridgeStreamItem>,
@@ -2459,6 +2846,76 @@ impl Drop for ClearOnDrop {
     }
 }
 
+const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+fn invalid_agui_body(message: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        format!("invalid request body: {message}"),
+    )
+        .into_response()
+}
+
+/// Read and validate the raw body before handing it to `agui-rs-server`.
+///
+/// `agui-rs-server` reads its route body with `to_bytes(..., usize::MAX)`, so
+/// Axum's `DefaultBodyLimit` extractor layer does not constrain the direct
+/// AG-UI route. This middleware is deliberately a body-reading boundary rather
+/// than another extractor layer; it also keeps invalid `RunAgentInput`s out of
+/// session admission and maps them to HTTP 400.
+async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next: Next) -> Response {
+    let Some(limit) = limit else {
+        return next.run(request).await;
+    };
+
+    if request.method() != Method::POST || request.uri().path() != "/" {
+        return next.run(request).await;
+    }
+
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("invalid request body: request body exceeds {limit} bytes"),
+        )
+            .into_response();
+    }
+
+    let (parts, body) = request.into_parts();
+    let mut body_stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => return invalid_agui_body(error),
+        };
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("invalid request body: request body exceeds {limit} bytes"),
+            )
+                .into_response();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let input = match serde_json::from_slice::<RunAgentInput>(&bytes) {
+        Ok(input) => input,
+        Err(error) => return invalid_agui_body(error),
+    };
+    if let Err(error) = input.validate() {
+        return invalid_agui_body(error);
+    }
+
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
 /// Build the AG-UI axum router for a given bridge state.
 ///
 /// Mounts:
@@ -2471,16 +2928,22 @@ impl Drop for ClearOnDrop {
 /// histories), build the router yourself by composing
 /// [`build_router_inner`] with your own `DefaultBodyLimit` layer.
 pub fn build_router(state: BridgeAppState) -> axum::Router {
-    const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-    build_router_inner(state).layer(axum::extract::DefaultBodyLimit::max(
-        DEFAULT_BODY_LIMIT_BYTES,
-    ))
+    build_router_inner_with_agui_body_limit(state, Some(DEFAULT_BODY_LIMIT_BYTES)).layer(
+        axum::extract::DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES),
+    )
 }
 
 /// Same as [`build_router`] without the request body limit. Compose your
 /// own [`axum::extract::DefaultBodyLimit`] when 16 MiB is wrong for your
 /// deployment.
 pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
+    build_router_inner_with_agui_body_limit(state, None)
+}
+
+fn build_router_inner_with_agui_body_limit(
+    state: BridgeAppState,
+    agui_body_limit: Option<usize>,
+) -> axum::Router {
     use axum::{Json, extract::State, routing::get, routing::post};
 
     #[derive(serde::Deserialize)]
@@ -2522,6 +2985,7 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct ToolResponseBody {
+        thread_id: String,
         tool_call_id: String,
         #[serde(default)]
         content: String,
@@ -2545,7 +3009,7 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
         } else {
             FrontendToolResponse::ok(body.content)
         };
-        if state.resolve_frontend_tool(&body.tool_call_id, resp) {
+        if state.resolve_frontend_tool(&body.thread_id, &body.tool_call_id, resp) {
             tracing::info!("resolved");
             axum::http::StatusCode::OK
         } else {
@@ -2560,8 +3024,8 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
 
     /// `GET /sessions` — list the agent's persisted conversations via ACP
     /// `session/list`. The bridge holds no history of its own; this is a
-    /// pass-through. Each entry's `sessionId` doubles as the AG-UI
-    /// `threadId` a client uses to resume the conversation.
+    /// pass-through. A client supplies an entry's `sessionId` in the private
+    /// resume marker while choosing its own AG-UI `threadId`.
     ///
     /// | Status | Meaning                                                  |
     /// |--------|----------------------------------------------------------|
@@ -2661,8 +3125,9 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
         State(state): State<BridgeAppState>,
         Json(body): Json<SetSessionConfigOptionBody>,
     ) -> axum::http::StatusCode {
+        let value = typed_config_option_value(body.value);
         match state
-            .set_session_config_option(&body.thread_id, body.config_id, body.value)
+            .set_session_config_option_value(&body.thread_id, body.config_id, value)
             .await
         {
             Ok(()) => axum::http::StatusCode::OK,
@@ -2717,9 +3182,8 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
         }
     }
 
-    /// `POST /session/delete` — delete a persisted ACP session. The request is
-    /// resolved as a cached bridge thread first and as an ACP SessionId only
-    /// on a cache miss; it never performs a listing preflight.
+    /// `POST /session/delete` — delete the persisted ACP session mapped to an
+    /// exact bridge thread. Cache misses are local 404s.
     async fn delete_session(
         State(state): State<BridgeAppState>,
         Json(body): Json<DeleteSessionBody>,
@@ -2727,6 +3191,7 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
         match state.delete_session(&body.thread_id).await {
             Ok(()) => axum::http::StatusCode::NO_CONTENT,
             Err(DeleteSessionStatus::InvalidInput) => axum::http::StatusCode::BAD_REQUEST,
+            Err(DeleteSessionStatus::NotFound) => axum::http::StatusCode::NOT_FOUND,
             Err(DeleteSessionStatus::Busy) => axum::http::StatusCode::CONFLICT,
             Err(DeleteSessionStatus::Unsupported) => axum::http::StatusCode::NOT_IMPLEMENTED,
             Err(DeleteSessionStatus::Timeout) => axum::http::StatusCode::GATEWAY_TIMEOUT,
@@ -2788,12 +3253,19 @@ pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
         r.with_state(state.clone())
     };
 
+    let allowed_origins = state.mcp_allowed_origins();
     let bearer_token = state.bearer_token();
     agui_rs_server::axum::agui_router(BridgeHandler::new(state))
+        .layer(axum::middleware::from_fn(move |request, next| {
+            agui_input_boundary(agui_body_limit, request, next)
+        }))
         .merge(aux)
         .layer(axum::middleware::from_fn(move |request, next| {
+            let allowed_origins = allowed_origins.clone();
             let bearer_token = bearer_token.clone();
-            async move { bearer_middleware(bearer_token, request, next).await }
+            async move {
+                bridge_security_middleware(allowed_origins, bearer_token, request, next).await
+            }
         }))
 }
 
@@ -2807,6 +3279,7 @@ pub struct BridgeAppStateBuilder {
     policy: Arc<dyn PermissionPolicy>,
     self_url: Option<String>,
     bearer_token: Option<Arc<str>>,
+    mcp_allowed_origins: HashSet<String>,
 }
 
 impl BridgeAppStateBuilder {
@@ -2833,6 +3306,25 @@ impl BridgeAppStateBuilder {
         let token = token.into();
         validate_bearer_token(&token)?;
         self.bearer_token = Some(Arc::from(token));
+        Ok(self)
+    }
+
+    /// Restrict present MCP `Origin` headers to this explicit allowlist.
+    ///
+    /// Origins are canonicalized to lowercase scheme/host plus effective
+    /// port. Paths, trailing slashes, wildcards, `null`, and user information
+    /// are rejected. Missing `Origin` remains allowed for non-browser agents.
+    pub fn with_mcp_allowed_origins<I, S>(mut self, origins: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for origin in origins {
+            let origin = origin.into();
+            let canonical = crate::mcp_endpoint::canonicalize_origin(&origin)
+                .map_err(|error| format!("invalid MCP allowed origin {origin:?}: {error}"))?;
+            self.mcp_allowed_origins.insert(canonical);
+        }
         Ok(self)
     }
 
@@ -2876,6 +3368,7 @@ impl BridgeAppStateBuilder {
                 frontend_tools: FrontendToolRegistry::new(),
                 self_url: self.self_url.map(|u| u.trim_end_matches('/').to_string()),
                 bearer_token: self.bearer_token,
+                mcp_allowed_origins: self.mcp_allowed_origins,
                 reaper: std::sync::Mutex::new(None),
             }),
         }
@@ -2967,6 +3460,40 @@ mod tests {
             );
         }
         assert!(validate_bearer_token(TEST_TOKEN).is_ok());
+    }
+
+    #[test]
+    fn mcp_origin_allowlist_canonicalizes_effective_ports() {
+        assert_eq!(
+            crate::mcp_endpoint::canonicalize_origin("HTTPS://Example.COM").unwrap(),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            crate::mcp_endpoint::canonicalize_origin("http://[::1]:80").unwrap(),
+            "http://[::1]:80"
+        );
+        assert!(crate::mcp_endpoint::canonicalize_origin("https://example.com/").is_err());
+    }
+
+    #[test]
+    fn mcp_origin_allowlist_rejects_ambiguous_values() {
+        for origin in [
+            "null",
+            "*",
+            "https://*.example.com",
+            "https://example.com/path",
+            "https://example.com/",
+            "https://example.com:bad",
+            "https://user@example.com",
+            "https://example.com?query=1",
+        ] {
+            assert!(
+                BridgeAppState::builder(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"))
+                    .with_mcp_allowed_origins([origin])
+                    .is_err(),
+                "origin should be rejected: {origin}"
+            );
+        }
     }
 
     #[test]
@@ -3085,6 +3612,91 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn tool_response_requires_thread_id() {
+        let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+        let response = build_router(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/tool-response")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"toolCallId":"call","content":"ok","isError":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn agui_input_validation_rejects_invalid_input_before_session_admission() {
+        let mut duplicate_messages = RunAgentInput::new("thread", "run");
+        for text in ["one", "two"] {
+            duplicate_messages
+                .messages
+                .push(Message::User(agui_rs_core::types::UserMessage {
+                    id: "duplicate-message-id".into(),
+                    content: UserMessageContent::Text(text.into()),
+                    name: None,
+                    encrypted_value: None,
+                }));
+        }
+
+        let inputs = [
+            RunAgentInput::new("", "run"),
+            RunAgentInput::new("thread", " "),
+            duplicate_messages,
+        ];
+        let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+
+        for input in inputs {
+            let response = build_router(state.clone())
+                .oneshot(
+                    HttpRequest::post("/")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&input).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error body");
+            assert!(body.starts_with(b"invalid request body: "));
+        }
+
+        assert_eq!(state.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn agui_body_limit_rejects_oversized_raw_body() {
+        let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+        let response = build_router(state.clone())
+            .oneshot(
+                HttpRequest::post("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b'x'; DEFAULT_BODY_LIMIT_BYTES + 1]))
+                    .unwrap(),
+            )
+            .await
+            .expect("router response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        assert_eq!(
+            body,
+            format!("invalid request body: request body exceeds {DEFAULT_BODY_LIMIT_BYTES} bytes")
+                .as_bytes()
+        );
+        assert_eq!(state.session_count(), 0);
+    }
+
     #[test]
     fn run_admission_releases_only_its_own_claim() {
         let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
@@ -3094,6 +3706,137 @@ mod tests {
         assert!(state.try_claim_run("thread", "run-2").is_none());
         drop(first);
         assert!(state.try_claim_run("thread", "run-2").is_some());
+    }
+
+    struct SessionCreationRaceClient {
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Semaphore>,
+        follower_started: Arc<tokio::sync::Notify>,
+        third_started: Arc<tokio::sync::Notify>,
+        release_followers: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpClient for SessionCreationRaceClient {
+        async fn open_session(&self, cfg: SessionConfig) -> Result<AcpSessionHandle, BridgeError> {
+            let call = self.opens.fetch_add(1, Ordering::SeqCst);
+            match call {
+                0 => {
+                    self.first_started.notify_one();
+                    self.release_first
+                        .acquire()
+                        .await
+                        .expect("first release semaphore is live")
+                        .forget();
+                    Err(BridgeError::SessionClosed)
+                }
+                1 => {
+                    self.follower_started.notify_one();
+                    self.release_followers
+                        .acquire()
+                        .await
+                        .expect("follower release semaphore is live")
+                        .forget();
+                    InProcessAcpClient::new().open_session(cfg).await
+                }
+                _ => {
+                    self.third_started.notify_one();
+                    self.release_followers
+                        .acquire()
+                        .await
+                        .expect("follower release semaphore is live")
+                        .forget();
+                    InProcessAcpClient::new().open_session(cfg).await
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_creation_gate_survives_failure_with_queued_waiters() {
+        let client = Arc::new(SessionCreationRaceClient {
+            opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            first_started: Arc::new(tokio::sync::Notify::new()),
+            release_first: Arc::new(tokio::sync::Semaphore::new(0)),
+            follower_started: Arc::new(tokio::sync::Notify::new()),
+            third_started: Arc::new(tokio::sync::Notify::new()),
+            release_followers: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let state = BridgeAppState::new(client.clone(), PathBuf::from("/"));
+
+        let first = {
+            let state = state.clone();
+            tokio::spawn(async move { state.session_for("creation-race").await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), client.first_started.notified())
+            .await
+            .expect("first open_session must start");
+
+        let queued = {
+            let state = state.clone();
+            tokio::spawn(async move { state.session_for("creation-race").await })
+        };
+
+        // The extra Arc proves the second caller retained the same gate before
+        // the first creator is allowed to fail.
+        let gate = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(gate) = state.inner.create_locks.get("creation-race") {
+                    let gate = gate.clone();
+                    if Arc::strong_count(&gate) >= 4 {
+                        break gate;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued caller must retain the creation gate");
+        drop(gate);
+
+        client.release_first.add_permits(1);
+        assert!(first.await.expect("first creator task").is_err());
+
+        tokio::time::timeout(Duration::from_secs(1), client.follower_started.notified())
+            .await
+            .expect("queued caller must reach the retrying open_session");
+
+        let contender = {
+            let state = state.clone();
+            tokio::spawn(async move { state.session_for("creation-race").await })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), client.third_started.notified())
+                .await
+                .is_err(),
+            "a new caller must queue behind the old gate, not open a second session"
+        );
+
+        client.release_followers.add_permits(2);
+        let queued_entry = tokio::time::timeout(Duration::from_secs(2), queued)
+            .await
+            .expect("queued creation must finish")
+            .expect("queued creation task must not panic")
+            .expect("queued creation must succeed");
+        let contender_entry = tokio::time::timeout(Duration::from_secs(2), contender)
+            .await
+            .expect("contender creation must finish")
+            .expect("contender creation task must not panic")
+            .expect("contender creation must reuse the queued session");
+
+        assert_eq!(client.opens.load(Ordering::SeqCst), 2);
+        assert!(Arc::ptr_eq(&queued_entry, &contender_entry));
+        let cached_entry = state
+            .inner
+            .sessions
+            .get("creation-race")
+            .expect("session is cached")
+            .clone();
+        assert!(Arc::ptr_eq(&cached_entry, &queued_entry));
+        assert_eq!(state.session_count(), 1);
+        assert!(state.inner.create_locks.is_empty());
     }
 
     async fn collect_history_terminal(
@@ -3215,6 +3958,7 @@ mod tests {
         let entry = Arc::new(SessionEntry::new(session.clone(), None));
         let registry_entry = state.inner.frontend_tools.entry("slow-consumer");
         let pending = registry_entry.register_pending("pending-tool".into());
+        let frontend_stream = install_frontend_sender(&registry_entry, 1);
         let prompt_guard = entry.enter_prompt();
         let run_guard = state
             .try_claim_run("slow-consumer", "slow-run")
@@ -3231,6 +3975,7 @@ mod tests {
                 state: state.clone(),
                 registry_entry,
                 turn_id,
+                frontend_stream,
             },
             1,
             prompt_guard,
@@ -3242,7 +3987,15 @@ mod tests {
             .expect("slow consumer must tear down the stream")
             .expect("pending frontend call response");
         assert!(response.is_error);
-        assert_eq!(entry.active_prompts(), 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while entry.active_prompts() != 0 && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            entry.active_prompts(),
+            0,
+            "timed out waiting for detached stream task to drop PromptGuard"
+        );
         assert!(
             !entry.handle.is_unusable(),
             "slow consumer cleanup must cancel the turn, not unconditionally kill a healthy session"

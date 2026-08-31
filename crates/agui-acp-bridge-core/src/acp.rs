@@ -32,7 +32,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use agent_client_protocol::schema::v1::{HttpHeader, SessionConfigOption, SessionId, StopReason};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, HttpHeader, SessionConfigOption, SessionConfigOptionValue, SessionId, StopReason,
+    TextContent,
+};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
@@ -288,7 +291,7 @@ pub struct SessionConfig {
     /// falling back to `session/new`.
     ///
     /// `None` (the default) always creates a new session.
-    pub load_session_id: Option<String>,
+    pub load_session_id: Option<SessionId>,
 }
 
 impl std::fmt::Debug for SessionConfig {
@@ -544,7 +547,18 @@ impl AcpSessionHandle {
     /// channels are unaffected. The actor processes prompts sequentially, so
     /// concurrent calls on the same session will queue.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<PromptStream, BridgeError> {
-        self.prompt_with_turn(text)
+        self.prompt_blocks(vec![ContentBlock::Text(TextContent::new(text))])
+            .await
+    }
+
+    /// Submit an ordered ACP content-block prompt and receive a [`PromptStream`]
+    /// scoped to that turn. Every block is forwarded to ACP unchanged and in
+    /// the supplied order.
+    pub async fn prompt_blocks(
+        &self,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<PromptStream, BridgeError> {
+        self.prompt_blocks_with_turn(prompt)
             .await
             .map(|(prompt, _turn_id)| prompt)
     }
@@ -559,6 +573,17 @@ impl AcpSessionHandle {
         &self,
         text: impl Into<String>,
     ) -> Result<(PromptStream, TurnId), BridgeError> {
+        self.prompt_blocks_with_turn(vec![ContentBlock::Text(TextContent::new(text))])
+            .await
+    }
+
+    /// Submit an ordered ACP content-block prompt and return its stream
+    /// together with the opaque identity used to cancel exactly this
+    /// queued/in-flight turn.
+    pub async fn prompt_blocks_with_turn(
+        &self,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<(PromptStream, TurnId), BridgeError> {
         if self.cmd_tx.is_closed() || self.is_unusable() {
             return Err(BridgeError::SessionClosed);
         }
@@ -571,7 +596,7 @@ impl AcpSessionHandle {
         let mut enqueue_guard = EnqueuedTurnGuard::new(self.turn_queue.clone(), turn.clone());
         self.cmd_tx
             .send(SessionCommand::Prompt {
-                text: text.into(),
+                prompt,
                 events_tx,
                 finished_tx,
                 turn: turn.clone(),
@@ -710,11 +735,22 @@ impl AcpSessionHandle {
         config_id: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<(), BridgeError> {
+        self.set_config_option_value(config_id, SessionConfigOptionValue::value_id(value.into()))
+            .await
+    }
+
+    /// Send an ACP `session/set_config_option` request with its typed payload
+    /// and await the agent's acknowledgement.
+    pub async fn set_config_option_value(
+        &self,
+        config_id: impl Into<String>,
+        value: SessionConfigOptionValue,
+    ) -> Result<(), BridgeError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.cmd_tx
             .send(SessionCommand::SetConfigOption {
                 config_id: config_id.into(),
-                value: value.into(),
+                value,
                 ack: ack_tx,
             })
             .await
@@ -796,7 +832,7 @@ impl AcpSessionHandle {
 #[derive(Debug)]
 pub(crate) enum SessionCommand {
     Prompt {
-        text: String,
+        prompt: Vec<ContentBlock>,
         events_tx: mpsc::Sender<BridgeStreamItem>,
         finished_tx: oneshot::Sender<Result<StopReason, BridgeError>>,
         turn: Arc<TurnState>,
@@ -807,7 +843,7 @@ pub(crate) enum SessionCommand {
     },
     SetConfigOption {
         config_id: String,
-        value: String,
+        value: SessionConfigOptionValue,
         ack: oneshot::Sender<Result<(), BridgeError>>,
     },
     Close {

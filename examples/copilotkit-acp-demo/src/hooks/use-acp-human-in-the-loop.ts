@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
 import { useAcpFrontendTool } from "./use-acp-frontend-tool";
 
@@ -64,6 +64,16 @@ export function useAcpHumanInTheLoop<Args extends Record<string, unknown>>(opts:
     resolve: (value: unknown) => void;
     reject: (err: Error) => void;
   } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      const resolver = resolverRef.current;
+      resolverRef.current = null;
+      resolver?.reject(
+        new Error("human-in-the-loop request cancelled: component unmounted"),
+      );
+    };
+  }, []);
 
   // Adopt a new in-flight call. If a prior call was unresolved, fail it.
   const adopt = useCallback(

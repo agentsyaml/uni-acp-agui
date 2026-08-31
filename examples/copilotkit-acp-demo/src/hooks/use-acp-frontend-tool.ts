@@ -104,7 +104,12 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
   useEffect(() => {
     if (!agent) return;
 
-    type ActiveCall = { id: string; argsDelta: string; resolved: boolean };
+    type ActiveCall = {
+      id: string;
+      threadId: string;
+      argsDelta: string;
+      resolved: boolean;
+    };
     // Tracking *every* in-flight call (not just the most recent) is
     // required for parallel tool calls. The agent legitimately emits
     // `Estimate the cost of 3 units of A100 and 2 of B200` as two
@@ -120,10 +125,11 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
         };
         const id = e.toolCallId ?? "";
         const name = e.toolCallName ?? "";
-        if (!id || !matchNamesRef.current.has(name)) {
+        const threadId = agent.threadId;
+        if (!id || !threadId || !matchNamesRef.current.has(name)) {
           return;
         }
-        activeCalls.set(id, { id, argsDelta: "", resolved: false });
+        activeCalls.set(id, { id, threadId, argsDelta: "", resolved: false });
       },
       onToolCallArgsEvent: ({ event }) => {
         const e = event as { toolCallId?: string; delta?: string };
@@ -142,7 +148,7 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
         }
         call.resolved = true;
         const args = parsed as Args;
-        void runHandler(id, args);
+        void runHandler(id, call.threadId, args);
       },
       onToolCallEndEvent: ({ event }) => {
         const e = event as { toolCallId?: string };
@@ -154,7 +160,7 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
         // MCP request resolves instead of timing out.
         if (!call.resolved) {
           call.resolved = true;
-          void runHandler(id, {} as Args);
+          void runHandler(id, call.threadId, {} as Args);
         }
         activeCalls.delete(id);
       },
@@ -165,7 +171,7 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
       activeCalls.clear();
     };
 
-    async function runHandler(toolCallId: string, args: Args) {
+    async function runHandler(toolCallId: string, threadId: string, args: Args) {
       let isError = false;
       let content: string;
       try {
@@ -187,7 +193,7 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
         const res = await fetch("/api/bridge/tool-response", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ toolCallId, content, isError }),
+          body: JSON.stringify({ threadId, toolCallId, content, isError }),
         });
         if (!res.ok) {
           logRef.current(

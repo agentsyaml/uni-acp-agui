@@ -45,13 +45,16 @@ pub struct SessionModelsInit {
 /// `GET /sessions` endpoint (backed by ACP `session/list`) so AG-UI
 /// frontends can render a conversation-history list without speaking ACP.
 ///
-/// The bridge holds **no** session state itself: this is a pass-through view
-/// of what the agent reports. `session_id` doubles as the AG-UI `threadId`
-/// the frontend should use to resume the conversation.
+/// The bridge holds no persisted history itself: this is a pass-through view
+/// of what the agent reports. ACP session IDs are separate from AG-UI
+/// `threadId`; the live bridge cache owns the explicit mapping between them.
+/// A listed `session_id` is supplied only as
+/// `forwardedProps.acpResume.sessionId` for a private load, never as a thread
+/// alias. Boolean resume markers and load fallbacks are not supported.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
-    /// ACP `SessionId`. Use this as the AG-UI `threadId` to resume.
+    /// ACP `SessionId`, separate from the AG-UI `threadId`.
     pub session_id: String,
     /// Absolute working directory the session was created in.
     pub cwd: String,

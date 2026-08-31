@@ -4,7 +4,14 @@ import {
   copilotRuntimeNextJSAppRouterEndpoint,
 } from "@copilotkit/runtime";
 import type { NextRequest } from "next/server";
-import { createBridgeAgent } from "@/lib/agui-bridge";
+import {
+  BRIDGE_AUXILIARY_TIMEOUT_MS,
+  BridgeRequestBodyTooLargeError,
+  bridgeErrorResponse,
+  bridgeRequestCsrfResponse,
+  createBridgeAgent,
+  readBoundedRequestBody,
+} from "@/lib/agui-bridge";
 
 /**
  * CopilotKit runtime route.
@@ -28,13 +35,48 @@ const runtime = new CopilotRuntime({
 });
 
 export const POST = async (req: NextRequest) => {
+  const csrfResponse = bridgeRequestCsrfResponse(req);
+  if (csrfResponse) return csrfResponse;
+
+  const bodyAdmissionTimeoutSignal = AbortSignal.timeout(
+    BRIDGE_AUXILIARY_TIMEOUT_MS,
+  );
+  const bodyAdmissionSignal = AbortSignal.any([
+    req.signal,
+    bodyAdmissionTimeoutSignal,
+  ]);
+  let body: string;
+
+  try {
+    body = await readBoundedRequestBody(req, bodyAdmissionSignal);
+  } catch (error) {
+    if (error instanceof BridgeRequestBodyTooLargeError) {
+      return bridgeErrorResponse(413, "request body too large");
+    }
+    if (req.signal.aborted) throw error;
+    if (bodyAdmissionTimeoutSignal.aborted) {
+      return bridgeErrorResponse(504, "bridge request timed out");
+    }
+    throw error;
+  }
+
+  // This 30s deadline is only for bounded request-body admission. Do not pass
+  // it into handleRequest: the primary response is intentionally long-lived
+  // SSE, so the runtime keeps the original signal for disconnect cancellation.
+  const runtimeRequest = new Request(req.url, {
+    method: req.method,
+    headers: new Headers(req.headers),
+    body,
+    signal: req.signal,
+  });
   const { handleRequest } = copilotRuntimeNextJSAppRouterEndpoint({
     runtime,
     serviceAdapter,
     endpoint: "/api/copilotkit",
   });
-  return handleRequest(req);
+  return handleRequest(runtimeRequest);
 };
 
-// Long-running SSE — opt out of the default 10s edge response cap.
+// Primary AG-UI SSE lifetime is bounded by Next's maxDuration and the
+// incoming request signal, not the 30s auxiliary deadline above.
 export const maxDuration = 300;

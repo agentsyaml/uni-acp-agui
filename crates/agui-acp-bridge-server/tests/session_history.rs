@@ -2,7 +2,7 @@
 //!
 //! - `GET /sessions` → ACP `session/list` pass-through.
 //! - Resume an existing conversation via `session/load` (history replay)
-//!   when a run carries `forwardedProps.acpResume = true`.
+//!   when a run carries `forwardedProps.acpResume.sessionId`.
 //!
 //! The bridge holds no history of its own; these verify it faithfully
 //! surfaces what the agent persists. A shared session store backs the mock
@@ -12,6 +12,7 @@
 
 mod support;
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -29,7 +30,16 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
-use support::{collect_sse_body, user_input};
+use support::{collect_sse_body, count_events, user_input};
+
+fn temporary_resume_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "agui-acp-session-history-{label}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root).expect("create temporary resume root");
+    root
+}
 
 /// An `AcpClient` whose every connection shares one in-memory session store,
 /// so sessions created on one connection are visible to later `session/list`
@@ -119,8 +129,108 @@ async fn sessions_endpoint_lists_created_conversations() {
         .collect();
     assert!(titles.contains(&"hello A"), "titles: {titles:?}");
     assert!(titles.contains(&"hello B"), "titles: {titles:?}");
-    // Every entry carries a sessionId usable as a resume threadId.
+    // Every entry carries the ACP SessionId used by the explicit resume marker.
     assert!(sessions.iter().all(|s| s["sessionId"].as_str().is_some()));
+}
+
+#[tokio::test]
+async fn resume_loads_a_nested_allowed_working_directory() {
+    let root = temporary_resume_root("nested");
+    let nested = root.join("nested/project");
+    fs::create_dir_all(&nested).expect("create nested cwd");
+
+    let client = Arc::new(SharedHistoryClient::new());
+    client.store.lock().expect("store poisoned").insert(
+        "nested-session".into(),
+        (
+            Some("nested".into()),
+            nested.clone(),
+            vec!["user:nested history".into()],
+        ),
+    );
+    let state = BridgeAppState::new(client, root.clone());
+
+    let mut input = RunAgentInput::new("nested-thread", "r-nested");
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": "nested-session"}
+    });
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(
+        body.contains("HISTORY:user:nested history"),
+        "body:\n{body}"
+    );
+    assert_eq!(state.session_count(), 1);
+    drop(state);
+    fs::remove_dir_all(root).expect("remove temporary resume root");
+}
+
+#[tokio::test]
+async fn resume_rejects_a_session_outside_the_bridge_root_before_load() {
+    let root = temporary_resume_root("outside-root");
+    let outside = temporary_resume_root("outside");
+    let client = Arc::new(SharedHistoryClient::new());
+    client.store.lock().expect("store poisoned").insert(
+        "outside-session".into(),
+        (
+            Some("outside".into()),
+            outside.clone(),
+            vec!["user:must not load".into()],
+        ),
+    );
+    let state = BridgeAppState::new(client, root.clone());
+
+    let mut input = RunAgentInput::new("outside-thread", "r-outside");
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": "outside-session"}
+    });
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(body.contains("ACP_RESUME_FAILED"), "body:\n{body}");
+    assert!(
+        !body.contains("HISTORY:"),
+        "outside session was loaded:\n{body}"
+    );
+    assert_eq!(
+        state.session_count(),
+        0,
+        "no actor should open before cwd validation"
+    );
+    drop(state);
+    fs::remove_dir_all(root).expect("remove bridge root");
+    fs::remove_dir_all(outside).expect("remove outside cwd");
+}
+
+#[tokio::test]
+async fn spoofed_resume_cwd_is_ignored() {
+    let root = temporary_resume_root("spoofed-cwd");
+    let outside = temporary_resume_root("spoofed-outside");
+    let client = Arc::new(SharedHistoryClient::new());
+    let state = BridgeAppState::new(client, root.clone());
+
+    let (_, _) =
+        collect_sse_body(state.clone(), user_input("source", "r-source", "persisted")).await;
+    let session_id = state.list_sessions().await.expect("list")[0]
+        .session_id
+        .clone();
+
+    let mut input = RunAgentInput::new("spoofed-thread", "r-spoofed");
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {
+            "sessionId": session_id,
+            "cwd": outside.to_string_lossy()
+        }
+    });
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(body.contains("HISTORY:user:persisted"), "body:\n{body}");
+    assert!(!body.contains("ACP_RESUME_FAILED"), "body:\n{body}");
+    drop(state);
+    fs::remove_dir_all(root).expect("remove bridge root");
+    fs::remove_dir_all(outside).expect("remove spoofed cwd");
 }
 
 #[tokio::test]
@@ -133,8 +243,8 @@ async fn resume_bootstrap_run_replays_loaded_history() {
     let (_, _) = collect_sse_body(state.clone(), user_input("conv", "r2", "beta")).await;
 
     // The bridge's live session for "conv" used an agent-assigned SessionId.
-    // To resume by loading, the frontend would use that SessionId (from GET
-    // /sessions) as the threadId. Discover it.
+    // To resume by loading, the frontend supplies that ACP SessionId in the
+    // private marker while choosing its own AG-UI threadId.
     let summaries = state.list_sessions().await.expect("list");
     assert!(!summaries.is_empty(), "agent must have recorded a session");
     let resume_id = summaries[0].session_id.clone();
@@ -142,9 +252,11 @@ async fn resume_bootstrap_run_replays_loaded_history() {
     // 2. Issue an explicit bridge-private resume bootstrap run. The marker is
     //    required; without it the same input is an ordinary new session/no-op
     //    run.
-    let input = RunAgentInput::new(&resume_id, "r-resume");
+    let input = RunAgentInput::new("resume-thread", "r-resume");
     let mut input = input;
-    input.forwarded_props = serde_json::json!({"acpResume": true});
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": resume_id}
+    });
     let (status, body) = collect_sse_body(state.clone(), input).await;
 
     assert_eq!(status, StatusCode::OK, "body:\n{body}");
@@ -158,13 +270,27 @@ async fn resume_bootstrap_run_replays_loaded_history() {
         body.contains("HISTORY:user:alpha") && body.contains("HISTORY:user:beta"),
         "resume must replay the loaded conversation history, body:\n{body}"
     );
+    assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+    let alpha = body
+        .find("HISTORY:user:alpha")
+        .expect("alpha history must be present");
+    let beta = body
+        .find("HISTORY:user:beta")
+        .expect("beta history must be present");
+    let finished = body
+        .rfind("\"type\":\"RUN_FINISHED\"")
+        .expect("resume run must finish");
+    assert!(
+        alpha < beta && beta < finished,
+        "history order must be preserved"
+    );
     assert!(
         body.contains("\"configOptions\"") && body.contains("\"currentValue\":\"loaded\""),
         "session/load config options must be cached and emitted, body:\n{body}"
     );
     assert!(
         state
-            .session_init_state(&resume_id)
+            .session_init_state("resume-thread")
             .and_then(|init| init.config_options)
             .is_some_and(|options| {
                 options.iter().any(|option| {
@@ -186,9 +312,14 @@ async fn explicit_resume_on_live_session_drains_without_new_session() {
     let state = BridgeAppState::new(client, PathBuf::from("/"));
 
     let (_, _) = collect_sse_body(state.clone(), user_input("live", "r1", "alpha")).await;
+    let resume_id = state.list_sessions().await.expect("list")[0]
+        .session_id
+        .clone();
 
     let mut input = RunAgentInput::new("live", "r-resume-live");
-    input.forwarded_props = serde_json::json!({"acpResume": true});
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": resume_id}
+    });
     let (status, body) = collect_sse_body(state.clone(), input).await;
 
     assert_eq!(status, StatusCode::OK, "body:\n{body}");
@@ -206,11 +337,7 @@ async fn bootstrap_without_marker_stays_on_normal_path() {
     let state = BridgeAppState::new(client, PathBuf::from("/"));
 
     let (_, _) = collect_sse_body(state.clone(), user_input("original", "r1", "alpha")).await;
-    let resume_id = state.list_sessions().await.expect("list")[0]
-        .session_id
-        .clone();
-
-    let input = RunAgentInput::new(&resume_id, "r-bootstrap");
+    let input = RunAgentInput::new("resume-thread", "r-bootstrap");
     let (status, body) = collect_sse_body(state.clone(), input).await;
     assert_eq!(status, StatusCode::OK, "body:\n{body}");
     assert!(body.contains("RUN_FINISHED"));
@@ -236,23 +363,41 @@ async fn explicit_resume_with_trailing_user_loads_before_prompt() {
     let resume_id = state.list_sessions().await.expect("list")[0]
         .session_id
         .clone();
-    let mut input = user_input(&resume_id, "r-resume-prompt", "gamma");
-    input.forwarded_props = serde_json::json!({"acpResume": true});
+    let mut input = user_input("resume-thread", "r-resume-prompt", "gamma");
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": resume_id}
+    });
 
-    let (status, body) = collect_sse_body(state, input).await;
+    let (status, body) = collect_sse_body(state.clone(), input).await;
     assert_eq!(status, StatusCode::OK, "body:\n{body}");
     assert!(
         body.contains("HISTORY:user:alpha"),
         "load history missing:\n{body}"
     );
     assert!(body.contains("echo: gamma"), "new prompt missing:\n{body}");
+    assert_eq!(count_events(&body, "MESSAGES_SNAPSHOT"), 0);
+    assert!(
+        body.find("HISTORY:user:alpha") < body.find("echo: gamma"),
+        "loaded history must precede the new prompt:\n{body}"
+    );
+
+    let (status, next_body) =
+        collect_sse_body(state, user_input("resume-thread", "r-next", "delta")).await;
+    assert_eq!(status, StatusCode::OK, "next prompt failed:\n{next_body}");
+    assert!(
+        !next_body.contains("HISTORY:"),
+        "loaded history must be replayed only once:\n{next_body}"
+    );
+    assert_eq!(count_events(&next_body, "MESSAGES_SNAPSHOT"), 0);
 }
 
 #[tokio::test]
 async fn explicit_resume_without_load_capability_is_a_run_error() {
     let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
     let mut input = RunAgentInput::new("resume-unsupported", "r-unsupported");
-    input.forwarded_props = serde_json::json!({"acpResume": true});
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": "unsupported-session"}
+    });
 
     let (status, body) = collect_sse_body(state.clone(), input).await;
     assert_eq!(
@@ -270,11 +415,59 @@ async fn explicit_resume_without_load_capability_is_a_run_error() {
 }
 
 #[tokio::test]
+async fn legacy_boolean_resume_requires_an_acp_session_id() {
+    let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+    let mut input = RunAgentInput::new("legacy-resume", "r-legacy");
+    input.forwarded_props = serde_json::json!({"acpResume": true});
+
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "resume failure must be an AG-UI stream"
+    );
+    assert!(
+        body.contains("ACP_RESUME_SESSION_ID_REQUIRED"),
+        "body:\n{body}"
+    );
+    assert_eq!(
+        state.session_count(),
+        0,
+        "invalid resume must open no actor"
+    );
+}
+
+#[tokio::test]
+async fn legacy_false_resume_requires_an_acp_session_id() {
+    let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+    let mut input = RunAgentInput::new("legacy-false-resume", "r-legacy-false");
+    input.forwarded_props = serde_json::json!({"acpResume": false});
+
+    let (status, body) = collect_sse_body(state.clone(), input).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "resume failure must be an AG-UI stream"
+    );
+    assert!(
+        body.contains("ACP_RESUME_SESSION_ID_REQUIRED"),
+        "body:\n{body}"
+    );
+    assert_eq!(
+        state.session_count(),
+        0,
+        "invalid resume must open no actor"
+    );
+}
+
+#[tokio::test]
 async fn explicit_resume_load_failure_is_a_run_error_without_new_session() {
     let client = Arc::new(SharedHistoryClient::new());
     let state = BridgeAppState::new(client, PathBuf::from("/"));
     let mut input = RunAgentInput::new("unknown-session-id", "r-failed");
-    input.forwarded_props = serde_json::json!({"acpResume": true});
+    input.forwarded_props = serde_json::json!({
+        "acpResume": {"sessionId": "unknown-session-id"}
+    });
 
     let (status, body) = collect_sse_body(state.clone(), input).await;
     assert_eq!(

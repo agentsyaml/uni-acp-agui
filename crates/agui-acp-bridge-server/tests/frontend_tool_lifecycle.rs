@@ -24,6 +24,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -35,7 +36,7 @@ use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Dispatch};
 use agui_acp_bridge_core::BridgeConfig;
 use agui_acp_bridge_core::BridgeError;
 use agui_acp_bridge_core::acp::CustomAgentInProcessClient;
-use agui_acp_bridge_server::{AcpClient, BridgeAppState, build_router};
+use agui_acp_bridge_server::{AcpClient, BridgeAppState, build_router, test_agents};
 use agui_rs_core::types::{Message, RunAgentInput, Tool, UserMessage, UserMessageContent};
 use serde_json::{Value, json};
 use tokio::io::DuplexStream;
@@ -290,6 +291,40 @@ async fn spawn_bridge(config: BridgeConfig) -> (SocketAddr, BridgeAppState) {
     (bound, state)
 }
 
+async fn spawn_replacement_bridge(config: BridgeConfig) -> (SocketAddr, BridgeAppState) {
+    let captured_url: McpUrlCell = Arc::new(TokioMutex::new(None));
+    let captured = captured_url.clone();
+    let opens = Arc::new(AtomicUsize::new(0));
+    let opens_for_factory = opens.clone();
+    let factory = move |stream: DuplexStream| {
+        let captured = captured.clone();
+        let first = opens_for_factory.fetch_add(1, Ordering::SeqCst) == 0;
+        async move {
+            if first {
+                test_agents::run_unresponsive_setting_agent(stream).await
+            } else {
+                run_tool_calling_agent(stream, captured).await
+            }
+        }
+    };
+    let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(factory));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let bound = listener.local_addr().expect("addr");
+    let state = BridgeAppState::builder(client, PathBuf::from("/"))
+        .with_self_url(format!("http://{bound}"))
+        .with_config(config)
+        .build();
+    state.spawn_reaper();
+    let app = build_router(state.clone());
+
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (bound, state)
+}
+
 fn input_with_tool(thread: &str, run: &str) -> RunAgentInput {
     let mut input = RunAgentInput::new(thread, run);
     input.tools.push(Tool {
@@ -342,17 +377,70 @@ fn first_tool_call_id(body: &str) -> Option<String> {
 
 async fn post_tool_response(
     bound: SocketAddr,
+    thread_id: &str,
     tool_call_id: &str,
     content: &str,
 ) -> reqwest::StatusCode {
     let http = reqwest::Client::new();
     let resp = http
         .post(format!("http://{bound}/tool-response"))
-        .json(&json!({"toolCallId": tool_call_id, "content": content, "isError": false}))
+        .json(&json!({"threadId": thread_id, "toolCallId": tool_call_id, "content": content, "isError": false}))
         .send()
         .await
         .expect("POST /tool-response");
     resp.status()
+}
+
+async fn drain_run(bound: SocketAddr, input: &RunAgentInput) -> String {
+    use futures::StreamExt;
+
+    let mut stream = post_run(bound, input).await.bytes_stream();
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(error))) => panic!("SSE chunk error: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if body.contains("\"type\":\"RUN_FINISHED\"") || body.contains("\"type\":\"RUN_ERROR\"") {
+            break;
+        }
+    }
+    body
+}
+
+async fn run_with_tool_response(bound: SocketAddr, input: &RunAgentInput) -> String {
+    use futures::StreamExt;
+
+    let mut stream = post_run(bound, input).await.bytes_stream();
+    let mut body = String::new();
+    let mut posted = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(error))) => panic!("SSE chunk error: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+        if !posted && let Some(tool_call_id) = first_tool_call_id(&body) {
+            assert_eq!(
+                post_tool_response(bound, &input.thread_id, &tool_call_id, "hi world").await,
+                reqwest::StatusCode::OK
+            );
+            posted = true;
+        }
+        if body.contains("\"type\":\"RUN_FINISHED\"") || body.contains("\"type\":\"RUN_ERROR\"") {
+            break;
+        }
+    }
+    assert!(
+        posted,
+        "replacement run must emit a frontend tool call: {body}"
+    );
+    body
 }
 
 // --- Tests ----------------------------------------------------------------
@@ -380,7 +468,7 @@ async fn tool_call_resolves_on_happy_path() {
         }
         if !posted && let Some(id) = first_tool_call_id(&body) {
             assert_eq!(
-                post_tool_response(bound, &id, "hi world").await,
+                post_tool_response(bound, "t-happy", &id, "hi world").await,
                 reqwest::StatusCode::OK
             );
             posted = true;
@@ -400,6 +488,105 @@ async fn tool_call_resolves_on_happy_path() {
     );
     assert!(body.contains("\"type\":\"RUN_FINISHED\""));
     let _ = state;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_session_recreates_frontend_tool_registry() {
+    let (bound, state) = spawn_replacement_bridge(BridgeConfig {
+        set_session_timeout: Duration::from_millis(100),
+        ..BridgeConfig::default()
+    })
+    .await;
+    let thread_id = "t-replacement-tools";
+
+    let first = input_with_tool(thread_id, "r1");
+    let first_events = drain_run(bound, &first).await;
+    assert!(
+        first_events.contains("\"type\":\"RUN_FINISHED\""),
+        "{first_events}"
+    );
+    assert!(state.frontend_tools().has(thread_id));
+
+    assert!(matches!(
+        state.set_session_mode(thread_id, "code").await,
+        Err(agui_acp_bridge_server::SetSessionStatus::Timeout)
+    ));
+    assert_eq!(state.session_count(), 1);
+
+    // Do not probe session_init_state here: that API intentionally evicts an
+    // unusable entry. The replacement run must repair the registry itself.
+    let replacement = input_with_tool(thread_id, "r2");
+    let replacement_events = run_with_tool_response(bound, &replacement).await;
+    assert!(
+        replacement_events.contains("\"type\":\"TOOL_CALL_START\"")
+            && replacement_events.contains("\"type\":\"TOOL_CALL_END\"")
+            && replacement_events.contains("\"type\":\"RUN_FINISHED\""),
+        "replacement MCP flow must complete: {replacement_events}"
+    );
+    assert!(
+        replacement_events.contains("TOOL_RESULT=hi world"),
+        "replacement tools/call must reach the browser response: {replacement_events}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_thread_tool_response_is_404_and_leaves_call_pending() {
+    let (bound, state) = spawn_bridge(BridgeConfig::default()).await;
+    let input = input_with_tool("t-owner", "r1");
+    let resp = post_run(bound, &input).await;
+
+    // Keep a second registry entry live so this proves a known wrong thread
+    // cannot fall back to any global tool-call-id lookup.
+    state.frontend_tools().entry("t-other");
+
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let tool_call_id = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tool call did not start"
+        );
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(error))) => panic!("SSE chunk error: {error}"),
+            Ok(None) => panic!("SSE ended before tool call"),
+            Err(_) => {}
+        }
+        if let Some(id) = first_tool_call_id(&body) {
+            break id;
+        }
+    };
+
+    assert_eq!(state.frontend_tools().pending_len("t-owner"), 1);
+    assert_eq!(
+        post_tool_response(bound, "t-owner", "unknown-call", "unknown").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(state.frontend_tools().pending_len("t-owner"), 1);
+    assert_eq!(
+        post_tool_response(bound, "t-other", &tool_call_id, "wrong").await,
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(state.frontend_tools().pending_len("t-owner"), 1);
+
+    assert_eq!(
+        post_tool_response(bound, "t-owner", &tool_call_id, "right").await,
+        reqwest::StatusCode::OK
+    );
+    let finish_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < finish_deadline && !body.contains("RUN_FINISHED") {
+        match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
+            Ok(Some(Err(error))) => panic!("SSE chunk error: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(body.contains("TOOL_RESULT=right"), "body:\n{body}");
+    assert!(body.contains("RUN_FINISHED"), "body:\n{body}");
+    assert_eq!(state.frontend_tools().pending_len("t-owner"), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -529,7 +716,7 @@ async fn bridge_stays_responsive_after_a_parked_disconnect() {
         }
         if !posted && let Some(id) = first_tool_call_id(&body) {
             assert_eq!(
-                post_tool_response(bound, &id, "ok").await,
+                post_tool_response(bound, "t-fresh", &id, "ok").await,
                 reqwest::StatusCode::OK
             );
             posted = true;

@@ -42,7 +42,7 @@ use agui_rs_core::types::{Message, RunAgentInput, Tool, UserMessage, UserMessage
 use serde_json::{Value, json};
 use tokio::io::DuplexStream;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -54,9 +54,17 @@ use uuid::Uuid;
 /// Filled when the agent receives `session/new`; read on the matching prompt.
 type McpUrlCell = Arc<TokioMutex<Option<String>>>;
 
+#[derive(Clone, Default)]
+struct ImmediateCallSignals {
+    prompt_started: Arc<Notify>,
+    call_started: Arc<Notify>,
+}
+
 async fn run_mcp_using_agent(
     stream: DuplexStream,
     captured_url: McpUrlCell,
+    immediate_call: bool,
+    signals: Option<ImmediateCallSignals>,
 ) -> Result<(), BridgeError> {
     let (read, write) = tokio::io::split(stream);
     let transport = ByteStreams::new(write.compat_write(), read.compat());
@@ -106,8 +114,10 @@ async fn run_mcp_using_agent(
                 async move |req: PromptRequest,
                             responder,
                             cx: ConnectionTo<agent_client_protocol::Client>| {
-                    // Drive the MCP flow: initialize → tools/list → tools/call,
-                    // then surface the tool result as an agent text message.
+                    // Drive the MCP flow and surface the tool result as an
+                    // agent text message. The regression variant skips
+                    // tools/list to issue tools/call as soon as prompt handling
+                    // starts.
                     let url = {
                         let slot = captured_url.lock().await;
                         slot.clone()
@@ -130,6 +140,10 @@ async fn run_mcp_using_agent(
                         }
                     };
 
+                    if let Some(signals) = &signals {
+                        signals.prompt_started.notify_one();
+                    }
+
                     let client = match build_mcp_client(&url).await {
                         Ok(c) => c,
                         Err(e) => {
@@ -145,44 +159,61 @@ async fn run_mcp_using_agent(
                         }
                     };
 
-                    let tools = match client.tools_list().await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            cx.send_notification(SessionNotification::new(
-                                req.session_id.clone(),
-                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                    ContentBlock::Text(TextContent::new(format!(
-                                        "MCP_TOOLS_LIST_FAILED: {e}"
-                                    ))),
-                                )),
-                            ))?;
-                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
-                        }
-                    };
+                    let first = if immediate_call {
+                        // The regression path deliberately skips tools/list:
+                        // once prompt handling starts, the agent calls the
+                        // known frontend tool immediately.
+                        "say_hello".to_string()
+                    } else {
+                        let tools = match client.tools_list().await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                cx.send_notification(SessionNotification::new(
+                                    req.session_id.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                        ContentBlock::Text(TextContent::new(format!(
+                                            "MCP_TOOLS_LIST_FAILED: {e}"
+                                        ))),
+                                    )),
+                                ))?;
+                                return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                            }
+                        };
 
-                    // Surface the tools/list result as a marker line so the
-                    // test can verify it independently of tools/call.
-                    let tool_names: Vec<String> = tools
-                        .iter()
-                        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
-                        .collect();
-                    cx.send_notification(SessionNotification::new(
-                        req.session_id.clone(),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                            TextContent::new(format!("TOOLS={}", tool_names.join(","))),
-                        ))),
-                    ))?;
-
-                    // Use the first tool. The test always provides exactly one.
-                    let Some(first) = tool_names.first().cloned() else {
+                        // Surface the tools/list result as a marker line so the
+                        // test can verify it independently of tools/call.
+                        let tool_names: Vec<String> = tools
+                            .iter()
+                            .filter_map(|t| {
+                                t.get("name").and_then(|n| n.as_str()).map(String::from)
+                            })
+                            .collect();
                         cx.send_notification(SessionNotification::new(
                             req.session_id.clone(),
                             SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new("NO_TOOLS_AVAILABLE")),
+                                ContentBlock::Text(TextContent::new(format!(
+                                    "TOOLS={}",
+                                    tool_names.join(",")
+                                ))),
                             )),
                         ))?;
-                        return responder.respond(PromptResponse::new(StopReason::EndTurn));
+
+                        // Use the first tool. The test always provides exactly one.
+                        let Some(first) = tool_names.first().cloned() else {
+                            cx.send_notification(SessionNotification::new(
+                                req.session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("NO_TOOLS_AVAILABLE")),
+                                )),
+                            ))?;
+                            return responder.respond(PromptResponse::new(StopReason::EndTurn));
+                        };
+                        first
                     };
+
+                    if let Some(signals) = &signals {
+                        signals.call_started.notify_one();
+                    }
 
                     let call_result =
                         match client.tools_call(&first, json!({"name": "world"})).await {
@@ -354,15 +385,28 @@ impl McpClient {
 // --------------------------------------------------------------------------
 
 async fn spawn_bridge() -> (SocketAddr, McpUrlCell) {
+    spawn_bridge_with_agent(false, None).await
+}
+
+async fn spawn_immediate_bridge(signals: ImmediateCallSignals) -> (SocketAddr, McpUrlCell) {
+    spawn_bridge_with_agent(true, Some(signals)).await
+}
+
+async fn spawn_bridge_with_agent(
+    immediate_call: bool,
+    signals: Option<ImmediateCallSignals>,
+) -> (SocketAddr, McpUrlCell) {
     let captured_url: McpUrlCell = Arc::new(TokioMutex::new(None));
     let captured_url_factory = captured_url.clone();
+    let signals_factory = signals.clone();
 
     // The factory is invoked each time the bridge opens an ACP session.
     // For these tests every run uses the same thread, so the agent
     // factory is invoked exactly once.
     let factory = move |stream: DuplexStream| {
         let captured = captured_url_factory.clone();
-        async move { run_mcp_using_agent(stream, captured).await }
+        let signals = signals_factory.clone();
+        async move { run_mcp_using_agent(stream, captured, immediate_call, signals).await }
     };
     let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(factory));
 
@@ -510,6 +554,7 @@ async fn drive_run(
                             let factory = on_tool_call(id.clone(), name, parsed_args);
                             let result = factory();
                             let body = json!({
+                                "threadId": input.thread_id,
                                 "toolCallId": id,
                                 "content": result.to_string(),
                                 "isError": false,
@@ -602,6 +647,27 @@ async fn frontend_tool_round_trip_streams_call_and_returns_browser_result() {
         tool_end < run_finished,
         "tool call must complete before RUN_FINISHED: {events:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frontend_tool_is_ready_for_an_immediate_prompt_call() {
+    let signals = ImmediateCallSignals::default();
+    let (bound, _captured) = spawn_immediate_bridge(signals.clone()).await;
+    let input = input_with_tool("thread-ft-immediate", "run-ft-immediate", say_hello_tool());
+    let on_tool_call: OnToolCall = Box::new(|_id, _name, _args| Box::new(|| json!({"ok": true})));
+
+    let (events, (), ()) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(
+            drive_run(bound, &input, on_tool_call),
+            signals.prompt_started.notified(),
+            signals.call_started.notified(),
+        )
+    })
+    .await
+    .expect("immediate frontend tool call deadlocked");
+    assert!(events.contains(&"TOOL_CALL_START".into()), "{events:?}");
+    assert!(events.contains(&"TOOL_CALL_END".into()), "{events:?}");
+    assert!(events.contains(&"RUN_FINISHED".into()), "{events:?}");
 }
 
 #[tokio::test]

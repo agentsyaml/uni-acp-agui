@@ -14,10 +14,10 @@ import { useConversations } from "@/components/copilot-provider";
  * harmless `GET /api/copilotkit/threads 404`). So a click produced no network
  * call to the bridge and the panel stayed blank.
  *
- * Instead we trigger the resume ourselves: point the agent at the selected
- * ACP SessionId, clear stale messages, and call `agent.runAgent()` with no
- * new user message plus the explicit `acpResume` forwarded prop. That is a
- * real `POST /` the bridge turns into a private `session/load` run → the
+ * Instead we trigger the resume ourselves: keep the selected ACP SessionId
+ * separate from the AG-UI threadId and call `agent.runAgent()` with no new
+ * user message plus the typed `acpResume` forwarded prop. That is a real
+ * `POST /` the bridge turns into a private `session/load` run → the
  * agent replays the conversation history as AG-UI `TEXT_MESSAGE_*` events,
  * which `runAgent` applies to `agent.messages`, and `<CopilotChat>` renders.
  *
@@ -25,14 +25,19 @@ import { useConversations } from "@/components/copilot-provider";
  */
 export function useAcpResume() {
   const { agent } = useAgent();
-  const { threadId, resumeToken } = useConversations();
+  const { resumeSessionId, threadId, resumeToken } = useConversations();
   const lastHandledToken = useRef<number>(0);
 
   useEffect(() => {
     if (!agent) return;
     // resumeToken starts at 0 (initial load, not an explicit open). Only act
     // on genuine user-driven opens.
-    if (resumeToken === 0 || resumeToken === lastHandledToken.current) return;
+    if (
+      resumeToken === 0 ||
+      resumeToken === lastHandledToken.current ||
+      !resumeSessionId
+    )
+      return;
     lastHandledToken.current = resumeToken;
 
     // `<CopilotChat threadId={threadId}>` binds the agent's threadId in its
@@ -46,11 +51,13 @@ export function useAcpResume() {
     // React Compiler treats it as immutable, and CopilotChat owns that state.
     const id = setTimeout(() => {
       void agent
-        .runAgent({ forwardedProps: { acpResume: true } })
+        .runAgent({
+          forwardedProps: { acpResume: { sessionId: resumeSessionId } },
+        })
         .catch((err: unknown) => {
           console.error("[useAcpResume] resume run failed", err);
         });
     }, 0);
     return () => clearTimeout(id);
-  }, [agent, threadId, resumeToken]);
+  }, [agent, resumeSessionId, threadId, resumeToken]);
 }

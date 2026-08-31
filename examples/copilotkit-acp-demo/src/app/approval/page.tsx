@@ -1,7 +1,7 @@
 "use client";
 
 import { useAgent, CopilotChat } from "@copilotkit/react-core/v2";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type PermissionOption = {
   optionId?: string;
@@ -27,17 +27,41 @@ export default function ApprovalPage() {
   const [history, setHistory] = useState<
     Array<{ ts: string; line: string }>
   >([]);
+  const [submitting, setSubmitting] = useState(false);
+  const pendingRef = useRef<ApprovalRequest | null>(null);
+  const submittingRef = useRef(false);
+  const lastSeenInterruptIdRef = useRef<string | null>(null);
+  const resolvedInterruptIdRef = useRef<string | null>(null);
+  const approvalControllerRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      approvalControllerRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (!agent) return;
     const subscription = agent.subscribe({
       onStateSnapshotEvent: ({ event }) => {
         const snap = (event as { snapshot?: ApprovalSnapshot }).snapshot;
-        if (snap?.approval?.pending) {
-          setPending(snap.approval);
+        const approval = snap?.approval;
+        if (
+          approval?.pending &&
+          approval.interruptId !== resolvedInterruptIdRef.current
+        ) {
+          pendingRef.current = approval;
+          setPending(approval);
+          const isNewRequest =
+            lastSeenInterruptIdRef.current !== approval.interruptId;
+          lastSeenInterruptIdRef.current = approval.interruptId;
+          if (!isNewRequest) return;
           appendHistory(
             setHistory,
-            `Permission request received: ${snap.approval.toolName ?? "?"} (${snap.approval.interruptId.slice(0, 8)}…)`,
+            `Permission request received: ${approval.toolName ?? "?"} (${approval.interruptId.slice(0, 8)}…)`,
           );
         }
       },
@@ -50,26 +74,47 @@ export default function ApprovalPage() {
     optionId: string | undefined,
     summary: string,
   ) => {
-    if (!pending) return;
+    const request = pendingRef.current;
+    if (!request || submittingRef.current) return;
+    submittingRef.current = true;
+    setSubmitting(true);
     appendHistory(
       setHistory,
-      `→ ${summary} (${pending.interruptId.slice(0, 8)}…)`,
+      `→ ${summary} (${request.interruptId.slice(0, 8)}…)`,
     );
-    setPending(null);
+    const controller = new AbortController();
+    approvalControllerRef.current = controller;
     try {
       const res = await fetch("/api/bridge/approval", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          interruptId: pending.interruptId,
+          interruptId: request.interruptId,
           approved,
           optionId,
         }),
+        signal: controller.signal,
       });
       const text = await res.text();
+      if (!mountedRef.current) return;
       appendHistory(setHistory, `← ${res.status} ${text || "(empty)"}`);
+      if (res.ok) {
+        resolvedInterruptIdRef.current = request.interruptId;
+        if (pendingRef.current?.interruptId === request.interruptId) {
+          pendingRef.current = null;
+          setPending(null);
+        }
+      }
     } catch (err) {
-      appendHistory(setHistory, `Request failed: ${String(err)}`);
+      if (mountedRef.current) {
+        appendHistory(setHistory, `Request failed: ${String(err)}`);
+      }
+    } finally {
+      if (approvalControllerRef.current === controller) {
+        approvalControllerRef.current = null;
+      }
+      submittingRef.current = false;
+      if (mountedRef.current) setSubmitting(false);
     }
   };
 
@@ -141,6 +186,7 @@ export default function ApprovalPage() {
                   key={`${id}-${idx}`}
                   type="button"
                   className="btn btn-success"
+                  disabled={submitting}
                   onClick={() => respond(true, id, `Approved (optionId=${id})`)}
                 >
                   ✓ {label}
@@ -150,6 +196,7 @@ export default function ApprovalPage() {
             <button
               type="button"
               className="btn btn-danger"
+              disabled={submitting}
               onClick={() => respond(false, undefined, "Denied")}
             >
               ✗ Deny

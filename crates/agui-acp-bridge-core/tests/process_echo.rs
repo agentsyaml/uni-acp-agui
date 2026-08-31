@@ -8,13 +8,22 @@
 mod build_example;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{SessionUpdate, StopReason};
+use agent_client_protocol::schema::v1::{
+    AgentCapabilities, ContentBlock, ImageContent, InitializeRequest, InitializeResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionUpdate,
+    StopReason, TextContent,
+};
+use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Dispatch};
 use agui_acp_bridge_core::{
-    AcpClient, BridgeConfig, BridgeStreamItem, ProcessAcpClient, SessionConfig,
+    AcpClient, BridgeConfig, BridgeError, BridgeStreamItem, CustomAgentInProcessClient,
+    ProcessAcpClient, PromptStream, SessionConfig,
 };
 use agui_acp_bridge_policy::AutoAllow;
+use tokio::io::DuplexStream;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::build_example::build_example_agent;
 
@@ -91,6 +100,139 @@ async fn process_echo_round_trip_streams_chunks_and_finishes() {
         "expected >=2 AgentMessageChunk events, got {chunk_count}"
     );
     assert!(finished, "expected Finished event");
+}
+
+#[tokio::test]
+async fn prompt_wrappers_forward_ordered_blocks_without_repurposing_ids() {
+    let captured = Arc::new(Mutex::new(Vec::<PromptRequest>::new()));
+    let captured_for_client = captured.clone();
+    let client = CustomAgentInProcessClient::new(move |stream| {
+        run_capture_prompt_agent(stream, captured_for_client.clone())
+    });
+    let handle = client
+        .open_session(cfg(std::env::current_dir().unwrap()))
+        .await
+        .expect("session must open");
+
+    assert_eq!(handle.session_id().0.as_ref(), "agent-session");
+
+    assert_finished_once(
+        handle.prompt("compat text").await.unwrap(),
+        StopReason::EndTurn,
+    )
+    .await;
+
+    let blocks = vec![
+        ContentBlock::Text(TextContent::new("first")),
+        ContentBlock::Image(ImageContent::new("aGVsbG8=", "image/png")),
+        ContentBlock::Text(TextContent::new("last")),
+    ];
+    assert_finished_once(
+        handle.prompt_blocks(blocks.clone()).await.unwrap(),
+        StopReason::EndTurn,
+    )
+    .await;
+
+    let (text_stream, text_turn) = handle.prompt_with_turn("compat with turn").await.unwrap();
+    assert_finished_once(text_stream, StopReason::EndTurn).await;
+    let (blocks_stream, blocks_turn) = handle
+        .prompt_blocks_with_turn(blocks.clone())
+        .await
+        .unwrap();
+    assert_finished_once(blocks_stream, StopReason::EndTurn).await;
+    assert_ne!(
+        text_turn, blocks_turn,
+        "turn IDs must remain distinct bridge IDs"
+    );
+
+    let captured = captured.lock().expect("capture lock");
+    assert_eq!(captured.len(), 4);
+    assert_eq!(
+        captured[0].prompt,
+        vec![ContentBlock::Text(TextContent::new("compat text"))]
+    );
+    assert_eq!(captured[1].prompt, blocks);
+    assert_eq!(
+        captured[2].prompt,
+        vec![ContentBlock::Text(TextContent::new("compat with turn"))]
+    );
+    assert_eq!(captured[3].prompt, blocks);
+    assert!(
+        captured
+            .iter()
+            .all(|request| request.session_id.0.as_ref() == "agent-session"),
+        "ACP session IDs must not be replaced with bridge turn/thread IDs"
+    );
+}
+
+async fn assert_finished_once(stream: PromptStream, expected: StopReason) {
+    let PromptStream {
+        mut events,
+        finished,
+    } = stream;
+    let mut terminal = Vec::new();
+    while let Some(item) = events.recv().await {
+        if let BridgeStreamItem::Finished { stop_reason } = item {
+            terminal.push(stop_reason);
+        }
+    }
+    assert_eq!(terminal, vec![expected]);
+    assert_eq!(
+        finished
+            .await
+            .expect("finished sender must remain")
+            .expect("prompt must succeed"),
+        expected
+    );
+}
+
+async fn run_capture_prompt_agent(
+    stream: DuplexStream,
+    captured: Arc<Mutex<Vec<PromptRequest>>>,
+) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-prompt-capture")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from("agent-session")))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest, responder, _cx| {
+                captured.lock().expect("capture lock").push(req);
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
 }
 
 #[cfg(unix)]

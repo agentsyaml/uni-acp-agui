@@ -12,6 +12,7 @@ pub mod policy;
 pub mod process;
 mod session;
 pub mod stream;
+mod terminal;
 pub mod translation;
 
 pub use acp::{

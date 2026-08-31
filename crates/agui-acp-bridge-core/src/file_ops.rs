@@ -3,11 +3,6 @@
 //! Implements `ReadTextFile` and `WriteTextFile` with path sandboxing
 //! to prevent directory traversal and symlink-based escapes.
 //!
-//! **Dormant ACP surface:** `session.rs` does not register these handlers while
-//! the bridge advertises no filesystem capability during `initialize`. The
-//! helpers remain correct and tested for a future, explicit capability gate;
-//! they are not currently reachable by an agent.
-//!
 //! # Sandbox model
 //!
 //! Every operation receives a `cwd` (the session's working directory) and an
@@ -15,11 +10,11 @@
 //! the OS (resolving symlinks), and verify the canonical path is inside the
 //! canonical `cwd`.
 //!
-//! For reads we canonicalize the full target. For writes, the target may
-//! not exist yet, so we canonicalize the **deepest existing ancestor** —
-//! the only thing the OS can canonicalize without TOCTOU. As long as the
-//! existing ancestor is inside `cwd`, the write is contained: subsequent
-//! `create_dir_all`/`write` calls only create or modify descendants.
+//! For reads we canonicalize the full target. For writes, the target may not
+//! exist yet, so we canonicalize the **deepest existing ancestor** for the
+//! initial sandbox check. The actual write is then rooted at an opened `cwd`
+//! directory and performed with descriptor-relative Linux filesystem
+//! operations, so a later symlink swap cannot redirect it.
 //!
 //! Callers are expected to pass an already-canonicalized `cwd`. The
 //! [`canonicalize_cwd`] helper returns one — `BridgeAppState` calls it
@@ -28,6 +23,413 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::BridgeError;
+
+#[cfg(target_os = "linux")]
+mod linux_secure_write {
+    use std::collections::HashMap;
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+    use std::os::raw::{c_char, c_int, c_long, c_uint};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    const AT_FDCWD: RawFd = -100;
+    const SYS_OPENAT2: c_long = 437;
+
+    const O_RDONLY: c_int = 0;
+    const O_WRONLY: c_int = 1;
+    const O_CREAT: c_int = 0o100;
+    const O_TRUNC: c_int = 0o1000;
+    const O_DIRECTORY: c_int = 0o200000;
+    const O_CLOEXEC: c_int = 0o2000000;
+    const O_PATH: c_int = 0o10000000;
+
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    const ERRNO_ELOOP: i32 = 40;
+    const ERRNO_ENOENT: i32 = 2;
+    const ERRNO_ENOSYS: i32 = 38;
+    const ERRNO_EXDEV: i32 = 18;
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    unsafe extern "C" {
+        fn syscall(number: c_long, ...) -> c_long;
+        fn mkdirat(dirfd: c_int, path: *const c_char, mode: c_uint) -> c_int;
+    }
+
+    pub(super) struct RootDirectory {
+        fd: OwnedFd,
+    }
+
+    // ponytail: retain bindings for the existing `Path` API; an explicit
+    // per-session sandbox owner can replace this registry if teardown matters.
+    static ROOT_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, Arc<RootDirectory>>>> =
+        OnceLock::new();
+
+    fn root_directories() -> &'static Mutex<HashMap<PathBuf, Arc<RootDirectory>>> {
+        ROOT_DIRECTORIES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn path_cstring(path: &Path) -> io::Result<CString> {
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "filesystem path contains NUL")
+        })
+    }
+
+    fn openat2_fd(
+        dirfd: RawFd,
+        path: &Path,
+        flags: c_int,
+        mode: c_uint,
+        resolve: u64,
+    ) -> io::Result<OwnedFd> {
+        let path = path_cstring(path)?;
+        let how = OpenHow {
+            flags: flags as u64,
+            mode: mode as u64,
+            resolve,
+        };
+        // SAFETY: `path` and `how` remain alive for the syscall, and the
+        // kernel writes no memory through either pointer.
+        let fd = unsafe {
+            syscall(
+                SYS_OPENAT2,
+                dirfd,
+                path.as_ptr(),
+                &how,
+                size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: a non-negative openat2 result is an owned file
+            // descriptor returned by the kernel.
+            Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        }
+    }
+
+    fn mkdirat_dir(dirfd: RawFd, path: &Path) -> io::Result<()> {
+        let path = path_cstring(path)?;
+        // SAFETY: `path` remains alive for the syscall and is NUL-terminated.
+        let result = unsafe { mkdirat(dirfd, path.as_ptr(), 0o777) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn file_from_fd(fd: OwnedFd) -> File {
+        let raw_fd = fd.into_raw_fd();
+        // SAFETY: `raw_fd` is transferred from `OwnedFd`, so `File` becomes
+        // its sole owner and will close it exactly once.
+        unsafe { File::from_raw_fd(raw_fd) }
+    }
+
+    fn open_root(cwd: &Path) -> io::Result<OwnedFd> {
+        let flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
+        // Do not fall back to path-based `openat`: resolving an absolute cwd
+        // that way leaves its intermediate components racy.
+        openat2_fd(AT_FDCWD, cwd, flags, 0, RESOLVE_NO_SYMLINKS).map_err(|error| {
+            if error.raw_os_error() == Some(ERRNO_ENOSYS) {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Linux openat2 is required for secure filesystem writes",
+                )
+            } else {
+                error
+            }
+        })
+    }
+
+    pub(super) fn initialize_root(cwd: &Path) -> io::Result<()> {
+        let _ = root_for(cwd)?;
+        Ok(())
+    }
+
+    pub(super) fn root_for(cwd: &Path) -> io::Result<Arc<RootDirectory>> {
+        let mut roots = root_directories()
+            .lock()
+            .map_err(|_| io::Error::other("sandbox root registry is poisoned"))?;
+        if let Some(root) = roots.get(cwd).cloned() {
+            return Ok(root);
+        }
+        let root = Arc::new(RootDirectory {
+            fd: open_root(cwd)?,
+        });
+        roots.insert(cwd.to_path_buf(), root.clone());
+        Ok(root)
+    }
+
+    pub(super) fn supported() -> bool {
+        match openat2_fd(
+            AT_FDCWD,
+            Path::new(""),
+            O_PATH | O_DIRECTORY | O_CLOEXEC,
+            0,
+            RESOLVE_NO_SYMLINKS,
+        ) {
+            Ok(_) => true,
+            Err(error) => error.raw_os_error() == Some(ERRNO_ENOENT),
+        }
+    }
+
+    fn open_dir_beneath(root_fd: RawFd, path: &Path) -> io::Result<OwnedFd> {
+        openat2_fd(
+            root_fd,
+            path,
+            O_PATH | O_DIRECTORY | O_CLOEXEC,
+            0,
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        )
+    }
+
+    fn ensure_parent_openat2(root_fd: RawFd, parent: &Path) -> io::Result<()> {
+        let mut prefix = PathBuf::new();
+        let mut current: Option<OwnedFd> = None;
+
+        for component in parent.components() {
+            match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => {
+                    prefix.push(name);
+                    let fd = match open_dir_beneath(root_fd, &prefix) {
+                        Ok(fd) => fd,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            let parent_fd = current
+                                .as_ref()
+                                .map_or(root_fd, |directory| directory.as_raw_fd());
+                            match mkdirat_dir(parent_fd, Path::new(name)) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                                Err(error) => return Err(error),
+                            }
+                            open_dir_beneath(root_fd, &prefix)?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    current = Some(fd);
+                }
+                Component::ParentDir => {
+                    prefix.push("..");
+                    current = Some(open_dir_beneath(root_fd, &prefix)?);
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "write path is not relative to cwd",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn open_read(
+        root: &RootDirectory,
+        cwd: &Path,
+        candidate: &Path,
+    ) -> io::Result<File> {
+        let relative = candidate.strip_prefix(cwd).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read path is not relative to cwd",
+            )
+        })?;
+        let fd = openat2_fd(
+            root.fd.as_raw_fd(),
+            relative,
+            O_RDONLY | O_CLOEXEC,
+            0,
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        )?;
+        Ok(file_from_fd(fd))
+    }
+
+    pub(super) fn open(root: &RootDirectory, cwd: &Path, candidate: &Path) -> io::Result<File> {
+        let relative = candidate.strip_prefix(cwd).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write path is not relative to cwd",
+            )
+        })?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new("."));
+        ensure_parent_openat2(root.fd.as_raw_fd(), parent)?;
+        let fd = openat2_fd(
+            root.fd.as_raw_fd(),
+            relative,
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+            0o666,
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        )?;
+        Ok(file_from_fd(fd))
+    }
+
+    pub(super) fn is_sandbox_error(error: &io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(ERRNO_ELOOP | ERRNO_EXDEV))
+    }
+}
+
+#[must_use]
+pub(crate) fn read_text_file_supported() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_secure_write::supported()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[must_use]
+pub(crate) fn write_text_file_supported() -> bool {
+    read_text_file_supported()
+}
+
+#[cfg(test)]
+use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use tokio::sync::Notify;
+
+/// Fixed upper bound for one text-file operation.
+///
+/// Reads and writes are bounded before any disk access so a single request
+/// cannot grow the in-memory buffer without limit.
+pub const MAX_TEXT_FILE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) struct WriteGate {
+    pub(crate) path: PathBuf,
+    pub(crate) started: Notify,
+    pub(crate) release: Notify,
+}
+
+#[cfg(test)]
+static TEST_WRITE_GATE: OnceLock<Mutex<Option<Arc<WriteGate>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_write_gate(gate: Arc<WriteGate>) {
+    *TEST_WRITE_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("write gate lock") = Some(gate);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_write_gate() {
+    if let Some(slot) = TEST_WRITE_GATE.get() {
+        *slot.lock().expect("write gate lock") = None;
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_write_gate(path: &Path) {
+    let gate = TEST_WRITE_GATE
+        .get()
+        .and_then(|slot| slot.lock().expect("write gate lock").clone());
+    let Some(gate) = gate.filter(|gate| gate.path == path) else {
+        return;
+    };
+    gate.started.notify_waiters();
+    gate.release.notified().await;
+}
+
+#[cfg(test)]
+pub(crate) struct ReadGate {
+    pub(crate) path: PathBuf,
+    pub(crate) started: Notify,
+    pub(crate) release: Notify,
+}
+
+#[cfg(test)]
+static TEST_READ_GATE: OnceLock<Mutex<Option<Arc<ReadGate>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_read_gate(gate: Arc<ReadGate>) {
+    *TEST_READ_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("read gate lock") = Some(gate);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_read_gate() {
+    if let Some(slot) = TEST_READ_GATE.get() {
+        *slot.lock().expect("read gate lock") = None;
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_read_gate(path: &Path) {
+    let gate = TEST_READ_GATE
+        .get()
+        .and_then(|slot| slot.lock().expect("read gate lock").clone());
+    let Some(gate) = gate.filter(|gate| gate.path == path) else {
+        return;
+    };
+    gate.started.notify_waiters();
+    gate.release.notified().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileErrorKind {
+    InvalidParams,
+    ResourceNotFound,
+    Internal,
+}
+
+pub(crate) fn error_kind(error: &BridgeError) -> FileErrorKind {
+    match error {
+        BridgeError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            FileErrorKind::InvalidParams
+        }
+        BridgeError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            FileErrorKind::ResourceNotFound
+        }
+        _ => FileErrorKind::Internal,
+    }
+}
+
+fn invalid_params(message: &'static str) -> BridgeError {
+    BridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
+fn resource_not_found(message: &'static str) -> BridgeError {
+    BridgeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, message))
+}
+
+fn filesystem_io(error: std::io::Error) -> BridgeError {
+    let kind = if error.kind() == std::io::ErrorKind::NotFound {
+        std::io::ErrorKind::NotFound
+    } else {
+        std::io::ErrorKind::Other
+    };
+    let message = if kind == std::io::ErrorKind::NotFound {
+        "filesystem resource not found"
+    } else {
+        "filesystem operation failed"
+    };
+    BridgeError::Io(std::io::Error::new(kind, message))
+}
 
 /// Canonicalize `cwd` for use as a sandbox root.
 ///
@@ -42,10 +444,21 @@ use crate::error::BridgeError;
 /// `std::path::absolute` cannot resolve it (e.g. on platforms with no
 /// notion of a current directory).
 pub fn canonicalize_cwd(cwd: &Path) -> std::io::Result<PathBuf> {
-    match std::fs::canonicalize(cwd) {
+    let cwd = match std::fs::canonicalize(cwd) {
         Ok(p) => Ok(p),
         Err(_) => std::path::absolute(cwd),
+    }?;
+
+    #[cfg(target_os = "linux")]
+    {
+        // Bind the sandbox to the directory object while it is constructed.
+        // A later rename/replace of this path must not make file operations
+        // reopen a different root. If the native primitive is unavailable,
+        // operations fail closed instead of falling back to path-based opens.
+        let _ = linux_secure_write::initialize_root(&cwd);
     }
+
+    Ok(cwd)
 }
 
 /// Return a "clean" form of `cwd` suitable for sending to an ACP agent in
@@ -80,13 +493,23 @@ pub fn acp_cwd(cwd: &Path) -> PathBuf {
 
 /// Resolve an agent-supplied path for **reading**.
 ///
-/// Returns the canonical path on success. Errors with `PermissionDenied` if
-/// the resolved path escapes `cwd`, and propagates I/O errors otherwise.
+/// Returns the canonical target for a descriptor-relative open. Errors with
+/// `PermissionDenied` if the resolved path escapes `cwd`, and propagates I/O
+/// errors otherwise.
 fn safe_resolve_read(cwd: &Path, path: &str) -> Result<PathBuf, BridgeError> {
     let candidate = require_absolute(path)?;
-    let canonical = std::fs::canonicalize(&candidate).map_err(BridgeError::Io)?;
-    enforce_sandbox(cwd, &canonical, &candidate)?;
-    Ok(canonical)
+    match std::fs::canonicalize(&candidate) {
+        Ok(canonical) => {
+            enforce_sandbox(cwd, &canonical, &candidate)?;
+            Ok(canonical)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let anchor = deepest_existing_ancestor(&candidate)?;
+            enforce_sandbox(cwd, &anchor, &candidate)?;
+            Err(resource_not_found("filesystem resource not found"))
+        }
+        Err(error) => Err(filesystem_io(error)),
+    }
 }
 
 /// Resolve an agent-supplied path for **writing**.
@@ -101,51 +524,101 @@ fn safe_resolve_write(cwd: &Path, path: &str) -> Result<PathBuf, BridgeError> {
     // an OS-honest answer about where the path actually lives, including
     // any symlinks the attacker may have placed in writable parts of the
     // filesystem.
-    let mut probe: &Path = &candidate;
-    let anchor = loop {
-        match std::fs::canonicalize(probe) {
-            Ok(p) => break p,
-            Err(_) => match probe.parent() {
-                Some(parent) => probe = parent,
-                None => {
-                    return Err(BridgeError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!(
-                            "no existing ancestor for {} could be canonicalized",
-                            candidate.display()
-                        ),
-                    )));
-                }
-            },
-        }
-    };
+    let anchor = deepest_existing_ancestor(&candidate)?;
 
     enforce_sandbox(cwd, &anchor, &candidate)?;
     Ok(candidate)
 }
 
+#[cfg(target_os = "linux")]
+fn secure_filesystem_error(error: std::io::Error) -> BridgeError {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        invalid_params("invalid filesystem path")
+    } else if linux_secure_write::is_sandbox_error(&error) {
+        invalid_params("path escapes working directory")
+    } else if error.kind() == std::io::ErrorKind::Unsupported {
+        BridgeError::Io(error)
+    } else {
+        filesystem_io(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn open_secure_read(cwd: &Path, path: &Path) -> Result<tokio::fs::File, BridgeError> {
+    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
+    let cwd = cwd.to_path_buf();
+    let path = path.to_path_buf();
+    let file =
+        tokio::task::spawn_blocking(move || linux_secure_write::open_read(&root, &cwd, &path))
+            .await
+            .map_err(|_| filesystem_io(std::io::Error::other("filesystem operation failed")))?
+            .map_err(secure_filesystem_error)?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn open_secure_read(_cwd: &Path, _path: &Path) -> Result<tokio::fs::File, BridgeError> {
+    Err(BridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure filesystem reads are unsupported on this platform",
+    )))
+}
+
+#[cfg(target_os = "linux")]
+async fn write_to_secure_path(cwd: &Path, path: &Path, content: &str) -> Result<(), BridgeError> {
+    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
+    let cwd = cwd.to_path_buf();
+    let path = path.to_path_buf();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut file = linux_secure_write::open(&root, &cwd, &path)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())
+    })
+    .await
+    .map_err(|_| filesystem_io(std::io::Error::other("filesystem operation failed")))?
+    .map_err(secure_filesystem_error)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn write_to_secure_path(
+    _cwd: &Path,
+    _path: &Path,
+    _content: &str,
+) -> Result<(), BridgeError> {
+    // ponytail: fail closed outside Linux; enable other targets only with
+    // their native descriptor/handle-relative traversal primitive.
+    Err(BridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure filesystem writes are unsupported on this platform",
+    )))
+}
+
+fn deepest_existing_ancestor(path: &Path) -> Result<PathBuf, BridgeError> {
+    let mut probe = path;
+    loop {
+        match std::fs::canonicalize(probe) {
+            Ok(path) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                probe = probe
+                    .parent()
+                    .ok_or_else(|| resource_not_found("no existing filesystem ancestor"))?;
+            }
+            Err(error) => return Err(filesystem_io(error)),
+        }
+    }
+}
+
 fn require_absolute(path: &str) -> Result<PathBuf, BridgeError> {
     let path = Path::new(path);
     if !path.is_absolute() {
-        return Err(BridgeError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("ACP filesystem paths must be absolute: {}", path.display()),
-        )));
+        return Err(invalid_params("ACP filesystem paths must be absolute"));
     }
     Ok(path.to_path_buf())
 }
 
-fn enforce_sandbox(cwd: &Path, canonical: &Path, original: &Path) -> Result<(), BridgeError> {
+fn enforce_sandbox(cwd: &Path, canonical: &Path, _original: &Path) -> Result<(), BridgeError> {
     if !canonical.starts_with(cwd) {
-        return Err(BridgeError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "path escapes working directory: {} (resolved to {}) is not under {}",
-                original.display(),
-                canonical.display(),
-                cwd.display()
-            ),
-        )));
+        return Err(invalid_params("path escapes working directory"));
     }
     Ok(())
 }
@@ -173,31 +646,44 @@ pub async fn read_text_file_range(
 ) -> Result<String, BridgeError> {
     let start_line = line.unwrap_or(1);
     if start_line == 0 {
-        return Err(BridgeError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "ACP read line is 1-based",
-        )));
+        return Err(invalid_params("ACP read line is 1-based"));
     }
 
     let full_path = safe_resolve_read(cwd, path)?;
-    let file = tokio::fs::File::open(&full_path).await?;
-    let mut reader = tokio::io::BufReader::new(file);
-    let max_lines = limit.unwrap_or(usize::MAX);
-    let mut current_line = 1usize;
-    let mut selected_lines = 0usize;
-    let mut content = String::new();
-    let mut buffer = String::new();
+    #[cfg(test)]
+    wait_for_read_gate(&full_path).await;
+    let file = open_secure_read(cwd, &full_path).await?;
+    let mut bounded = tokio::io::AsyncReadExt::take(file, (MAX_TEXT_FILE_BYTES + 1) as u64);
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut bytes)
+        .await
+        .map_err(filesystem_io)?;
+    if bytes.len() > MAX_TEXT_FILE_BYTES {
+        return Err(invalid_params("text file exceeds the core size limit"));
+    }
 
-    while selected_lines < max_lines {
-        buffer.clear();
-        if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut buffer).await? == 0 {
-            break;
-        }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        filesystem_io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "UTF-8",
+        ))
+    })?;
+    let max_lines = limit.unwrap_or(usize::MAX);
+    if max_lines == 0 {
+        return Ok(String::new());
+    }
+
+    let mut content = String::new();
+    let mut selected_lines = 0usize;
+    for (index, current) in text.split_inclusive('\n').enumerate() {
+        let current_line = index + 1;
         if current_line >= start_line {
-            content.push_str(&buffer);
-            selected_lines = selected_lines.saturating_add(1);
+            content.push_str(current);
+            selected_lines += 1;
+            if selected_lines == max_lines {
+                break;
+            }
         }
-        current_line = current_line.saturating_add(1);
     }
 
     Ok(content)
@@ -206,15 +692,18 @@ pub async fn read_text_file_range(
 /// Write a text file from an absolute ACP path under `cwd`.
 ///
 /// `cwd` MUST be canonicalized (see [`canonicalize_cwd`]). The deepest
-/// existing ancestor must be inside `cwd` (preventing symlink redirection of
-/// intermediate directories). Missing parent directories are then created.
+/// existing ancestor must be inside `cwd`, and the actual write is rooted at
+/// an opened `cwd` directory so intermediate symlink swaps cannot redirect
+/// it. Missing parent directories are created relative to that directory.
 pub async fn write_text_file(cwd: &Path, path: &str, content: &str) -> Result<(), BridgeError> {
-    let full_path = safe_resolve_write(cwd, path)?;
-    if let Some(parent) = full_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    if content.len() > MAX_TEXT_FILE_BYTES {
+        return Err(invalid_params("text file exceeds the core size limit"));
     }
-    tokio::fs::write(&full_path, content).await?;
-    Ok(())
+
+    let full_path = safe_resolve_write(cwd, path)?;
+    #[cfg(test)]
+    wait_for_write_gate(&full_path).await;
+    write_to_secure_path(cwd, &full_path, content).await
 }
 
 #[cfg(test)]
@@ -267,6 +756,20 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    struct ReplacedRoot {
+        path: PathBuf,
+        original: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ReplacedRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+            let _ = std::fs::rename(&self.original, &self.path);
+        }
+    }
+
     fn absolute(dir: &TempDir, relative: &str) -> String {
         dir.path().join(relative).to_string_lossy().into_owned()
     }
@@ -285,6 +788,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, "hello");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn initialized_root_handle_survives_root_path_replacement() {
+        if !write_text_file_supported() {
+            return;
+        }
+
+        let dir = temp_cwd();
+        let root = dir.path().to_path_buf();
+        let target = root.join("target.txt");
+        std::fs::write(&target, "original").unwrap();
+
+        let original = root.with_file_name(format!(
+            "agui-fileops-root-original-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::rename(&root, &original).unwrap();
+        let _root_guard = ReplacedRoot {
+            path: root.clone(),
+            original: original.clone(),
+        };
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("target.txt"), "replacement").unwrap();
+
+        let target_path = target.to_string_lossy().into_owned();
+        let read = read_text_file(&root, &target_path, None).await.unwrap();
+        assert_eq!(read, "original");
+
+        write_text_file(&root, &target_path, "updated")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(original.join("target.txt")).unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_missing_file_is_resource_not_found() {
+        let dir = temp_cwd();
+        let result = read_text_file(dir.path(), &absolute(&dir, "missing.txt"), None).await;
+        let error = result.expect_err("missing file must fail");
+        assert_eq!(error_kind(&error), FileErrorKind::ResourceNotFound);
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_an_internal_filesystem_error() {
+        let dir = temp_cwd();
+        std::fs::write(dir.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
+        let result = read_text_file(dir.path(), &absolute(&dir, "invalid.txt"), None).await;
+        let error = result.expect_err("invalid UTF-8 must fail");
+        assert_eq!(error_kind(&error), FileErrorKind::Internal);
+    }
+
+    #[tokio::test]
+    async fn oversized_text_file_is_rejected_before_line_buffering() {
+        let dir = temp_cwd();
+        std::fs::write(
+            dir.path().join("large.txt"),
+            vec![b'x'; MAX_TEXT_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let result = read_text_file(dir.path(), &absolute(&dir, "large.txt"), None).await;
+        let error = result.expect_err("file-size bound must be enforced");
+        assert_eq!(error_kind(&error), FileErrorKind::InvalidParams);
     }
 
     #[tokio::test]
@@ -349,14 +923,78 @@ mod tests {
         assert!(result.is_err(), "must not return file content from {probe}");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn write_within_cwd_creates_file_and_parents() {
+        if !write_text_file_supported() {
+            return;
+        }
         let dir = temp_cwd();
         write_text_file(dir.path(), &absolute(&dir, "nested/deep/foo.txt"), "ok")
             .await
             .unwrap();
         let actual = std::fs::read_to_string(dir.path().join("nested/deep/foo.txt")).unwrap();
         assert_eq!(actual, "ok");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_overwrites_existing_file() {
+        if !write_text_file_supported() {
+            return;
+        }
+        let dir = temp_cwd();
+        let path = absolute(&dir, "foo.txt");
+        write_text_file(dir.path(), &path, "first").await.unwrap();
+        write_text_file(dir.path(), &path, "second").await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("foo.txt")).unwrap(),
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_write_is_rejected_before_disk_access() {
+        let dir = temp_cwd();
+        let path = dir.path().join("oversized.txt");
+        let result = write_text_file(
+            dir.path(),
+            &path.to_string_lossy(),
+            &"x".repeat(MAX_TEXT_FILE_BYTES + 1),
+        )
+        .await;
+        let error = result.expect_err("oversized write must fail");
+        assert_eq!(error_kind(&error), FileErrorKind::InvalidParams);
+        assert!(!path.exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn write_fails_closed_when_secure_primitive_is_unavailable() {
+        assert!(!write_text_file_supported());
+        let dir = temp_cwd();
+        let path = dir.path().join("unsupported.txt");
+        let result = write_text_file(dir.path(), &path.to_string_lossy(), "nope").await;
+        let error = result.expect_err("writes must fail closed on unsupported targets");
+        assert_eq!(error_kind(&error), FileErrorKind::Internal);
+        assert!(
+            matches!(error, BridgeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported)
+        );
+        assert!(!path.exists());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn read_fails_closed_when_secure_primitive_is_unavailable() {
+        let dir = temp_cwd();
+        let path = dir.path().join("unsupported.txt");
+        std::fs::write(&path, "nope").unwrap();
+        let result = read_text_file(dir.path(), &path.to_string_lossy(), None).await;
+        let error = result.expect_err("reads must fail closed on unsupported targets");
+        assert!(matches!(
+            error,
+            BridgeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported
+        ));
     }
 
     #[tokio::test]
@@ -384,6 +1022,59 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_rejects_symlink_swapped_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let secure_reads_supported = read_text_file_supported();
+        let dir = temp_cwd();
+        let target = dir.path().join("read.txt");
+        std::fs::write(&target, "inside").unwrap();
+        let outside = std::env::temp_dir().join(format!("agui-read-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&outside, "outside").unwrap();
+        let path = target.to_string_lossy().into_owned();
+        let gate = Arc::new(ReadGate {
+            path: target.clone(),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        install_read_gate(gate.clone());
+
+        let started = gate.started.notified();
+        let cwd = dir.path().to_path_buf();
+        let read = tokio::spawn(async move { read_text_file(&cwd, &path, None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("read must reach the post-validation gate");
+
+        let preserved = dir.path().join("read-original.txt");
+        std::fs::rename(&target, &preserved).unwrap();
+        symlink(&outside, &target).unwrap();
+        gate.release.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            .await
+            .expect("swapped read must finish")
+            .expect("swapped read task must not panic");
+        clear_read_gate();
+
+        let error = result.expect_err("a swapped read must not return outside content");
+        if secure_reads_supported {
+            assert_eq!(error_kind(&error), FileErrorKind::InvalidParams);
+        } else {
+            assert!(matches!(
+                error,
+                BridgeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported
+            ));
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(preserved, target).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn write_through_symlinked_parent_pointing_outside_is_rejected() {
@@ -400,6 +1091,62 @@ mod tests {
             result.is_err(),
             "write through symlinked parent must be rejected"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_rejects_parent_symlink_swapped_after_validation() {
+        use std::os::unix::fs::symlink;
+
+        let secure_writes_supported = write_text_file_supported();
+        let dir = temp_cwd();
+        let parent = dir.path().join("swappable");
+        std::fs::create_dir(&parent).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("agui-swap-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&outside).unwrap();
+        let target = parent.join("foo.txt");
+        let target_path = target.to_string_lossy().into_owned();
+        let gate = Arc::new(WriteGate {
+            path: target.clone(),
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        install_write_gate(gate.clone());
+
+        let started = gate.started.notified();
+        let cwd = dir.path().to_path_buf();
+        let write = tokio::spawn(async move { write_text_file(&cwd, &target_path, "boom").await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started)
+            .await
+            .expect("write must reach the post-validation gate");
+
+        let preserved = dir.path().join("swappable-original");
+        std::fs::rename(&parent, &preserved).unwrap();
+        symlink(&outside, &parent).unwrap();
+        gate.release.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+            .await
+            .expect("swapped write must finish")
+            .expect("swapped write task must not panic");
+        clear_write_gate();
+
+        let error = result.expect_err("a swapped parent must not be written");
+        if secure_writes_supported {
+            assert_eq!(error_kind(&error), FileErrorKind::InvalidParams);
+        } else {
+            assert!(matches!(
+                error,
+                BridgeError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported
+            ));
+        }
+        assert!(!outside.join("foo.txt").exists());
+        assert!(!preserved.join("foo.txt").exists());
+
+        std::fs::remove_file(&parent).unwrap();
+        std::fs::rename(preserved, parent).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[tokio::test]

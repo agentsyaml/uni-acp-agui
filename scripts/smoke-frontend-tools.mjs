@@ -263,6 +263,7 @@ async function driveRun(opts) {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   toolCallId: id,
+                  threadId: opts.threadId,
                   content: result.content,
                   isError: !result.ok,
                 }),

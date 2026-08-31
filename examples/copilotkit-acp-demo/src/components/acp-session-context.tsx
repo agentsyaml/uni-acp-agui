@@ -115,6 +115,12 @@ const Ctx = createContext<AcpSessionState | null>(null);
  */
 const FETCH_TIMEOUT_MS = 35_000;
 
+interface SessionRequest {
+  id: number;
+  threadId: string;
+  controller: AbortController;
+}
+
 interface SessionInitPayload {
   modes?: SessionModesInit | null;
   models?: SessionModelsInit | null;
@@ -202,6 +208,51 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
     agentRef.current = agent;
   }, [agent]);
 
+  const mountedRef = useRef(true);
+  const requestIdRef = useRef(0);
+  const activeRequestRef = useRef<SessionRequest | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      activeRequestRef.current?.controller.abort();
+      activeRequestRef.current = null;
+    };
+  }, []);
+
+  // Settings are last-write-wins. Abort the previous browser request and tag
+  // every continuation so an older response cannot replace the latest choice.
+  const beginRequest = useCallback(
+    (threadId: string, isSetting: boolean): SessionRequest => {
+      activeRequestRef.current?.controller.abort();
+      const request: SessionRequest = {
+        id: ++requestIdRef.current,
+        threadId,
+        controller: new AbortController(),
+      };
+      activeRequestRef.current = request;
+      setPending(isSetting);
+      if (isSetting) setError(null);
+      return request;
+    },
+    [],
+  );
+
+  const isCurrentRequest = useCallback((request: SessionRequest) => {
+    return (
+      mountedRef.current &&
+      activeRequestRef.current?.id === request.id &&
+      agentRef.current?.threadId === request.threadId
+    );
+  }, []);
+
+  const finishRequest = useCallback((request: SessionRequest) => {
+    if (activeRequestRef.current?.id !== request.id) return;
+    activeRequestRef.current = null;
+    if (mountedRef.current) setPending(false);
+  }, []);
+
   // Listen for agent:session_init custom events.
   useEffect(() => {
     if (!agent) return;
@@ -236,101 +287,132 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
     return () => subscription.unsubscribe();
   }, [agent, applySessionInit]);
 
+  const loadSessionInit = useCallback(
+    async (request: SessionRequest): Promise<boolean> => {
+      const timer = setTimeout(
+        () => request.controller.abort(),
+        FETCH_TIMEOUT_MS,
+      );
+      try {
+        const res = await fetch(
+          `/api/bridge/session/init?threadId=${encodeURIComponent(request.threadId)}`,
+          { cache: "no-store", signal: request.controller.signal },
+        );
+        if (!isCurrentRequest(request)) return false;
+        if (!res.ok) {
+          const body = await res.text();
+          if (!isCurrentRequest(request)) return false;
+          setError(`session init HTTP ${res.status}: ${body || "(no body)"}`);
+          return false;
+        }
+        const json = (await res.json()) as SessionInitPayload;
+        if (!isCurrentRequest(request)) return false;
+        applySessionInit(json);
+        return true;
+      } catch (err) {
+        if (isCurrentRequest(request)) setError(String(err));
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    [applySessionInit, isCurrentRequest],
+  );
+
   const refresh = useCallback(async (): Promise<boolean> => {
     const threadId = agentRef.current?.threadId;
     if (!threadId) return false;
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+    const request = beginRequest(threadId, false);
     try {
-      const res = await fetch(
-        `/api/bridge/session/init?threadId=${encodeURIComponent(threadId)}`,
-        { cache: "no-store", signal: ctl.signal },
-      );
-      if (!res.ok) {
-        const body = await res.text();
-        setError(`session init HTTP ${res.status}: ${body || "(no body)"}`);
-        return false;
-      }
-      const json = (await res.json()) as SessionInitPayload;
-      applySessionInit(json);
-      return true;
-    } catch (err) {
-      setError(String(err));
-      return false;
+      return await loadSessionInit(request);
     } finally {
-      clearTimeout(timer);
+      finishRequest(request);
     }
-  }, [applySessionInit]);
+  }, [beginRequest, finishRequest, loadSessionInit]);
 
-  const setMode = useCallback(async (modeId: string): Promise<boolean> => {
-    const threadId = agentRef.current?.threadId;
-    if (!threadId) {
-      setError("no active agent thread; send a message first");
-      return false;
-    }
-    setPending(true);
-    setError(null);
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch("/api/bridge/session/set-mode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId, modeId }),
-        signal: ctl.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        setError(`set-mode HTTP ${res.status}: ${body || "(no body)"}`);
+  const setMode = useCallback(
+    async (modeId: string): Promise<boolean> => {
+      const threadId = agentRef.current?.threadId;
+      if (!threadId) {
+        setError("no active agent thread; send a message first");
         return false;
       }
-      setModes((prev) =>
-        prev ? { ...prev, currentModeId: modeId } : prev,
+      const request = beginRequest(threadId, true);
+      const timer = setTimeout(
+        () => request.controller.abort(),
+        FETCH_TIMEOUT_MS,
       );
-      return true;
-    } catch (err) {
-      setError(String(err));
-      return false;
-    } finally {
-      clearTimeout(timer);
-      setPending(false);
-    }
-  }, []);
+      try {
+        const res = await fetch("/api/bridge/session/set-mode", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ threadId, modeId }),
+          signal: request.controller.signal,
+        });
+        if (!isCurrentRequest(request)) return false;
+        if (!res.ok) {
+          const body = await res.text();
+          if (!isCurrentRequest(request)) return false;
+          setError(`set-mode HTTP ${res.status}: ${body || "(no body)"}`);
+          return false;
+        }
+        if (!isCurrentRequest(request)) return false;
+        setModes((prev) =>
+          prev ? { ...prev, currentModeId: modeId } : prev,
+        );
+        return true;
+      } catch (err) {
+        if (isCurrentRequest(request)) setError(String(err));
+        return false;
+      } finally {
+        clearTimeout(timer);
+        finishRequest(request);
+      }
+    },
+    [beginRequest, finishRequest, isCurrentRequest],
+  );
 
-  const setModel = useCallback(async (modelId: string): Promise<boolean> => {
-    const threadId = agentRef.current?.threadId;
-    if (!threadId) {
-      setError("no active agent thread; send a message first");
-      return false;
-    }
-    setPending(true);
-    setError(null);
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
-    try {
-      const res = await fetch("/api/bridge/session/set-model", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ threadId, modelId }),
-        signal: ctl.signal,
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        setError(`set-model HTTP ${res.status}: ${body || "(no body)"}`);
+  const setModel = useCallback(
+    async (modelId: string): Promise<boolean> => {
+      const threadId = agentRef.current?.threadId;
+      if (!threadId) {
+        setError("no active agent thread; send a message first");
         return false;
       }
-      setModels((prev) =>
-        prev ? { ...prev, currentModelId: modelId } : prev,
+      const request = beginRequest(threadId, true);
+      const timer = setTimeout(
+        () => request.controller.abort(),
+        FETCH_TIMEOUT_MS,
       );
-      return true;
-    } catch (err) {
-      setError(String(err));
-      return false;
-    } finally {
-      clearTimeout(timer);
-      setPending(false);
-    }
-  }, []);
+      try {
+        const res = await fetch("/api/bridge/session/set-model", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ threadId, modelId }),
+          signal: request.controller.signal,
+        });
+        if (!isCurrentRequest(request)) return false;
+        if (!res.ok) {
+          const body = await res.text();
+          if (!isCurrentRequest(request)) return false;
+          setError(`set-model HTTP ${res.status}: ${body || "(no body)"}`);
+          return false;
+        }
+        if (!isCurrentRequest(request)) return false;
+        setModels((prev) =>
+          prev ? { ...prev, currentModelId: modelId } : prev,
+        );
+        return true;
+      } catch (err) {
+        if (isCurrentRequest(request)) setError(String(err));
+        return false;
+      } finally {
+        clearTimeout(timer);
+        finishRequest(request);
+      }
+    },
+    [beginRequest, finishRequest, isCurrentRequest],
+  );
 
   const setConfigOption = useCallback(
     async (configId: string, value: string): Promise<boolean> => {
@@ -339,19 +421,22 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
         setError("no active agent thread; send a message first");
         return false;
       }
-      setPending(true);
-      setError(null);
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
+      const request = beginRequest(threadId, true);
+      const timer = setTimeout(
+        () => request.controller.abort(),
+        FETCH_TIMEOUT_MS,
+      );
       try {
         const res = await fetch("/api/bridge/session/set-config-option", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ threadId, configId, value }),
-          signal: ctl.signal,
+          signal: request.controller.signal,
         });
+        if (!isCurrentRequest(request)) return false;
         if (!res.ok) {
           const body = await res.text();
+          if (!isCurrentRequest(request)) return false;
           setError(
             `set-config-option HTTP ${res.status}: ${body || "(no body)"}`,
           );
@@ -359,16 +444,16 @@ export function AcpSessionProvider({ children }: { children: ReactNode }) {
         }
         // The route intentionally forwards only the bridge status. Re-read the
         // bridge snapshot because an option change may also change other choices.
-        return await refresh();
+        return await loadSessionInit(request);
       } catch (err) {
-        setError(String(err));
+        if (isCurrentRequest(request)) setError(String(err));
         return false;
       } finally {
         clearTimeout(timer);
-        setPending(false);
+        finishRequest(request);
       }
     },
-    [refresh],
+    [beginRequest, finishRequest, isCurrentRequest, loadSessionInit],
   );
 
   const value = useMemo<AcpSessionState>(

@@ -1,10 +1,11 @@
 #![doc = "Built-in PermissionPolicy implementations for the AG-UI to ACP bridge."]
 
 use agent_client_protocol::schema::v1::{
-    PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+    FileSystemCapabilities, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
 };
 use agui_acp_bridge_core::{PermissionDecision, PermissionPolicy};
 use async_trait::async_trait;
+use std::sync::Arc;
 
 fn pick_allow(req: &RequestPermissionRequest) -> Option<PermissionOptionId> {
     req.options
@@ -91,6 +92,44 @@ impl PermissionPolicy for InterruptViaAgUiEvent {
         PermissionDecision::Defer {
             interrupt_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+}
+
+/// Adds opt-in filesystem capabilities to an existing permission policy.
+///
+/// Permission decisions remain fully delegated to `inner`; the filesystem
+/// bits only control which live-session file handlers the bridge advertises,
+/// and terminal capability is delegated unchanged.
+#[derive(Debug, Clone)]
+pub struct FilesystemAccessPolicy {
+    inner: Arc<dyn PermissionPolicy>,
+    capabilities: FileSystemCapabilities,
+}
+
+impl FilesystemAccessPolicy {
+    /// Wrap `inner` with independent read and write filesystem capabilities.
+    pub fn new(inner: Arc<dyn PermissionPolicy>, allow_read: bool, allow_write: bool) -> Self {
+        Self {
+            inner,
+            capabilities: FileSystemCapabilities::new()
+                .read_text_file(allow_read)
+                .write_text_file(allow_write),
+        }
+    }
+}
+
+#[async_trait]
+impl PermissionPolicy for FilesystemAccessPolicy {
+    async fn decide(&self, request: &RequestPermissionRequest) -> PermissionDecision {
+        self.inner.decide(request).await
+    }
+
+    fn filesystem_capabilities(&self) -> FileSystemCapabilities {
+        self.capabilities.clone()
+    }
+
+    fn terminal_capability(&self) -> bool {
+        self.inner.terminal_capability()
     }
 }
 
@@ -191,5 +230,46 @@ mod tests {
             }
             other => panic!("expected two Defers, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn filesystem_access_policy_delegates_and_keeps_bits_independent() {
+        let request = req_with(None, vec![opt("allow", PermissionOptionKind::AllowOnce)]);
+        let read_only = FilesystemAccessPolicy::new(Arc::new(AutoAllow), true, false);
+        assert_eq!(
+            read_only.decide(&request).await,
+            PermissionDecision::Allow {
+                option_id: PermissionOptionId::new("allow")
+            }
+        );
+        let read_caps = read_only.filesystem_capabilities();
+        assert!(read_caps.read_text_file);
+        assert!(!read_caps.write_text_file);
+
+        let write_only = FilesystemAccessPolicy::new(Arc::new(AutoDeny), false, true);
+        assert_eq!(write_only.decide(&request).await, PermissionDecision::Deny);
+        let write_caps = write_only.filesystem_capabilities();
+        assert!(!write_caps.read_text_file);
+        assert!(write_caps.write_text_file);
+    }
+
+    #[derive(Debug)]
+    struct TerminalPolicy;
+
+    #[async_trait]
+    impl PermissionPolicy for TerminalPolicy {
+        async fn decide(&self, _request: &RequestPermissionRequest) -> PermissionDecision {
+            PermissionDecision::Deny
+        }
+
+        fn terminal_capability(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn filesystem_access_policy_preserves_terminal_capability() {
+        let policy = FilesystemAccessPolicy::new(Arc::new(TerminalPolicy), false, false);
+        assert!(policy.terminal_capability());
     }
 }

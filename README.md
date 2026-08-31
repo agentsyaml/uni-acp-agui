@@ -43,7 +43,13 @@ AG-UI client ──POST /──► BridgeHandler ──prompt()──► AcpSess
      └─────── SSE ───────────┘
 ```
 
-`thread_id` maps 1:1 to an `AcpSessionHandle`; turns sharing the same thread reuse the same session. The agent streams `SessionUpdate` notifications over stdio, `Translator` converts each into AG-UI events, and they are written to the SSE response in order. The stream terminates with `RUN_FINISHED` or `RUN_ERROR`.
+The bridge implements an explicit mapping where `thread_id` is the AG-UI
+conversation key and maps 1:1 to an
+`AcpSessionHandle`; the handle's real ACP `SessionId` is a separate identity.
+Turns sharing the same thread reuse the same session. The agent streams
+`SessionUpdate` notifications over stdio, `Translator` converts each into
+AG-UI events, and they are written to the SSE response in order. The stream
+terminates with `RUN_FINISHED` or `RUN_ERROR`.
 
 ## CLI
 
@@ -92,8 +98,11 @@ the agent accepts the ACP `session/delete` request. It returns `409` for active
 or pending local work, `501` when delete is not advertised, `502` for an ACP
 error, and `504` for a bounded timeout. Delete removes the session from the
 agent's `session/list`; ACP does not promise a hard-delete of every underlying
-artifact. Cached aliases and local frontend state are removed after a terminal
-delete outcome, while unsupported delete leaves the cached session reusable.
+artifact. It resolves only the exact bridge-owned `threadId` mapping: a cache
+miss, including an ACP-looking thread ID, returns `404` without a wire
+request. The exact mapping and local frontend state are removed after a
+terminal delete outcome, while unsupported delete leaves the cached session
+reusable.
 
 ACP v1 `MessageId` values from content updates are forwarded to the matching
 AG-UI text/reasoning message lifecycle. They remain distinct from AG-UI
@@ -106,13 +115,18 @@ When the ACP agent advertises the `session/list` and `loadSession` capabilities,
 the bridge surfaces them statelessly — it stores no history of its own:
 
 - `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`.
-  Each `sessionId` doubles as the AG-UI `threadId` used to resume.
-- To **resume** a conversation, POST a run whose `threadId` is that `sessionId`
-  and whose `forwardedProps` contains `{"acpResume": true}`. Only this explicit
-  marker enables the private resume path. On a cache-miss the bridge issues
-  `session/load`, and the agent's replayed history streams back as AG-UI events
-  before the new turn. Missing `loadSession` or a failed `session/load` returns
-  a non-success AG-UI run error; it never falls back to `session/new`.
+  `sessionId` is the ACP identity; it never doubles as an AG-UI `threadId`.
+- To **resume** a conversation, choose an AG-UI `threadId` and POST a run
+  whose `forwardedProps` contains
+  `{"acpResume":{"sessionId":"<ACP sessionId>"}}`. This typed marker is
+  the only private resume form; boolean or malformed markers return
+  `ACP_RESUME_SESSION_ID_REQUIRED` and open no actor. On a cache miss the
+  bridge issues `session/load` with only the supplied ACP `sessionId`, and the
+  agent's replayed history streams back before the new turn. A cached-thread
+  mapping must match the supplied ACP ID; otherwise the run returns
+  `ACP_RESUME_FAILED`. Missing `loadSession` or a failed `session/load` returns
+  the existing non-success AG-UI resume error and never falls back to
+  `session/new`. There is no ACP-ID alias or fallback cleanup path.
 
 
 `/approval` request body and status codes:

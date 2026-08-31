@@ -22,7 +22,7 @@
 //!   `open_session` exceeds a short `open_session_timeout`. Used to pin the
 //!   startup-timeout path.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -30,8 +30,9 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, ImageContent, InitializeRequest,
     InitializeResponse, NewSessionRequest, NewSessionResponse, PermissionOption,
     PermissionOptionId, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, PromptResponse, RequestPermissionRequest, SessionId, SessionNotification,
-    SessionUpdate, StopReason, TextContent, ToolCallUpdate, ToolCallUpdateFields,
+    PromptRequest, PromptResponse, RequestPermissionRequest, SessionConfigOptionValue, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Dispatch};
 use agui_acp_bridge_core::BridgeError;
@@ -236,7 +237,7 @@ pub async fn run_stateful_session_agent(stream: DuplexStream) -> Result<(), Brid
 ///   2. Plan (with two entries)
 ///   3. AgentMessageChunk (text)        ← only this should produce TEXT_MESSAGE_*
 ///   4. UserMessageChunk (text)         ← still goes through translator
-///   5. AgentMessageChunk (image)       ← non-text → CustomEvent
+///   5. AgentMessageChunk (image)       ← non-text → RawEvent
 ///
 /// Verifies the translator's handling of the full SessionUpdate enum surface
 /// per `translation.rs`.
@@ -1342,6 +1343,370 @@ pub async fn run_modes_models_agent(stream: DuplexStream) -> Result<(), BridgeEr
         .map_err(BridgeError::Acp)
 }
 
+/// Probe shared with the boolean config-option integration tests.
+#[derive(Debug, Default, Clone)]
+pub struct BooleanConfigProbe {
+    initialize_boolean_capability: Arc<Mutex<Option<bool>>>,
+    requests: Arc<Mutex<Vec<(String, SessionConfigOptionValue)>>>,
+}
+
+impl BooleanConfigProbe {
+    #[must_use]
+    pub fn initialize_boolean_capability(&self) -> bool {
+        self.initialize_boolean_capability
+            .lock()
+            .expect("boolean capability probe poisoned")
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn requests(&self) -> Vec<(String, SessionConfigOptionValue)> {
+        self.requests
+            .lock()
+            .expect("boolean config probe poisoned")
+            .clone()
+    }
+}
+
+/// Agent fixture for the stable typed session configuration values.
+pub async fn run_boolean_config_agent(
+    stream: DuplexStream,
+    probe: Arc<BooleanConfigProbe>,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        SessionConfigOption, SessionConfigSelectOption, SetSessionConfigOptionRequest,
+        SetSessionConfigOptionResponse,
+    };
+
+    fn options(enabled: bool, mode: &str) -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::boolean("enabled", "Enabled", enabled),
+            SessionConfigOption::select(
+                "mode",
+                "Mode",
+                mode.to_string(),
+                vec![
+                    SessionConfigSelectOption::new("ask", "Ask"),
+                    SessionConfigSelectOption::new("code", "Code"),
+                ],
+            ),
+        ]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+    let enabled = Arc::new(Mutex::new(false));
+    let mode = Arc::new(Mutex::new("ask".to_string()));
+
+    Agent
+        .builder()
+        .name("agui-bridge-boolean-config-test")
+        .on_receive_request(
+            {
+                let probe = probe.clone();
+                async move |req: InitializeRequest, responder, _cx| {
+                    let advertised = req
+                        .client_capabilities
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.config_options.as_ref())
+                        .and_then(|options| options.boolean.as_ref())
+                        .is_some();
+                    *probe
+                        .initialize_boolean_capability
+                        .lock()
+                        .expect("boolean capability probe poisoned") = Some(advertised);
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let enabled = enabled.clone();
+                let mode = mode.clone();
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
+                            .config_options(options(
+                                *enabled.lock().expect("enabled value poisoned"),
+                                &mode.lock().expect("mode value poisoned"),
+                            )),
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let probe = probe.clone();
+                let enabled = enabled.clone();
+                let mode = mode.clone();
+                async move |req: SetSessionConfigOptionRequest,
+                            responder,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let config_id = req.config_id.0.to_string();
+                    probe
+                        .requests
+                        .lock()
+                        .expect("boolean config probe poisoned")
+                        .push((config_id.clone(), req.value.clone()));
+                    match (config_id.as_str(), req.value) {
+                        ("enabled", SessionConfigOptionValue::Boolean { value }) => {
+                            *enabled.lock().expect("enabled value poisoned") = value;
+                        }
+                        ("mode", SessionConfigOptionValue::ValueId { value }) => {
+                            *mode.lock().expect("mode value poisoned") = value.0.to_string();
+                        }
+                        _ => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "unexpected config option value",
+                                ),
+                            );
+                        }
+                    }
+                    responder.respond(SetSessionConfigOptionResponse::new(options(
+                        *enabled.lock().expect("enabled value poisoned"),
+                        &mode.lock().expect("mode value poisoned"),
+                    )))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("boolean config ready"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture for proving discovered config validation happens before ACP.
+/// Any setting request is a test failure; invalid HTTP values must be rejected
+/// from the cached snapshot without entering this handler.
+pub async fn run_rejecting_config_agent(
+    stream: DuplexStream,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{
+        SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelect,
+        SessionConfigSelectOption, SetSessionConfigOptionRequest,
+    };
+    use std::sync::atomic::Ordering;
+
+    fn options() -> Vec<SessionConfigOption> {
+        vec![
+            SessionConfigOption::new(
+                "mode",
+                "Mode",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "ask",
+                    vec![
+                        SessionConfigSelectOption::new("ask", "Ask"),
+                        SessionConfigSelectOption::new("code", "Code"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Mode),
+            SessionConfigOption::new(
+                "model",
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    "model-a",
+                    vec![
+                        SessionConfigSelectOption::new("model-a", "Model A"),
+                        SessionConfigSelectOption::new("model-b", "Model B"),
+                    ],
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ]
+    }
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-rejecting-config-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(
+                    NewSessionResponse::new(SessionId::from(Uuid::new_v4().to_string()))
+                        .config_options(options()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let calls = calls.clone();
+                async move |_req: SetSessionConfigOptionRequest,
+                            _responder,
+                            _cx|
+                            -> Result<(), agent_client_protocol::Error> {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("invalid config value reached the ACP mock");
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("config validation ready"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent fixture with no config snapshot or legacy mode capability. Any
+/// setting request is a test failure; the bridge must reject it locally.
+pub async fn run_rejecting_undiscovered_settings_agent(
+    stream: DuplexStream,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<(), BridgeError> {
+    use agent_client_protocol::schema::v1::{SetSessionConfigOptionRequest, SetSessionModeRequest};
+    use std::sync::atomic::Ordering;
+
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-rejecting-undiscovered-settings-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let calls = calls.clone();
+                async move |_req: SetSessionConfigOptionRequest,
+                            _responder,
+                            _cx|
+                            -> Result<(), agent_client_protocol::Error> {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("undiscovered config option reached the ACP mock");
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let calls = calls.clone();
+                async move |_req: SetSessionModeRequest,
+                            _responder,
+                            _cx|
+                            -> Result<(), agent_client_protocol::Error> {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    panic!("undiscovered legacy mode reached the ACP mock");
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                cx.send_notification(SessionNotification::new(
+                    req.session_id,
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("undiscovered settings ready"),
+                    ))),
+                ))?;
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
 /// Agent that advertises legacy modes alongside a non-mode config snapshot.
 /// The bridge must use `session/set_mode` instead of assuming every non-empty
 /// `config_options` list contains a mode option.
@@ -2343,11 +2708,12 @@ pub async fn run_delete_lifecycle_agent(
 }
 
 /// Shared session store for [`run_session_history_agent_with`]. Maps
-/// `session_id -> (title, history lines)`. Sharing one store across multiple
+/// `session_id -> (title, persisted cwd, history lines)`. Sharing one store across multiple
 /// spawned agent instances models a real agent that persists sessions to
 /// disk across separate ACP connections.
-pub type SharedSessionStore =
-    std::sync::Arc<Mutex<std::collections::HashMap<String, (Option<String>, Vec<String>)>>>;
+pub type SharedSessionStore = std::sync::Arc<
+    Mutex<std::collections::HashMap<String, (Option<String>, std::path::PathBuf, Vec<String>)>>,
+>;
 
 /// Agent that supports session persistence: `session/new`, `session/list`,
 /// `session/load`, and `session/prompt`. Used to exercise the bridge's
@@ -2428,12 +2794,12 @@ pub async fn run_session_history_agent_with(
         .on_receive_request(
             {
                 let store = store_new.clone();
-                async move |_req: NewSessionRequest, responder, _cx| {
+                async move |req: NewSessionRequest, responder, _cx| {
                     let id = Uuid::new_v4().to_string();
                     store
                         .lock()
                         .expect("store poisoned")
-                        .insert(id.clone(), (None, Vec::new()));
+                        .insert(id.clone(), (None, req.cwd, Vec::new()));
                     responder.respond(
                         NewSessionResponse::new(SessionId::from(id))
                             .config_options(history_config_options("new")),
@@ -2449,8 +2815,9 @@ pub async fn run_session_history_agent_with(
                     let guard = store.lock().expect("store poisoned");
                     let sessions: Vec<SessionInfo> = guard
                         .iter()
-                        .map(|(id, (title, _))| {
-                            SessionInfo::new(SessionId::from(id.clone()), "/").title(title.clone())
+                        .map(|(id, (title, cwd, _))| {
+                            SessionInfo::new(SessionId::from(id.clone()), cwd.clone())
+                                .title(title.clone())
                         })
                         .collect();
                     responder.respond(ListSessionsResponse::new(sessions))
@@ -2467,11 +2834,19 @@ pub async fn run_session_history_agent_with(
                     let sid = req.session_id.clone();
                     let history = {
                         let guard = store.lock().expect("store poisoned");
-                        let Some((_, history)) = guard.get(&sid.0.to_string()) else {
+                        let Some((_, persisted_cwd, history)) = guard.get(&sid.0.to_string())
+                        else {
                             return responder.respond_with_error(
                                 agent_client_protocol::util::internal_error("unknown session id"),
                             );
                         };
+                        if req.cwd != *persisted_cwd {
+                            return responder.respond_with_error(
+                                agent_client_protocol::util::internal_error(
+                                    "session/load cwd does not match persisted cwd",
+                                ),
+                            );
+                        }
                         history.clone()
                     };
                     // Replay the stored history as notifications before the
@@ -2513,12 +2888,12 @@ pub async fn run_session_history_agent_with(
                         let mut guard = store.lock().expect("store poisoned");
                         let entry = guard
                             .entry(sid.0.to_string())
-                            .or_insert_with(|| (None, Vec::new()));
+                            .or_insert_with(|| (None, std::path::PathBuf::new(), Vec::new()));
                         if entry.0.is_none() {
                             entry.0 = Some(text.clone());
                         }
-                        entry.1.push(format!("user:{text}"));
-                        entry.1.push(format!("assistant:{reply}"));
+                        entry.2.push(format!("user:{text}"));
+                        entry.2.push(format!("assistant:{reply}"));
                     }
 
                     cx.send_notification(SessionNotification::new(

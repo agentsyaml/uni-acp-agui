@@ -2,11 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::message_state::MessageState;
 use crate::stream::{SessionModelsInit, SessionModesInit};
-use agent_client_protocol::schema::v1::{MessageId, SessionUpdate, ToolCallStatus};
+use agent_client_protocol::schema::v1::{
+    ConfigOptionUpdate, MessageId, SessionUpdate, ToolCallStatus,
+};
 use agui_rs_core::events::{
-    BaseEventFields, CustomEvent, Event, ReasoningMessageContentEvent, ReasoningMessageEndEvent,
-    ReasoningMessageRole, ReasoningMessageStartEvent, TextMessageStartEvent, ToolCallArgsEvent,
-    ToolCallEndEvent, ToolCallResultEvent, ToolCallStartEvent, ToolResultRole,
+    BaseEventFields, CustomEvent, Event, RawEvent, ReasoningMessageContentEvent,
+    ReasoningMessageEndEvent, ReasoningMessageRole, ReasoningMessageStartEvent,
+    TextMessageStartEvent, ToolCallArgsEvent, ToolCallEndEvent, ToolCallResultEvent,
+    ToolCallStartEvent, ToolResultRole,
 };
 use agui_rs_core::types::TextMessageRole;
 use serde_json::json;
@@ -206,6 +209,13 @@ impl Translator {
                     value: json!({ "modeId": mode_id }),
                     base: BaseEventFields::default(),
                 }));
+                out
+            }
+            // Config snapshots are a known bridge CUSTOM extension consumed by
+            // the demo UI; other opaque ACP updates remain lossless RAW events.
+            SessionUpdate::ConfigOptionUpdate(ref update) => {
+                let mut out = self.close_open_messages();
+                out.push(config_option_update_event(update));
                 out
             }
             SessionUpdate::AvailableCommandsUpdate(ref cmds) => {
@@ -702,6 +712,16 @@ fn close_text(state: &mut MessageState) -> Vec<Event> {
 fn raw_passthrough(update: &SessionUpdate) -> Event {
     let value =
         serde_json::to_value(update).unwrap_or_else(|_| json!({"error": "serialize_failed"}));
+    Event::Raw(RawEvent {
+        event: value,
+        source: Some("acp".to_string()),
+        base: BaseEventFields::default(),
+    })
+}
+
+fn config_option_update_event(update: &ConfigOptionUpdate) -> Event {
+    let value = serde_json::to_value(SessionUpdate::ConfigOptionUpdate(update.clone()))
+        .unwrap_or_else(|_| json!({"error": "serialize_failed"}));
     Event::Custom(CustomEvent {
         name: "acp.session_update".to_string(),
         value,
@@ -1008,7 +1028,7 @@ mod tests {
         let mut t = Translator::new();
         assert!(matches!(
             t.translate(SessionUpdate::Plan(pending)).as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
 
         let in_progress = Plan::new(vec![
@@ -1187,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn first_completed_plan_entry_is_custom_but_in_progress_starts_and_finishes() {
+    fn first_completed_plan_entry_is_raw_but_in_progress_starts_and_finishes() {
         let mut completed_translator = Translator::new();
         let completed = Plan::new(vec![PlanEntry::new(
             "already done",
@@ -1195,7 +1215,7 @@ mod tests {
             PlanEntryStatus::Completed,
         )]);
         let completed_events = completed_translator.translate(SessionUpdate::Plan(completed));
-        assert!(matches!(completed_events.as_slice(), [Event::Custom(_)]));
+        assert!(matches!(completed_events.as_slice(), [Event::Raw(_)]));
         assert!(
             !completed_events
                 .iter()
@@ -1211,7 +1231,7 @@ mod tests {
         let in_progress_events = in_progress_translator.translate(SessionUpdate::Plan(in_progress));
         assert!(matches!(
             in_progress_events.as_slice(),
-            [Event::StepStarted(_), Event::Custom(_)]
+            [Event::StepStarted(_), Event::Raw(_)]
         ));
 
         let completed_after_unpaired = Plan::new(vec![PlanEntry::new(
@@ -1228,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn removed_open_plan_entry_finishes_before_snapshot_custom() {
+    fn removed_open_plan_entry_finishes_before_snapshot_raw() {
         let mut t = Translator::new();
         let pending = Plan::new(vec![
             PlanEntry::new("keep", PlanEntryPriority::Medium, PlanEntryStatus::Pending),
@@ -1260,7 +1280,7 @@ mod tests {
         )])));
         assert!(matches!(
             events.as_slice(),
-            [Event::StepFinished(_), Event::Custom(_)]
+            [Event::StepFinished(_), Event::Raw(_)]
         ));
         match &events[0] {
             Event::StepFinished(step) => assert_eq!(step.step_name, "removed"),
@@ -1269,7 +1289,7 @@ mod tests {
         assert!(matches!(
             t.translate(SessionUpdate::Plan(Plan::new(Vec::new())))
                 .as_slice(),
-            [Event::StepFinished(_), Event::Custom(_)]
+            [Event::StepFinished(_), Event::Raw(_)]
         ));
         assert!(
             t.translate(SessionUpdate::Plan(Plan::new(Vec::new())))
@@ -1285,7 +1305,7 @@ mod tests {
             PlanEntry::new("same", PlanEntryPriority::Low, PlanEntryStatus::InProgress),
         ]);
         let events = t.translate(SessionUpdate::Plan(duplicate));
-        assert!(matches!(events.as_slice(), [Event::Custom(_)]));
+        assert!(matches!(events.as_slice(), [Event::Raw(_)]));
         assert!(
             !events
                 .iter()
@@ -1362,7 +1382,7 @@ mod tests {
         assert!(t.flush().is_empty());
 
         let after_reset = t.translate(SessionUpdate::Plan(completed));
-        assert!(matches!(after_reset.as_slice(), [Event::Custom(_)]));
+        assert!(matches!(after_reset.as_slice(), [Event::Raw(_)]));
         assert!(
             !after_reset
                 .iter()
@@ -1396,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_snapshot_structure_changes_emit_full_custom_snapshot() {
+    fn plan_snapshot_structure_changes_emit_full_raw_snapshot() {
         let mut t = Translator::new();
         let initial = Plan::new(vec![
             PlanEntry::new("alpha", PlanEntryPriority::Medium, PlanEntryStatus::Pending),
@@ -1411,7 +1431,7 @@ mod tests {
         )]);
         assert!(matches!(
             t.translate(SessionUpdate::Plan(partial)).as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
 
         let priority_changed = Plan::new(vec![PlanEntry::new(
@@ -1422,7 +1442,7 @@ mod tests {
         assert!(matches!(
             t.translate(SessionUpdate::Plan(priority_changed))
                 .as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
 
         let mut meta = serde_json::Map::new();
@@ -1432,7 +1452,7 @@ mod tests {
         ]);
         assert!(matches!(
             t.translate(SessionUpdate::Plan(meta_changed)).as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
 
         let mut reordered_translator = Translator::new();
@@ -1449,12 +1469,12 @@ mod tests {
             reordered_translator
                 .translate(SessionUpdate::Plan(reordered))
                 .as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
     }
 
     #[test]
-    fn plan_top_level_meta_change_emits_custom_once() {
+    fn plan_top_level_meta_change_emits_raw_once() {
         let mut t = Translator::new();
         let entries = vec![PlanEntry::new(
             "same entry",
@@ -1465,7 +1485,7 @@ mod tests {
         assert!(matches!(
             t.translate(SessionUpdate::Plan(Plan::new(entries.clone())))
                 .as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
         assert!(
             t.translate(SessionUpdate::Plan(Plan::new(entries.clone())))
@@ -1477,7 +1497,7 @@ mod tests {
         let changed = Plan::new(entries.clone()).meta(meta.clone());
         assert!(matches!(
             t.translate(SessionUpdate::Plan(changed)).as_slice(),
-            [Event::Custom(_)]
+            [Event::Raw(_)]
         ));
         assert!(
             t.translate(SessionUpdate::Plan(Plan::new(entries).meta(meta)))
@@ -1486,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_all_pending_falls_through_as_custom() {
+    fn plan_all_pending_falls_through_as_raw() {
         let plan = Plan::new(vec![PlanEntry::new(
             "step",
             PlanEntryPriority::Medium,
@@ -1495,7 +1515,7 @@ mod tests {
         let mut t = Translator::new();
         let evs = t.translate(SessionUpdate::Plan(plan));
         assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], Event::Custom(_)));
+        assert!(matches!(evs[0], Event::Raw(_)));
     }
 
     #[test]
@@ -1591,29 +1611,53 @@ mod tests {
     }
 
     #[test]
-    fn agent_message_chunk_with_image_emits_custom_event() {
-        let img = ContentChunk::new(ContentBlock::Image(ImageContent::new(
-            "aGVsbG8=",
-            "image/png",
+    fn opaque_non_text_update_emits_one_raw_after_closing_text() {
+        let update = SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Image(
+            ImageContent::new("aGVsbG8=", "image/png"),
         )));
         let mut t = Translator::new();
-        let evs = t.translate(SessionUpdate::AgentMessageChunk(img));
-        assert_eq!(evs.len(), 1, "non-text chunk must emit exactly one event");
-        match &evs[0] {
-            Event::Custom(c) => {
-                assert_eq!(c.name, "acp.session_update");
-                let serialized = c.value.to_string();
-                assert!(
-                    serialized.contains("image/png"),
-                    "custom event must preserve original image payload, got {serialized}"
-                );
+        let _ = t.translate(SessionUpdate::AgentMessageChunk(chunk("before image")));
+        let expected = serde_json::to_value(&update).expect("ACP update must serialize");
+        let evs = t.translate(update);
+
+        assert!(matches!(
+            evs.as_slice(),
+            [Event::TextMessageEnd(_), Event::Raw(_)]
+        ));
+        match &evs[1] {
+            Event::Raw(raw) => {
+                assert_eq!(raw.source.as_deref(), Some("acp"));
+                assert_eq!(raw.event, expected);
+                assert_eq!(raw.base, BaseEventFields::default());
             }
-            other => panic!("expected Custom for non-text image chunk, got {other:?}"),
+            other => panic!("expected Raw for non-text image chunk, got {other:?}"),
         }
         assert!(
             t.flush().is_empty(),
-            "no text message was opened, so flush must be a no-op"
+            "opaque update must close the open text boundary"
         );
+    }
+
+    #[test]
+    fn config_option_update_emits_complete_custom_bridge_snapshot() {
+        let update = SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(vec![
+            agent_client_protocol::schema::v1::SessionConfigOption::boolean(
+                "enabled", "Enabled", true,
+            ),
+        ]));
+        let expected = serde_json::to_value(&update).expect("config update must serialize");
+        let mut t = Translator::new();
+        let events = t.translate(update);
+
+        match events.as_slice() {
+            [Event::Custom(custom)] => {
+                assert_eq!(custom.name, "acp.session_update");
+                assert_eq!(custom.value, expected);
+                assert_eq!(custom.value["sessionUpdate"], "config_option_update");
+                assert!(custom.value["configOptions"][0].is_object());
+            }
+            other => panic!("expected one config CUSTOM event, got {other:?}"),
+        }
     }
 
     #[test]

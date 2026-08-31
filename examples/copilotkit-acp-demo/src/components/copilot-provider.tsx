@@ -11,6 +11,7 @@ import {
 } from "react";
 
 const THREAD_STORAGE_KEY = "agui-acp-demo.threadId";
+const RESUME_SESSION_STORAGE_KEY = "agui-acp-demo.resumeSessionId";
 
 function freshId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -39,9 +40,28 @@ function persistThreadId(id: string) {
   }
 }
 
+function loadResumeSessionId(): string | null {
+  try {
+    return window.localStorage.getItem(RESUME_SESSION_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function persistResumeSessionId(id: string | null) {
+  try {
+    if (id) window.localStorage.setItem(RESUME_SESSION_STORAGE_KEY, id);
+    else window.localStorage.removeItem(RESUME_SESSION_STORAGE_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 interface ConversationsContextValue {
-  /** The active AG-UI threadId (== ACP SessionId for resumed conversations). */
+  /** The active AG-UI threadId, distinct from any ACP SessionId. */
   threadId: string;
+  /** ACP SessionId to load for the current explicit resume, if any. */
+  resumeSessionId: string | null;
   /**
    * Increments every time the user explicitly opens a past conversation.
    * The chat surface watches this to drive an explicit resume run (see
@@ -78,10 +98,9 @@ export function useConversations(): ConversationsContextValue {
  * does not persist it. Without pinning, every reload starts a new ACP session
  * on the bridge → a new agent subprocess that lingers until the idle reaper.
  *
- * Resume: opening a past conversation sets the active threadId to that
- * conversation's ACP SessionId. `useAcpResume` then sends an explicit
- * `forwardedProps.acpResume=true` marker; ordinary bootstrap connections do
- * not load history.
+ * Resume: opening a past conversation creates a fresh AG-UI threadId and
+ * keeps the selected ACP SessionId separate. `useAcpResume` sends the typed
+ * sessionId marker; ordinary runs never infer ACP identity from threadId.
  */
 export function CopilotProvider({ children }: { children: ReactNode }) {
   // `useState` initializer runs once per mount. On the server it returns a
@@ -91,25 +110,48 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
     if (typeof window === "undefined") return "ssr-placeholder";
     return loadOrCreateThreadId();
   });
-  const [resumeToken, setResumeToken] = useState(0);
+  const [resumeSessionId, setResumeSessionId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return loadResumeSessionId();
+  });
+  const [resumeToken, setResumeToken] = useState(() =>
+    resumeSessionId ? 1 : 0,
+  );
 
   const newConversation = useCallback(() => {
     const id = freshId();
     persistThreadId(id);
+    persistResumeSessionId(null);
     setThreadId(id);
+    setResumeSessionId(null);
   }, []);
 
   const openConversation = useCallback((sessionId: string) => {
-    persistThreadId(sessionId);
-    setThreadId(sessionId);
+    const id = freshId();
+    persistThreadId(id);
+    persistResumeSessionId(sessionId);
+    setThreadId(id);
+    setResumeSessionId(sessionId);
     // Bump the resume token so the chat surface re-runs the explicit resume
     // even if the same conversation is re-opened.
     setResumeToken((n) => n + 1);
   }, []);
 
   const ctx = useMemo<ConversationsContextValue>(
-    () => ({ threadId, resumeToken, newConversation, openConversation }),
-    [threadId, resumeToken, newConversation, openConversation],
+    () => ({
+      threadId,
+      resumeSessionId,
+      resumeToken,
+      newConversation,
+      openConversation,
+    }),
+    [
+      threadId,
+      resumeSessionId,
+      resumeToken,
+      newConversation,
+      openConversation,
+    ],
   );
 
   return (
