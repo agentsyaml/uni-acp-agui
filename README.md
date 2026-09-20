@@ -26,7 +26,7 @@ curl -N -X POST http://127.0.0.1:8080/ \
   -d '{"threadId":"t1","runId":"r1","messages":[{"role":"user","id":"m1","content":"hello"}],"tools":[],"context":[],"forwardedProps":{},"state":{}}'
 ```
 
-All seven fields are required, camelCase. `Accept: text/event-stream` is mandatory (protobuf encoding is not yet implemented). The response is an SSE stream of `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`.
+All seven fields are required, camelCase. Send `Accept: text/event-stream` (a missing or `*/*` Accept is treated as SSE; an explicit protobuf `Accept` is rejected with `406`). The response is an SSE stream of `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`.
 
 To wrap a real agent binary, swap `--in-process` for the executable path:
 

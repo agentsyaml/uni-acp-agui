@@ -8,6 +8,9 @@ import { HttpAgent } from "@ag-ui/client";
  * it as an AG-UI HTTP endpoint. Default: http://127.0.0.1:8080/.
  *
  * Override via the server-only `AGUI_BRIDGE_URL` environment variable.
+ *
+ * Auth pairing: the Rust server reads `AGUI_ACP_BRIDGE_TOKEN`; this demo
+ * proxy reads `AGUI_BRIDGE_TOKEN` — set both in production (same value).
  */
 export const BRIDGE_URL =
   process.env.AGUI_BRIDGE_URL ?? "http://127.0.0.1:8080/";
@@ -336,6 +339,8 @@ export async function proxyBridgeRequest(
 
 /** Headers for server-side requests to the protected bridge. */
 export function bridgeHeaders(): Record<string, string> {
+  // Auth pairing: the Rust server reads `AGUI_ACP_BRIDGE_TOKEN`; this demo
+  // proxy reads `AGUI_BRIDGE_TOKEN` — set both in production (same value).
   const token = process.env.AGUI_BRIDGE_TOKEN;
   return token ? { Authorization: `Bearer ${token}` } : {};
 }

@@ -20,6 +20,9 @@ Browser
 The browser never talks to `127.0.0.1:8080` directly — `CopilotRuntime` proxies
 each run, which means CORS, auth headers, and middleware all stay server-side.
 
+> **Auth token pairing:** the Rust server reads `AGUI_ACP_BRIDGE_TOKEN`; the
+> demo proxy reads `AGUI_BRIDGE_TOKEN` — set both in production (same value).
+
 ## Prerequisites
 
 - Rust 1.88+ (already required by the workspace)
@@ -107,6 +110,9 @@ API routes:
   `/session/close` lifecycle endpoint.
 - `POST /api/bridge/session/delete` — server-side proxy to the bridge
   `/session/delete` persistence endpoint.
+- `POST /api/bridge/session/cancel` — server-side proxy to the bridge
+  `/session/cancel` run-cancellation endpoint (kept for demo parity with
+  close/delete).
 
 ### Mutating-route CSRF boundary
 

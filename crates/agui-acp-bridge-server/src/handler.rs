@@ -93,7 +93,7 @@ pub enum SetSessionStatus {
 /// JSON body for the server-facing config-option route.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetSessionConfigOptionBody {
+pub(crate) struct SetSessionConfigOptionBody {
     pub thread_id: String,
     pub config_id: String,
     #[serde(deserialize_with = "deserialize_string_or_boolean")]
@@ -202,21 +202,21 @@ fn validate_legacy_mode(
 /// JSON body for the server-facing cancel route.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CancelSessionBody {
+pub(crate) struct CancelSessionBody {
     pub thread_id: String,
 }
 
 /// JSON body for the explicit ACP session-close route.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CloseSessionBody {
+pub(crate) struct CloseSessionBody {
     pub thread_id: String,
 }
 
 /// JSON body for the explicit ACP session-delete route.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteSessionBody {
+pub(crate) struct DeleteSessionBody {
     pub thread_id: String,
 }
 
@@ -288,6 +288,22 @@ fn run_error_with_code(code: &'static str, message: impl Into<String>) -> Event 
     })
 }
 
+/// Map an ACP-origin `BridgeError` to a machine-readable RUN_ERROR code.
+///
+/// The cancel-grace expiry is the one timeout a client can act on (it
+/// cancelled and the agent refused to stop within the grace window), so it
+/// gets its own code via the dedicated [`BridgeError::CancelGraceExpired`]
+/// variant. Every other ACP/connection failure collapses to `ACP_ERROR` with
+/// the error string preserved in the message.
+fn acp_failure_run_error(error: &BridgeError) -> Event {
+    let is_cancel_grace = matches!(error, BridgeError::CancelGraceExpired(_));
+    if is_cancel_grace {
+        run_error_with_code("ACP_CANCEL_GRACE_EXPIRED", error.to_string())
+    } else {
+        run_error_with_code("ACP_ERROR", error.to_string())
+    }
+}
+
 const MIN_BEARER_TOKEN_LEN: usize = 16;
 
 fn validate_bearer_token(token: &str) -> Result<(), String> {
@@ -354,24 +370,6 @@ fn unauthorized() -> Response {
     response
 }
 
-async fn bearer_middleware(
-    expected: Option<Arc<str>>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if expected.is_none()
-        || is_anonymous_health_probe(&request)
-        || has_valid_bearer(
-            request.headers(),
-            expected.as_deref().unwrap_or_default().as_bytes(),
-        )
-    {
-        next.run(request).await
-    } else {
-        unauthorized()
-    }
-}
-
 async fn bridge_security_middleware(
     allowed_origins: Arc<HashSet<String>>,
     bearer_token: Option<Arc<str>>,
@@ -383,7 +381,17 @@ async fn bridge_security_middleware(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    bearer_middleware(bearer_token, request, next).await
+    if bearer_token.is_none()
+        || is_anonymous_health_probe(&request)
+        || has_valid_bearer(
+            request.headers(),
+            bearer_token.as_deref().unwrap_or_default().as_bytes(),
+        )
+    {
+        next.run(request).await
+    } else {
+        unauthorized()
+    }
 }
 
 /// Map one ACP prompt stop reason to the bridge's single AG-UI terminal event.
@@ -510,7 +518,7 @@ struct SessionEntry {
     /// Counts this actor against `max_sessions` until the entry and every
     /// external `Arc<SessionEntry>` holding it are dropped.
     _capacity_permit: Option<OwnedSemaphorePermit>,
-    last_used: parking_lot_like::Mutex<Instant>,
+    last_used: std::sync::Mutex<Instant>,
     /// Number of in-flight prompts on this session. The reaper refuses to
     /// drop entries with `active_prompts > 0` even if their `last_used` is
     /// stale: a long-running prompt would otherwise be killed mid-flight.
@@ -545,17 +553,17 @@ impl SessionEntry {
         Self {
             handle,
             _capacity_permit: capacity_permit,
-            last_used: parking_lot_like::Mutex::new(Instant::now()),
+            last_used: std::sync::Mutex::new(Instant::now()),
             active_prompts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     fn touch(&self) {
-        *self.last_used.lock() = Instant::now();
+        *self.last_used.lock().expect("session entry mutex poisoned") = Instant::now();
     }
 
     fn last_used(&self) -> Instant {
-        *self.last_used.lock()
+        *self.last_used.lock().expect("session entry mutex poisoned")
     }
 
     fn active_prompts(&self) -> usize {
@@ -638,27 +646,6 @@ impl Drop for PromptGuard {
             .active_prompts
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         self.entry.touch();
-    }
-}
-
-/// Tiny wrapper module so we don't pull in `parking_lot`. `std::sync::Mutex`
-/// is used; the wrapper just gives us `.lock()` returning the guard directly
-/// (panicking on poison) so the call sites stay readable.
-mod parking_lot_like {
-    use std::sync::{Mutex as StdMutex, MutexGuard};
-
-    #[derive(Debug)]
-    pub struct Mutex<T>(StdMutex<T>);
-
-    impl<T> Mutex<T> {
-        pub fn new(t: T) -> Self {
-            Self(StdMutex::new(t))
-        }
-
-        #[track_caller]
-        pub fn lock(&self) -> MutexGuard<'_, T> {
-            self.0.lock().expect("session entry mutex poisoned")
-        }
     }
 }
 
@@ -1917,7 +1904,7 @@ impl std::fmt::Debug for BridgeAppState {
 
 /// `RunHandler` that translates each AG-UI POST into one ACP prompt turn.
 #[derive(Clone, Debug)]
-pub struct BridgeHandler {
+pub(crate) struct BridgeHandler {
     state: BridgeAppState,
 }
 
@@ -2237,7 +2224,7 @@ impl RunHandler for BridgeHandler {
                     agui_acp_bridge_core::BridgeError::QueueCapacity { .. } => {
                         run_error_with_code("ACP_QUEUE_CAPACITY", err.to_string())
                     }
-                    _ => factory::run_error(format!("acp prompt failed: {err}")),
+                    _ => acp_failure_run_error(&err),
                 };
                 let evs = vec![Ok(factory::run_started(thread_id, run_id)), Ok(error_event)];
                 guarded_event_stream(evs, run_guard)
@@ -2394,7 +2381,10 @@ fn build_event_stream(
         // CopilotKit follow-up run, a reconnect) keeps its own sender and
         // its in-flight tool calls don't get stranded into a timeout.
         let _clear_on_drop = clear_on_drop;
-        let mut mcp_tool_rx = mcp_tool_rx;
+        // `None` once the MCP channel closes mid-run: that arm is then
+        // disabled in the select below while the rest of the loop keeps
+        // draining ACP events until Finished/RunError/disconnect.
+        let mut mcp_tool_rx = Some(mcp_tool_rx);
         let session_for_stream = session;
 
         if send_prompt_sse(
@@ -2466,11 +2456,20 @@ fn build_event_stream(
                     Some(it) => it,
                     None => break,
                 },
-                mcp = mcp_tool_rx.recv() => match mcp {
+                // Only while the MCP channel is still open. Once every
+                // sender clone is gone mid-run (e.g. a newer overlapping
+                // run took over the registry slot), we drop this arm and
+                // keep servicing `events` + `tx.closed()` until the turn
+                // reaches Finished/RunError or the client disconnects.
+                // Breaking out here would silently discard the remaining
+                // ACP updates for the rest of the turn and lose the
+                // disconnect-cancellation path below.
+                mcp = async { mcp_tool_rx.as_mut().unwrap().recv().await }, if mcp_tool_rx.is_some() => match mcp {
                     Some(it) => it,
-                    // mcp channel closing is fine — the registry entry
-                    // will close it when the session is reaped or closed.
-                    None => continue,
+                    None => {
+                        mcp_tool_rx = None;
+                        continue;
+                    }
                 },
                 // Detect client disconnect even while idle. When the SSE
                 // consumer drops, `tx` closes. Without this branch the loop
@@ -2674,7 +2673,7 @@ fn build_event_stream(
             Ok(Ok(stop_reason)) => {
                 stop_reason_terminal_event(thread_id.clone(), run_id.clone(), stop_reason)
             }
-            Ok(Err(e)) => factory::run_error(format!("acp prompt errored: {e}")),
+            Ok(Err(e)) => acp_failure_run_error(&e),
             Err(_) => factory::run_error("acp session dropped before finish"),
         };
         let _ = send_prompt_sse(
@@ -2841,7 +2840,7 @@ impl Drop for ClearOnDrop {
             // still parked on a oneshot so the agent's turn can unwind
             // instead of pinning the session until `frontend_tool_timeout`.
             self.entry
-                .abort_pending_calls("AG-UI run ended before tool resolved");
+                .drain_pending("AG-UI run ended before tool resolved");
         }
     }
 }
@@ -2861,24 +2860,37 @@ fn invalid_agui_body(message: impl std::fmt::Display) -> Response {
 /// `agui-rs-server` reads its route body with `to_bytes(..., usize::MAX)`, so
 /// Axum's `DefaultBodyLimit` extractor layer does not constrain the direct
 /// AG-UI route. This middleware is deliberately a body-reading boundary rather
-/// than another extractor layer; it also keeps invalid `RunAgentInput`s out of
-/// session admission and maps them to HTTP 400.
+/// than another extractor layer. It ALWAYS parses and validates the
+/// `RunAgentInput` (keeping invalid inputs out of session admission and
+/// mapping them to HTTP 400) regardless of whether a body `limit` is
+/// configured; only the size check itself is limit-gated.
+///
+/// It also enforces the JSON-in / SSE-out media-type boundary
+/// (`docs/PROTOCOL_CONFORMANCE.md` §2 "Non-JSON/SSE AG-UI transport"): an
+/// explicit protobuf `Accept` is rejected with HTTP 406 before any session
+/// admission, and the outbound `Accept` is pinned to SSE so the upstream
+/// encoder can never select protobuf for `*/*`.
 async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next: Next) -> Response {
-    let Some(limit) = limit else {
-        return next.run(request).await;
-    };
-
     if request.method() != Method::POST || request.uri().path() != "/" {
         return next.run(request).await;
     }
 
-    if request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > limit)
-    {
+    if let Some(reject) = reject_wrong_media_types(request.headers()) {
+        return reject;
+    }
+
+    let content_length_over_limit = |request: &Request<Body>| {
+        limit.is_some_and(|limit| {
+            request
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|length| length > limit)
+        })
+    };
+    if content_length_over_limit(&request) {
+        let limit = limit.expect("checked above");
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("invalid request body: request body exceeds {limit} bytes"),
@@ -2886,7 +2898,15 @@ async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next:
             .into_response();
     }
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    // Pin the outbound Accept to SSE. `agui-rs-encoder` treats `*/*` (and an
+    // absent Accept, which curl/browser defaults make common) as
+    // protobuf-capable; this bridge only implements SSE, so downstream the
+    // encoder must always see an explicit `text/event-stream`.
+    parts.headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static(agui_rs_core::AGUI_MEDIA_TYPE_SSE),
+    );
     let mut body_stream = body.into_data_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = body_stream.next().await {
@@ -2894,7 +2914,9 @@ async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next:
             Ok(chunk) => chunk,
             Err(error) => return invalid_agui_body(error),
         };
-        if bytes.len().saturating_add(chunk.len()) > limit {
+        if let Some(limit) = limit
+            && bytes.len().saturating_add(chunk.len()) > limit
+        {
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("invalid request body: request body exceeds {limit} bytes"),
@@ -2914,6 +2936,59 @@ async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next:
 
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
+}
+
+/// Enforce the bridge's JSON-in / SSE-out media-type boundary on the AG-UI
+/// route (`docs/PROTOCOL_CONFORMANCE.md` §2 "Non-JSON/SSE AG-UI transport").
+///
+/// The upstream `agui-rs-server` route picks its encoder from `Accept`, and
+/// `agui-rs-encoder` treats `*/*` as protobuf-capable — but this bridge only
+/// implements the JSON/SSE path, so an explicit protobuf `Accept` is rejected
+/// with HTTP 406 BEFORE any session admission or SSE stream starts. `*/*` and
+/// a missing `Accept` are treated as SSE (the middleware later pins the
+/// outbound `Accept` header to `text/event-stream`, so the upstream encoder
+/// can never select protobuf for them). A non-JSON `Content-Type` is rejected
+/// with 400; an absent `Content-Type` or one carrying charset/suffix
+/// parameters (`application/json; charset=utf-8`,
+/// `application/vnd.api+json`) is tolerated.
+fn reject_wrong_media_types(headers: &HeaderMap) -> Option<Response> {
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok());
+    let accepts_proto = accept.is_some_and(|accept| {
+        accept.split(',').any(|part| {
+            part.split(';').next().is_some_and(|media| {
+                media
+                    .trim()
+                    .eq_ignore_ascii_case(agui_rs_core::AGUI_MEDIA_TYPE_PROTOBUF)
+            })
+        })
+    });
+    if accepts_proto {
+        return Some(
+            (
+                StatusCode::NOT_ACCEPTABLE,
+                "this bridge only implements the AG-UI JSON/SSE transport; \
+                 the AG-UI protobuf encoding is not supported",
+            )
+                .into_response(),
+        );
+    }
+
+    let json_content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_none_or(|media| {
+            let media = media.trim();
+            media.eq_ignore_ascii_case("application/json")
+                || (media.ends_with("+json") && !media.is_empty())
+        });
+    if json_content_type {
+        None
+    } else {
+        Some(invalid_agui_body("content-type must be application/json"))
+    }
 }
 
 /// Build the AG-UI axum router for a given bridge state.
@@ -3248,8 +3323,8 @@ fn build_router_inner_with_agui_body_limit(
             .route("/session/set-config-option", post(set_config_option))
             .route("/session/cancel", post(cancel_session))
             .route("/session/close", post(close_session))
-            .route("/session/delete", post(delete_session));
-        let r = r.route("/session/set-model", post(set_model));
+            .route("/session/delete", post(delete_session))
+            .route("/session/set-model", post(set_model));
         r.with_state(state.clone())
     };
 

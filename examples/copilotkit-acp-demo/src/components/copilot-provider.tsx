@@ -74,6 +74,19 @@ interface ConversationsContextValue {
   newConversation: () => void;
   /** Switch to an existing conversation by its ACP SessionId (triggers resume). */
   openConversation: (sessionId: string) => void;
+  /**
+   * Set when the last explicit resume run failed. Rendered as an inline
+   * banner; cleared by a successful resume or a new conversation.
+   */
+  resumeError: string | null;
+  /** Clear {@link resumeError} after the user has seen it. */
+  dismissResumeError: () => void;
+  /**
+   * Record a failed explicit resume: surface `message` in the UI and drop
+   * the persisted resume session id (localStorage + state) so a reload
+   * does not re-fire the same failing run.
+   */
+  reportResumeFailure: (message: string) => void;
 }
 
 const ConversationsContext = createContext<ConversationsContextValue | null>(
@@ -117,6 +130,7 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
   const [resumeToken, setResumeToken] = useState(() =>
     resumeSessionId ? 1 : 0,
   );
+  const [resumeError, setResumeError] = useState<string | null>(null);
 
   const newConversation = useCallback(() => {
     const id = freshId();
@@ -124,6 +138,7 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
     persistResumeSessionId(null);
     setThreadId(id);
     setResumeSessionId(null);
+    setResumeError(null);
   }, []);
 
   const openConversation = useCallback((sessionId: string) => {
@@ -132,9 +147,20 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
     persistResumeSessionId(sessionId);
     setThreadId(id);
     setResumeSessionId(sessionId);
+    setResumeError(null);
     // Bump the resume token so the chat surface re-runs the explicit resume
     // even if the same conversation is re-opened.
     setResumeToken((n) => n + 1);
+  }, []);
+
+  const dismissResumeError = useCallback(() => setResumeError(null), []);
+
+  const reportResumeFailure = useCallback((message: string) => {
+    // A failed resume must not refire on every reload: drop the persisted
+    // session id alongside surfacing the error.
+    persistResumeSessionId(null);
+    setResumeSessionId(null);
+    setResumeError(message);
   }, []);
 
   const ctx = useMemo<ConversationsContextValue>(
@@ -144,6 +170,9 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
       resumeToken,
       newConversation,
       openConversation,
+      resumeError,
+      dismissResumeError,
+      reportResumeFailure,
     }),
     [
       threadId,
@@ -151,6 +180,9 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
       resumeToken,
       newConversation,
       openConversation,
+      resumeError,
+      dismissResumeError,
+      reportResumeFailure,
     ],
   );
 

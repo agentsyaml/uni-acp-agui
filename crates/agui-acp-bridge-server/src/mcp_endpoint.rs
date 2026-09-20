@@ -280,56 +280,13 @@ fn decode_mcp_name_value(value: &[u8]) -> Result<String, ()> {
         return Err(());
     }
     let payload = &value[9..value.len() - 2];
-    let decoded = decode_standard_base64(payload).ok_or(())?;
+    // Strict standard decoding: padding required, canonical alphabet, no
+    // whitespace — matching the hand-rolled decoder's acceptance exactly.
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| ())?;
     String::from_utf8(decoded).map_err(|_| ())
-}
-
-fn decode_standard_base64(value: &str) -> Option<Vec<u8>> {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
-        return None;
-    }
-    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
-        let last = index + 1 == bytes.len() / 4;
-        let first = base64_value(chunk[0])?;
-        let second = base64_value(chunk[1])?;
-        decoded.push((first << 2) | (second >> 4));
-        match chunk[2] {
-            b'=' => {
-                if !last || chunk[3] != b'=' || second & 0x0f != 0 {
-                    return None;
-                }
-            }
-            byte => {
-                let third = base64_value(byte)?;
-                decoded.push((second << 4) | (third >> 2));
-                match chunk[3] {
-                    b'=' => {
-                        if !last || third & 0x03 != 0 {
-                            return None;
-                        }
-                    }
-                    byte => {
-                        let fourth = base64_value(byte)?;
-                        decoded.push((third << 6) | fourth);
-                    }
-                }
-            }
-        }
-    }
-    Some(decoded)
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {

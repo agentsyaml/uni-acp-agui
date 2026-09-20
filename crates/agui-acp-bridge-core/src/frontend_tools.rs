@@ -117,14 +117,6 @@ impl ThreadEntry {
         }
     }
 
-    /// Build a stand-alone entry not connected to any registry. Useful for
-    /// unit tests that exercise `ThreadEntry` semantics in isolation.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn orphaned() -> Self {
-        Self::default()
-    }
-
     /// Replace the tool list. Called once per `RunAgentInput`.
     pub fn set_tools(&self, tools: Vec<FrontendToolDef>) {
         *self.lock_tools() = tools;
@@ -212,20 +204,6 @@ impl ThreadEntry {
         rx
     }
 
-    /// Guard a registered pending call so cancellation of the MCP request
-    /// removes it without waiting for the frontend-tool timeout.
-    pub fn pending_call_guard(
-        self: &Arc<Self>,
-        tool_call_id: impl Into<String>,
-    ) -> PendingCallGuard {
-        PendingCallGuard {
-            entry: self.clone(),
-            tool_call_id: tool_call_id.into(),
-            end_sender: None,
-            completed: false,
-        }
-    }
-
     /// Guard a registered pending call and close its AG-UI lifecycle if the
     /// MCP request is cancelled before the handler can send `FrontendToolEnd`.
     pub fn pending_call_guard_with_sender(
@@ -236,7 +214,7 @@ impl ThreadEntry {
         PendingCallGuard {
             entry: self.clone(),
             tool_call_id: tool_call_id.into(),
-            end_sender: Some(end_sender),
+            end_sender,
             completed: false,
         }
     }
@@ -267,13 +245,7 @@ impl ThreadEntry {
     /// prevents the idle reaper from releasing the session. Aborting the
     /// pending calls lets the agent's turn unwind promptly so the session
     /// becomes reapable.
-    pub fn abort_pending_calls(&self, reason: &str) {
-        self.drain_pending(reason);
-    }
-
-    /// Drain every pending request with an error response so MCP handler
-    /// tasks awaiting them exit immediately.
-    fn drain_pending(&self, reason: &str) {
+    pub fn drain_pending(&self, reason: &str) {
         let keys: Vec<String> = self.pending.iter().map(|e| e.key().clone()).collect();
         for k in keys {
             if let Some((_, tx)) = self.pending.remove(&k) {
@@ -307,7 +279,7 @@ impl Drop for ThreadEntry {
 pub struct PendingCallGuard {
     entry: Arc<ThreadEntry>,
     tool_call_id: String,
-    end_sender: Option<mpsc::Sender<BridgeStreamItem>>,
+    end_sender: mpsc::Sender<BridgeStreamItem>,
     completed: bool,
 }
 
@@ -321,14 +293,14 @@ impl PendingCallGuard {
 impl Drop for PendingCallGuard {
     fn drop(&mut self) {
         let _ = self.entry.pending.remove(&self.tool_call_id);
-        if !self.completed
-            && let Some(sender) = &self.end_sender
-        {
+        if !self.completed {
             let item = BridgeStreamItem::FrontendToolEnd {
                 tool_call_id: self.tool_call_id.clone(),
             };
-            if let Err(tokio::sync::mpsc::error::TrySendError::Full(item)) = sender.try_send(item) {
-                let sender = sender.clone();
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(item)) =
+                self.end_sender.try_send(item)
+            {
+                let sender = self.end_sender.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
                         let _ = sender.send(item).await;
@@ -608,7 +580,7 @@ mod tests {
         assert_eq!(entry.pending_len(), 1);
 
         assert!(entry.clear_active_sender_if_same(&registered_sender));
-        entry.abort_pending_calls("sender cleared");
+        entry.drain_pending("sender cleared");
         let response = receiver.await.expect("abort response");
         assert!(response.is_error);
         assert_eq!(entry.pending_len(), 0);
@@ -631,24 +603,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_pending_call_guard_removes_entry_promptly() {
-        let registry = FrontendToolRegistry::new();
-        let entry = registry.entry("t1");
-        let _rx = entry.register_pending("call-cancel".into());
-        let guard = entry.pending_call_guard("call-cancel");
-        let task = tokio::spawn(async move {
-            let _guard = guard;
-            std::future::pending::<()>().await;
-        });
-
-        tokio::task::yield_now().await;
-        assert_eq!(entry.pending_len(), 1);
-        task.abort();
-        let _ = task.await;
-        assert_eq!(entry.pending_len(), 0);
-    }
-
-    #[tokio::test]
     async fn cancelled_mcp_guard_closes_frontend_tool_lifecycle_when_channel_is_full() {
         let registry = FrontendToolRegistry::new();
         let entry = registry.entry("t1");
@@ -665,7 +619,7 @@ mod tests {
             .register_pending_on_active_sender("call-cancel-end".into())
             .expect("active sender");
 
-        let guard = entry.pending_call_guard_with_sender("call-cancel-end", sender);
+        let guard = entry.pending_call_guard_with_sender("call-cancel-end", sender.clone());
         drop(guard);
 
         assert_eq!(entry.pending_len(), 0);
@@ -685,9 +639,10 @@ mod tests {
 
     #[test]
     fn orphaned_entry_resolves_locally() {
-        // A stand-alone entry has no registry — register/resolve must still
-        // work locally without panicking.
-        let entry = ThreadEntry::orphaned();
+        // A stand-alone entry (no registry) must still register/resolve
+        // locally without panicking. Built via Default, same as an entry
+        // with an empty thread id.
+        let entry = ThreadEntry::default();
         assert_eq!(entry.thread_id(), "");
         let _rx = entry.register_pending("orphan-1".into());
         assert_eq!(entry.pending_len(), 1);

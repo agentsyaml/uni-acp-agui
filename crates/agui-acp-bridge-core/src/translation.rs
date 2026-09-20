@@ -107,11 +107,6 @@ impl Translator {
         self.suppressed_titles = titles.into_iter().map(Into::into).collect();
     }
 
-    /// Whether a given title is currently being suppressed.
-    pub fn is_suppressed(&self, title: &str) -> bool {
-        self.suppressed_titles.contains(title)
-    }
-
     /// Emit an AG-UI `TOOL_CALL_START` (and `TOOL_CALL_ARGS` if any) for a
     /// tool call the bridge is driving directly through its in-process
     /// MCP endpoint.

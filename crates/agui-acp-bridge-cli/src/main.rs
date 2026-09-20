@@ -36,6 +36,7 @@ use agui_acp_bridge_server::{
 };
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, ValueEnum};
+use std::future::Future;
 use tokio::net::TcpListener;
 use tokio::signal;
 
@@ -250,6 +251,9 @@ async fn run(cli: Cli) -> Result<()> {
         );
     }
 
+    // Auth pairing: the Rust server reads AGUI_ACP_BRIDGE_TOKEN; the demo
+    // proxy (examples/copilotkit-acp-demo) reads AGUI_BRIDGE_TOKEN — set
+    // both in production (same value).
     let bearer_token = match std::env::var("AGUI_ACP_BRIDGE_TOKEN") {
         Ok(token) => Some(token),
         Err(std::env::VarError::NotPresent) => None,
@@ -350,14 +354,134 @@ async fn run(cli: Cli) -> Result<()> {
     log_startup(&cli, bound);
 
     let router = build_router(state);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("axum::serve failed")?;
+    // Bounded graceful shutdown: `with_graceful_shutdown` alone waits
+    // indefinitely on open SSE connections after SIGTERM, which pushes
+    // container runtimes past their stop timeout into SIGKILL. Race the
+    // serving loop against the shutdown signal (the server MUST keep
+    // accepting connections while healthy — awaiting the signal before
+    // serving would accept nothing), then bound only the remaining drain:
+    // once the signal arrives, resolve graceful shutdown immediately so
+    // in-flight streams get a fixed window before forced stop.
+    //
+    // ponytail: hardcoded 10s rather than min(idle_timeout, …) —
+    // idle_timeout (default 120s) is a session-reaping knob, not a drain
+    // budget, and no operator tunes it expecting it to govern SIGTERM
+    // latency. 10s comfortably covers normal SSE teardown; in-flight turns
+    // that cannot finish by then are lost either way once the container is
+    // SIGKILLed, so failing fast is the honest behavior.
+    const DRAIN_WINDOW: Duration = Duration::from_secs(10);
+    let serve = async {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    };
+    tokio::pin!(serve);
+    // Race serving against the signal. While healthy the server runs forever;
+    // once the signal arrives, keep polling the SAME serve future under the
+    // drain window (a fresh axum::serve would fork accept loops; tokio's
+    // TcpListener can't be cloned).
+    let drained = tokio::select! {
+        biased;
+        result = &mut serve => Ok(result),
+        () = shutdown_signal() => {
+            serve_with_drain(serve.as_mut(), DRAIN_WINDOW).await
+        }
+    };
+    match drained {
+        Ok(result) => {
+            result.context("axum::serve failed")?;
+        }
+        Err(()) => {
+            tracing::warn!(
+                drain = ?DRAIN_WINDOW,
+                "drain window elapsed with streams still open; forcing stop"
+            );
+            // Graceful teardown did not finish, so any subprocess-backed
+            // sessions have not run their normal drop path. Kill our agent
+            // child processes best-effort so a SIGKILL of this bridge does
+            // not orphan them.
+            if !cli.in_process {
+                kill_agent_children();
+            }
+        }
+    }
 
     tracing::info!("bridge stopped");
     Ok(())
 }
+
+/// Run `serve` under a bounded drain window.
+///
+/// Returns `Err(())` if the drain window elapsed first (streams still open);
+/// otherwise returns the serve result. The caller must already have received
+/// the shutdown signal — this bounds only the post-signal drain. Split out so
+/// tests can drive it with paused time.
+async fn serve_with_drain<S>(serve: S, drain: Duration) -> std::result::Result<S::Output, ()>
+where
+    S: Future,
+{
+    tokio::time::timeout(drain, serve)
+        .await
+        .map_err(|_: tokio::time::error::Elapsed| ())
+}
+
+/// Best-effort kill of any leftover agent child processes after an
+/// ungraceful exit. Normally the ACP SDK's connection teardown
+/// (`ChildGuard`) SIGKILLs each spawned process group when the session
+/// drops — but that only runs on graceful task teardown. If the drain
+/// window expires and our own process is then SIGKILLed, we must not
+/// orphan the agents.
+///
+/// ponytail: one-level /proc scan for OUR direct children only (ACP agents
+/// are spawned as direct children of this process, and as their own process
+/// group leaders, so pgid == pid). Not per-session PID tracking — the bridge
+/// does not expose its session table to the CLI; this is a last-resort safety
+/// net on the shutdown path, not a process manager.
+#[cfg(unix)]
+fn kill_agent_children() {
+    let Some(children) = (|| -> Option<Vec<i32>> {
+        let my_pid = std::process::id() as i32;
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            // Only numeric entries are processes.
+            let Ok(pid) = entry.file_name().to_str().unwrap_or("").parse::<i32>() else {
+                continue;
+            };
+            // /proc/<pid>/stat fields are space-separated but comm may contain
+            // spaces AND ')' itself; split after the FINAL ')' so ppid is
+            // field 4 of the remainder.
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, rest)) = stat.rsplit_once(')') else {
+                continue;
+            };
+            let ppid = rest.split_whitespace().nth(1);
+            if ppid.and_then(|p| p.parse::<i32>().ok()) == Some(my_pid) {
+                found.push(pid);
+            }
+        }
+        Some(found)
+    })() else {
+        return;
+    };
+
+    for pid in children {
+        // Agents run as their own process-group leader (pgid == pid), so
+        // killing the group reaches tool grandchildren; fall back to the
+        // direct pid in case the group is already gone. Exact pids — no
+        // pattern matching, so unrelated processes are never touched.
+        // Direct syscalls via libc — no dependence on coreutils being on PATH.
+        let group_gone = unsafe { libc::kill(-pid, libc::SIGKILL) } == 0;
+        if !group_gone {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        tracing::info!(pid, "best-effort kill attempted on agent child");
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_agent_children() {}
 
 fn require_non_loopback_auth(
     host: IpAddr,
@@ -564,6 +688,51 @@ mod tests {
         assert!(
             err.to_string().contains("--allow"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_drain_forces_stop_when_serve_hangs() {
+        // Short real-time durations: `#[tokio::test(start_paused = true)]`
+        // would need tokio's `test-util` feature, which this crate does not
+        // enable. The proportions below still pin both behaviors in ~600ms.
+        let drain_window = Duration::from_millis(100);
+
+        // Serve future that never resolves; the drain window must win.
+        let started = std::time::Instant::now();
+        let result = serve_with_drain(
+            std::future::pending::<std::future::Ready<()>>(),
+            drain_window,
+        )
+        .await;
+        assert!(result.is_err(), "drain window should force stop");
+        assert!(
+            started.elapsed() >= drain_window,
+            "drain should have waited the full window"
+        );
+
+        // Serve future that resolves well inside the window completes
+        // normally.
+        let serve = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            "done"
+        };
+        let result = serve_with_drain(serve, drain_window).await;
+        assert_eq!(result.expect("serve should finish first"), "done");
+
+        // The window only starts counting at signal time — exactly the
+        // sequence `run()` performs: idle far longer than DRAIN_WINDOW while
+        // waiting for the shutdown signal (no timeout armed yet), then arm
+        // the drain and let a healthy serve finish.
+        tokio::time::sleep(drain_window * 3).await;
+        let serve = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            "still fine"
+        };
+        let result = serve_with_drain(serve, drain_window).await;
+        assert_eq!(
+            result.expect("idle serve survives an idle period past DRAIN_WINDOW"),
+            "still fine"
         );
     }
 }

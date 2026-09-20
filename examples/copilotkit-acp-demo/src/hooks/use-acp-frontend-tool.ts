@@ -137,31 +137,32 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
         const call = activeCalls.get(id);
         if (!call || call.resolved) return;
         call.argsDelta += e.delta ?? "";
-        // The bridge sends raw_input as a single delta in practice,
-        // but we tolerate streaming. As soon as the accumulated
-        // delta parses as JSON we fire the handler.
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(call.argsDelta);
-        } catch {
-          return;
-        }
-        call.resolved = true;
-        const args = parsed as Args;
-        void runHandler(id, call.threadId, args);
+        // Deliberately do NOT parse or fire here: a valid JSON *prefix*
+        // (e.g. `{}`) would parse before the full args arrive and fire the
+        // handler prematurely. The handler runs exclusively on
+        // TOOL_CALL_END, where the args are complete.
       },
       onToolCallEndEvent: ({ event }) => {
         const e = event as { toolCallId?: string };
         const id = e.toolCallId ?? "";
         const call = activeCalls.get(id);
-        if (!call) return;
+        if (!call || call.resolved) return;
+        call.resolved = true;
         // No-arg tool path: the agent ended the call without ever
-        // streaming args. Fire the handler with `{}` so the bridge's
-        // MCP request resolves instead of timing out.
-        if (!call.resolved) {
-          call.resolved = true;
-          void runHandler(id, call.threadId, {} as Args);
+        // streaming args, leaving `argsDelta` empty. Fire with `{}` so the
+        // bridge's MCP request resolves instead of timing out.
+        let args = {} as Args;
+        if (call.argsDelta.length > 0) {
+          try {
+            args = JSON.parse(call.argsDelta) as Args;
+          } catch (err) {
+            logRef.current(
+              "[useAcpFrontendTool] unparseable tool-call args; resolving with {}",
+              { toolCallId: id, err },
+            );
+          }
         }
+        void runHandler(id, call.threadId, args);
         activeCalls.delete(id);
       },
     });

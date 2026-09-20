@@ -11,7 +11,11 @@ complete. Status values below are exactly: `implemented`, `partial`,
 
 - **ACP:** stable wire Protocol v1. The Rust SDK dependency
   `agent-client-protocol 2.0.0` supplies the v1 schema; SDK version `2.0.0`
-  is **not** wire Protocol v2. ACP v2 draft material is out of scope.
+  is **not** wire Protocol v2. ACP v2 is a draft (2026-07-20) and out of
+  scope; this bridge targets stable v1. Note that v2 removes client
+  filesystem/terminal methods and merges load into resume, which will require
+  redesign if/when targeted
+  (<https://agentclientprotocol.com/protocol/v2/migration>).
 - Official ACP v1 sources:
   - <https://agentclientprotocol.com/protocol/v1/overview>
   - <https://agentclientprotocol.com/protocol/v1/schema>
@@ -21,11 +25,19 @@ complete. Status values below are exactly: `implemented`, `partial`,
 - **AG-UI:** current core JSON input and JSON events over SSE. The repository
   pins `@ag-ui/client 0.0.53` in
   `examples/copilotkit-acp-demo/package.json`; the Rust `agui-rs` core/server
-  dependencies are `0.1` in the workspace `Cargo.toml`.
+  dependencies are `0.1` in the workspace `Cargo.toml`. The bridge does not
+  implement AG-UI 1.0 (npm `@ag-ui/client` 1.0.0, shipped 2026-09-17); 1.0
+  adds native interrupt outcomes (`RUN_FINISHED.outcome` with
+  `type: "interrupt"` plus `RunAgentInput.resume[]`) and native usage on
+  `RUN_FINISHED`/`RUN_ERROR`. The target now includes those 1.0 native
+  surfaces; the current implementation remains private-extension-based, and
+  upgrading to AG-UI 1.0 is a pending protocol-position decision.
 - AG-UI references for this target:
   <https://docs.ag-ui.com/sdk/js/core/events>,
-  <https://docs.ag-ui.com/sdk/js/core/types>, and
-  <https://docs.ag-ui.com/concepts/agent-input>.
+  <https://docs.ag-ui.com/sdk/js/core/types>,
+  <https://docs.ag-ui.com/spec/1.0/events>,
+  <https://docs.ag-ui.com/concepts/interrupts>, and
+  <https://docs.ag-ui.com/spec/1.0/basic/run-input>.
 - **MCP:** an optional, private frontend-tool extension. It is not ACP core
   and is not AG-UI core. Its presence must not increase either protocol's
   conformance claim.
@@ -115,7 +127,7 @@ For compactness below, `core/` means
 | `UsageUpdate` | Feature-gated and emitted as `agent:usage_update` CUSTOM. | partial | Map usage fields to the selected AG-UI core representation or preserve a lossless raw form; feature flags must not alter ACP wire version. | `core/src/translation.rs`, `core/Cargo.toml` |
 | `Plan` snapshot | Limited step start/finish edges plus RAW snapshot. | partial | Keep snapshot replacement semantics and ordering; do not infer identity that ACP does not provide. | `core/src/translation.rs` unit tests |
 | `PlanUpdate` / `PlanRemoved` | No native handling. | pending implementation | Preserve the ACP update variant losslessly and emit no fabricated step lifecycle. Add capability/update tests before claiming native mapping. | `core/src/translation.rs`; no current dedicated integration test |
-| Unknown update | Active-stream opaque/unknown variants become serialized AG-UI RAW events with source `acp`; out-of-turn notifications are currently warned and dropped. | partial | Never silently drop. Preserve a lossless raw event while possible; otherwise terminate the affected stream/connection with an explicit protocol error. | `core/src/translation.rs`, `core/src/session.rs` |
+| Unknown update | Active-stream opaque/unknown variants become serialized AG-UI RAW events with source `acp`; out-of-turn notifications are spilled to a bounded buffer drained by the next run. | partial | Never silently drop. Preserve a lossless raw event while possible; otherwise terminate the affected stream/connection with an explicit protocol error. | `core/src/translation.rs`, `core/src/session.rs`; `server/tests/bridge_mock_agent.rs` spill tests |
 | Frontend MCP extension | `mcp_servers` is added only when the agent advertises `mcpCapabilities.http`; modern stateless `server/discover`, `tools/list`, and `tools/call` are implemented, with the legacy `2024-11-05` request-response subset retained. | N/A | Keep this separately labeled as MCP extension behavior, with MCP JSON-RPC errors; it is not ACP/AG-UI core conformance. No MCP session/SSE lifecycle is claimed. | `server/src/mcp_endpoint.rs`; its focused tests, `server/tests/frontend_tools.rs`, `frontend_tool_lifecycle.rs` |
 
 ### AG-UI input, events, lifecycle, state, and transport
@@ -130,10 +142,10 @@ For compactness below, `core/` means
 | AG-UI `resume[]` | Any `input.resume` is rejected. | explicitly rejected | Emit machine-readable `RUN_ERROR` (`AGUI_RESUME_UNSUPPORTED` today); do not open a session or turn it into a no-op. Native resume remains explicitly rejected until a complete interop path exists. | `server/src/handler.rs`; `server/tests/http_sse_roundtrip.rs` |
 | Private `forwardedProps.acpResume` | Typed object `{ "sessionId": "<ACP SessionId>" }` selects strict ACP `session/load` and one-shot history replay. | implemented | Keep it explicitly private; boolean or malformed markers return `ACP_RESUME_SESSION_ID_REQUIRED`, and it must never be presented as AG-UI `resume[]` or ACP `session/resume`. | `server/src/handler.rs`; `server/tests/session_history.rs`, `session_identity.rs`, `examples/copilotkit-acp-demo/src/hooks/use-acp-resume.ts` |
 | Approval interrupt | Only deferred permission emits the private approval `STATE_SNAPSHOT` object plus `POST /approval`; input state is not emitted as a generic snapshot. | implemented | Keep as a documented private bridge extension only. | `server/src/handler.rs`; `server/tests/bridge_mock_agent.rs` |
-| Canonical interrupt/continuation | No native AG-UI interrupt outcome or continuation is implemented. | explicitly rejected | Do not claim canonical interrupt. Until implemented, native requests remain an explicit unsupported run error; private approval must not substitute for it. | `server/src/handler.rs`; `server/tests/bridge_mock_agent.rs`, `http_sse_roundtrip.rs` |
+| Canonical interrupt/continuation | No native AG-UI interrupt outcome or continuation is implemented. AG-UI 1.0 defines a native one (`RUN_FINISHED.outcome` `type: "interrupt"` plus `RunAgentInput.resume[]`); this bridge pins 0.x and does not emit it. | explicitly rejected | Do not claim canonical interrupt. Until implemented, native requests remain an explicit unsupported run error; private approval must not substitute for it. Migrating to the 1.0 interrupt/resume surface is a pending protocol-position decision. | `server/src/handler.rs`; `server/tests/bridge_mock_agent.rs`, `http_sse_roundtrip.rs`; <https://docs.ag-ui.com/spec/1.0/events>, <https://docs.ag-ui.com/concepts/interrupts> |
 | Generic state delta and activity | `RunAgentInput.state` is request context and emits no generic `STATE_SNAPSHOT`; only private approval uses `STATE_SNAPSHOT`. No `STATE_DELTA` or `ACTIVITY_*` lane exists. | explicitly rejected | Do not emit generic state/activity snapshots or deltas without an ACP/source contract; approval remains private and stateful AG-UI semantics are not claimed. | `server/src/handler.rs`; `server/tests/http_sse_roundtrip.rs`, `bridge_mock_agent.rs` |
 | Generic raw event | Opaque/unknown ACP updates use AG-UI RAW with serialized payload and source `acp`; known bridge extensions and usage remain CUSTOM. | implemented | Preserve the serialized ACP payload and source on the RAW event; this lane does not implement STATE_DELTA, ACTIVITY, MESSAGES_SNAPSHOT, or native resume/interrupt. | `core/src/translation.rs`; `server/tests/http_sse_roundtrip.rs`, `bridge_mock_agent.rs` |
-| Config/session info and usage events | Available through CUSTOM session-init and `agent:usage_update` usage extensions (usage remains CUSTOM because no canonical event exists) plus RAW update snapshots. | partial | Keep usage as CUSTOM until a canonical usage event exists; preserve other config/session data losslessly with truthful capabilities. | `server/src/handler.rs`, `core/src/stream.rs` |
+| Config/session info and usage events | Available through CUSTOM session-init and `agent:usage_update` usage extensions plus RAW update snapshots. AG-UI 1.0 adds native usage on `RUN_FINISHED`/`RUN_ERROR`; this bridge pins 0.x, so usage remains CUSTOM here. | partial | Keep usage as CUSTOM while pinned to 0.x; on an AG-UI 1.0 upgrade (a pending protocol-position decision) migrate to the native usage fields without dropping data; preserve other config/session data losslessly with truthful capabilities. | `server/src/handler.rs`, `core/src/stream.rs`; <https://docs.ag-ui.com/spec/1.0/events> |
 | Non-JSON/SSE AG-UI transport | The route requires the JSON/SSE path; other encodings are not implemented. | explicitly rejected | Reject unsupported media/`Accept` at the HTTP boundary without opening ACP; HTTP rejection is not an AG-UI wire event. | `server/src/handler.rs`, `examples/copilotkit-acp-demo/src/lib/agui-bridge.ts` |
 
 ## 3. Frozen internal interfaces
@@ -159,8 +171,12 @@ For compactness below, `core/` means
   frozen full contract. No non-text block, empty placeholder, or conversion
   failure may be silently dropped.
 - **Feature/capability forwarding:** ACP initialization always negotiates v1;
-  SDK feature flags such as `unstable_session_model` and
-  `unstable_session_usage` cannot change that wire version. Advertise only
+  this crate's own core features such as `unstable_session_model` and
+  `unstable_session_usage` cannot change that wire version. They are distinct
+  from SDK unstable features such as `unstable_auth_methods`,
+  `unstable_elicitation`, `unstable_end_turn_token_usage`,
+  `unstable_mcp_over_acp`, `unstable_session_fork`, and
+  `unstable_protocol_v2`, which are not enabled here. Advertise only
   implemented client capabilities, gate agent methods on the advertised
   capability, and forward capability/config snapshots without fabricating
   support.
@@ -169,9 +185,13 @@ Ordering is fixed: `RUN_STARTED` → `SessionInit`/updates and translated
 events → translator flush → exactly one `RUN_FINISHED` or `RUN_ERROR` → end
 of-stream. Text/reasoning closes precede a tool start; tool end precedes its
 result; loaded history precedes a new prompt. No event is emitted after the
-terminal event. Unknown updates are lossless RAW (with known bridge
-extensions remaining CUSTOM) or an explicit error;
-there are no silent drops. A disconnected client is an explicit cancellation,
+terminal event. Updates arriving outside an active turn are spilled to a
+bounded buffer drained by the next run, never silently dropped; if that buffer
+is at capacity, the update is dropped with a logged warning and the run
+continues. If the session actor terminates while the spill buffer is still
+non-empty, the buffered updates are discarded but logged as a warning. Unknown updates inside a turn are lossless
+RAW (with known bridge extensions remaining CUSTOM) or an explicit error.
+A disconnected client is an explicit cancellation,
 not a successful run.
 
 ## 4. ID and lifecycle mapping
@@ -310,6 +330,12 @@ Shared-state review is mandatory for every P2/P3 change:
   ACP cancel grace, client disconnect while idle, bounded-channel backpressure,
   and queue/session-capacity tests. Existing timeout/cancel coverage is in
   `server/tests/bridge_mock_agent.rs` and `frontend_tool_lifecycle.rs`.
+- [ ] **Boundary tests from the current fix wave:** evidence required for the
+  out-of-turn/no-silent-drop contract (§3) and truthful error codes — media-type
+  / `Accept` HTTP 406 rejection at the AG-UI route, truthful limit-error codes
+  (`ACP_MAX_TOKENS`, `ACP_MAX_TURN_REQUESTS`, `ACP_QUEUE_CAPACITY`) asserted
+  exactly, a dedicated cancel-grace timeout code distinct from generic errors,
+  and the bounded-spill/overflow (warn-and-drop) path for post-terminal updates.
 
 ## 8. Gate status
 

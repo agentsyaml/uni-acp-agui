@@ -26,7 +26,6 @@ pub use file_ops::canonicalize_cwd;
 pub use frontend_tools::{
     FrontendToolDef, FrontendToolRegistry, FrontendToolResponse, ThreadEntry,
 };
-pub use message_state::MessageState;
 pub use policy::{PermissionDecision, PermissionPolicy};
 pub use process::ProcessAcpClient;
 pub use session::{

@@ -26,7 +26,7 @@ curl -N -X POST http://127.0.0.1:8080/ \
   -d '{"threadId":"t1","runId":"r1","messages":[{"role":"user","id":"m1","content":"你好"}],"tools":[],"context":[],"forwardedProps":{},"state":{}}'
 ```
 
-七个字段全部必填，camelCase；`Accept: text/event-stream` 必带（暂未实现 protobuf 编码）。响应是 SSE 流，依次包含 `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`。
+七个字段全部必填，camelCase；请发送 `Accept: text/event-stream`（缺省或 `*/*` 按 SSE 处理；显式的 protobuf `Accept` 会返回 `406`）。响应是 SSE 流，依次包含 `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`。
 
 要换成真实 Agent 二进制，把 `--in-process` 换成可执行文件路径即可：
 

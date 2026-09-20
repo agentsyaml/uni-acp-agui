@@ -354,12 +354,12 @@ async fn validates_policy_not_consulted_on_turns_without_permission_request() {
 }
 
 #[tokio::test]
-async fn validates_late_notification_after_finish_is_dropped() {
-    // Documents (and pins) the design choice that late notifications —
-    // those arriving on the connection-level callback after the prompt
-    // has already completed — are dropped rather than rebroadcast on a
-    // subsequent run's stream. Both the current run's body and the next
-    // run's body must NOT contain the late chunk.
+async fn validates_no_events_after_terminal_before_spill_drain() {
+    // Pins half of the spill contract: late notifications — those arriving
+    // on the connection-level callback after the prompt has completed — do
+    // NOT appear retroactively in the run that already terminated (no
+    // events after the terminal event). They are spilled and drained by
+    // the NEXT run; see `validates_spilled_late_notifications_drain_on_next_run`.
     let state = state_with_client(client_for(test_agents::run_late_notification_agent));
 
     let (status, body) =
@@ -373,15 +373,89 @@ async fn validates_late_notification_after_finish_is_dropped() {
         !body.contains("LATE-AFTER-FINISH"),
         "late notification must not appear in the same run (channel already closed), body:\n{body}"
     );
+}
 
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+#[tokio::test]
+async fn validates_spilled_late_notifications_drain_on_next_run() {
+    // The other half of the spill contract: a late notification arriving
+    // after the prompt response is preserved in the bounded spill buffer and
+    // rebroadcast at the START of the second run's stream — before that
+    // run's own in-band chunk from the new prompt. Never silently dropped.
+    let state = state_with_client(client_for(test_agents::run_late_notification_agent));
+
+    // Run 1: terminates; its late notification lands in the spill buffer.
+    let (status, body) =
+        collect_sse_body(state.clone(), user_input("thread-spill", "run-1", "first")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("LATE-AFTER-FINISH"),
+        "no events after run 1's terminal event, body:\n{body}"
+    );
+
+    // Give the agent's spawned late-notification task time to deliver.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Run 2: opens with the spilled update, then emits its own turn text
+    // (this agent labels every in-turn chunk "in-band").
+    let (status2, body2) =
+        collect_sse_body(state, user_input("thread-spill", "run-2", "second")).await;
+    assert_eq!(status2, StatusCode::OK, "body:\n{body2}");
+    let late = body2
+        .find("LATE-AFTER-FINISH")
+        .expect("spilled late notification must be rebroadcast on the next run, body:\n{body2}");
+    let own = body2
+        .rfind("in-band")
+        .expect("second run's own in-band chunk must be present, body:\n{body2}");
+    assert!(
+        late < own,
+        "spilled update must precede run 2's own turn events, body:\n{body2}"
+    );
+}
+
+#[tokio::test]
+async fn validates_spill_overflow_drops_with_warning_and_session_stays_usable() {
+    // 40 late updates against a 32-entry spill buffer: the first 32 are
+    // preserved, the rest are warned and dropped. The session itself stays
+    // usable — run 2 completes normally with the drained prefix.
+    let state = state_with_client(client_for(|stream| {
+        test_agents::run_late_notification_flood_agent(stream, 40)
+    }));
+
+    let (status, body) =
+        collect_sse_body(state.clone(), user_input("thread-flood", "run-1", "first")).await;
+    assert_eq!(status, StatusCode::OK, "body:\n{body}");
+    assert!(
+        !body.contains("LATE-AFTER-FINISH"),
+        "no events after run 1's terminal event, body:\n{body}"
+    );
+
+    // Let all 40 late notifications reach the notification handler.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
     let (status2, body2) =
-        collect_sse_body(state, user_input("thread-late", "run-2", "second")).await;
-    assert_eq!(status2, StatusCode::OK);
+        collect_sse_body(state, user_input("thread-flood", "run-2", "second")).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "overflow must not poison the session, body:\n{body2}"
+    );
     assert!(
-        !body2.contains("LATE-AFTER-FINISH"),
-        "late notifications are intentionally dropped, body:\n{body2}"
+        body2.contains("RUN_FINISHED"),
+        "run 2 must finish cleanly despite spill overflow, body:\n{body2}"
+    );
+    let kept = (0..32)
+        .filter(|index| body2.contains(&format!("LATE-AFTER-FINISH-{index}")))
+        .count();
+    let dropped = (32..40)
+        .filter(|index| body2.contains(&format!("LATE-AFTER-FINISH-{index}")))
+        .count();
+    assert_eq!(
+        kept, 32,
+        "spill must retain exactly its capacity, body:\n{body2}"
+    );
+    assert_eq!(
+        dropped, 0,
+        "updates beyond capacity must be dropped, body:\n{body2}"
     );
 }
 

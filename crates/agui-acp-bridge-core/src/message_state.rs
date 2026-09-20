@@ -21,10 +21,6 @@ impl MessageState {
         }
     }
 
-    pub fn message_id(&self) -> &str {
-        &self.message_id
-    }
-
     pub fn is_open(&self) -> bool {
         self.open
     }

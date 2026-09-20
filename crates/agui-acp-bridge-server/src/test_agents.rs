@@ -16,6 +16,8 @@
 //! - [`run_slow_prompt_agent`] — sleeps before responding (queued-prompt test).
 //! - [`run_long_running_agent`] — emits up to 1000 chunks at 50ms each (~50s).
 //! - [`run_late_notification_agent`] — sends notification AFTER PromptResponse.
+//! - [`run_late_notification_flood_agent`] — sends >32 late notifications per
+//!   prompt, exercising spill-buffer overflow.
 //! - [`run_counting_agent`] — emits N sequentially-numbered text chunks as fast
 //!   as possible, then ends. Used for streaming ordering / throughput tests.
 //! - [`run_slow_handshake_agent`] — sleeps before answering `session/new`, so
@@ -1057,12 +1059,13 @@ pub async fn run_long_running_agent(stream: DuplexStream) -> Result<(), BridgeEr
 /// Agent that emits a chunk, responds to prompt, **then** sends a late
 /// notification AFTER the PromptResponse has been delivered.
 ///
-/// Late notifications are intentionally dropped (with a tracing warning)
-/// rather than buffered or routed to the next prompt. Per `session.rs`,
-/// the per-prompt event slot is cleared as soon as the prompt completes,
-/// so any notification arriving on the connection-level callback after
-/// that point has nowhere to go and would be a protocol violation if the
-/// agent took the contract literally.
+/// Late notifications are spilled into the bridge's bounded spill buffer
+/// (`session.rs` `SpillBuffer`) and rebroadcast at the start of the NEXT run
+/// on the same thread, ahead of that run's own events. They never appear
+/// retroactively in the run that already terminated (no events after the
+/// terminal event). This agent emits its in-band chunk on every prompt, so
+/// the draining run distinguishes the spilled update from turn-two's own
+/// text.
 pub async fn run_late_notification_agent(stream: DuplexStream) -> Result<(), BridgeError> {
     let (read, write) = tokio::io::split(stream);
     let transport = ByteStreams::new(write.compat_write(), read.compat());
@@ -1111,6 +1114,89 @@ pub async fn run_late_notification_agent(stream: DuplexStream) -> Result<(), Bri
                             TextContent::new("LATE-AFTER-FINISH"),
                         ))),
                     ));
+                    Ok(())
+                });
+
+                responder.respond(PromptResponse::new(StopReason::EndTurn))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_dispatch(
+            async move |message: Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| {
+                // Forward Response messages to their awaiters; reject anything else.
+                match message {
+                    Dispatch::Response(result, router) => router.route_with_result(result),
+                    Dispatch::Request(_, responder) => responder.respond_with_error(
+                        agent_client_protocol::util::internal_error("unhandled request"),
+                    ),
+                    Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
+        .connect_to(transport)
+        .await
+        .map_err(BridgeError::Acp)
+}
+
+/// Agent that spills past the bridge's capacity: every prompt gets one
+/// in-band chunk plus `count` LATE-AFTER-FINISH-<i> chunks after the prompt
+/// response (matching `SpillBuffer`'s 32-entry cap when `count > 32`). Used
+/// to prove overflow drops with a warning while keeping the session usable.
+pub async fn run_late_notification_flood_agent(
+    stream: DuplexStream,
+    count: usize,
+) -> Result<(), BridgeError> {
+    let (read, write) = tokio::io::split(stream);
+    let transport = ByteStreams::new(write.compat_write(), read.compat());
+
+    Agent
+        .builder()
+        .name("agui-bridge-late-notif-flood-test")
+        .on_receive_request(
+            async move |req: InitializeRequest, responder, _cx| {
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new()),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |_req: NewSessionRequest, responder, _cx| {
+                responder.respond(NewSessionResponse::new(SessionId::from(
+                    Uuid::new_v4().to_string(),
+                )))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |req: PromptRequest,
+                        responder,
+                        cx: ConnectionTo<agent_client_protocol::Client>| {
+                let sid = req.session_id.clone();
+
+                cx.send_notification(SessionNotification::new(
+                    sid.clone(),
+                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                        TextContent::new("in-band"),
+                    ))),
+                ))?;
+
+                let cx_clone = cx.clone();
+                let sid_for_late = sid.clone();
+                let _ = cx.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    for index in 0..count {
+                        let _ = cx_clone.send_notification(SessionNotification::new(
+                            sid_for_late.clone(),
+                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                ContentBlock::Text(TextContent::new(format!(
+                                    "LATE-AFTER-FINISH-{index}"
+                                ))),
+                            )),
+                        ));
+                    }
                     Ok(())
                 });
 
@@ -2731,17 +2817,8 @@ pub type SharedSessionStore = std::sync::Arc<
 ///   notifications (prefixed `HISTORY:`) before responding, mirroring how a
 ///   real agent surfaces a resumed conversation.
 ///
-/// Each spawned instance gets a private store. Use
-/// [`run_session_history_agent_with`] to share one store across instances
-/// (modelling cross-connection persistence).
-pub async fn run_session_history_agent(stream: DuplexStream) -> Result<(), BridgeError> {
-    let store: SharedSessionStore =
-        std::sync::Arc::new(Mutex::new(std::collections::HashMap::new()));
-    run_session_history_agent_with(stream, store).await
-}
-
-/// Like [`run_session_history_agent`] but backed by a caller-supplied shared
-/// store, so multiple spawned instances see the same persisted sessions.
+/// Each spawned instance gets a private store; pass [`SharedSessionStore`] to
+/// share one store across instances (modelling cross-connection persistence).
 pub async fn run_session_history_agent_with(
     stream: DuplexStream,
     store: SharedSessionStore,

@@ -8,9 +8,6 @@ pub enum BridgeError {
     #[error("ACP error: {0}")]
     Acp(#[from] agent_client_protocol::Error),
 
-    #[error("AG-UI error: {0}")]
-    AgUi(#[from] agui_rs_core::AgUiError),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -19,6 +16,13 @@ pub enum BridgeError {
 
     #[error("operation timed out after {0:?}")]
     Timeout(Duration),
+
+    /// The agent did not acknowledge `session/cancel` within the configured
+    /// grace window. The ACP session state is unknowable afterward; the
+    /// session actor marks itself unusable so the handle is evicted rather
+    /// than reused.
+    #[error("cancel grace expired after {0:?}: agent did not acknowledge session/cancel")]
+    CancelGraceExpired(Duration),
 
     #[error("unsupported ACP protocol version: agent negotiated {actual}, expected {expected}")]
     ProtocolVersionMismatch {
@@ -51,10 +55,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_agui_preserves_message() {
-        let inner = agui_rs_core::AgUiError::Validation("boom".into());
-        let bridge: BridgeError = inner.into();
-        assert!(format!("{bridge}").contains("boom"));
+    fn cancel_grace_expired_message_names_the_condition() {
+        let err = BridgeError::CancelGraceExpired(Duration::from_millis(750));
+        let msg = format!("{err}");
+        assert!(msg.contains("cancel grace"), "got: {msg}");
+        // Downstream (server/handler.rs) maps uncoded errors to a generic
+        // RUN_ERROR with this Display text, so it must stay readable.
+        assert!(msg.contains("session/cancel"), "got: {msg}");
     }
 
     #[test]

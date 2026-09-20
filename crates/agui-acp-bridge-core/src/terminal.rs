@@ -574,9 +574,11 @@ fn output_limit(request: &CreateTerminalRequest) -> usize {
 fn wire_error(error: TerminalError) -> agent_client_protocol::Error {
     match error {
         TerminalError::InvalidParams => agent_client_protocol::Error::invalid_params(),
-        TerminalError::Capacity => agent_client_protocol::Error::request_cancelled().data(format!(
-            "terminal capacity reached (limit {MAX_TERMINALS_PER_SESSION})"
-        )),
+        // A per-session budget violation, not a caller cancellation: report
+        // -32603 with the actual limit instead of mislabeled -32800.
+        TerminalError::Capacity => agent_client_protocol::Error::internal_error().data(
+            serde_json::json!({"limit": "MAX_TERMINALS_PER_SESSION", "cap": MAX_TERMINALS_PER_SESSION}),
+        ),
         TerminalError::ResourceNotFound => agent_client_protocol::Error::resource_not_found(None),
         TerminalError::Internal => agent_client_protocol::Error::internal_error(),
     }
@@ -588,8 +590,18 @@ pub(crate) async fn create_request(
     cancellation: RequestCancellation,
     responder: agent_client_protocol::Responder<CreateTerminalResponse>,
 ) -> Result<(), agent_client_protocol::Error> {
+    // fork/exec under the registry's std Mutex is blocking work; keep it off
+    // the async dispatch thread without restructuring the lock-around-spawn
+    // invariant that makes the per-session cap race-free.
     let created = cancellation
-        .run_until_cancelled(async move { registry.create(&request).map_err(wire_error) })
+        .run_until_cancelled(async move {
+            let create_result =
+                match tokio::task::spawn_blocking(move || registry.create(&request)).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(wire_error(TerminalError::Internal)),
+                };
+            create_result.map_err(wire_error)
+        })
         .await;
     let (mut result, guard, mut keep) = match created {
         Ok((_id, guard)) if cancellation.is_cancelled() => (
@@ -2323,7 +2335,16 @@ mod tests {
             registry.create(&request),
             Err(TerminalError::Capacity)
         ));
-        assert_eq!(i32::from(wire_error(TerminalError::Capacity).code), -32800);
+        let capacity = wire_error(TerminalError::Capacity);
+        // Budget violation is a truthful internal error, not -32800.
+        assert_eq!(i32::from(capacity.code), -32603);
+        assert_eq!(
+            capacity.data,
+            Some(serde_json::json!({
+                "limit": "MAX_TERMINALS_PER_SESSION",
+                "cap": MAX_TERMINALS_PER_SESSION
+            }))
+        );
 
         drop(created);
         drop(guard);

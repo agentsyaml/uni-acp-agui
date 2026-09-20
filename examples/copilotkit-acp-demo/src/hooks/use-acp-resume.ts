@@ -25,7 +25,13 @@ import { useConversations } from "@/components/copilot-provider";
  */
 export function useAcpResume() {
   const { agent } = useAgent();
-  const { resumeSessionId, threadId, resumeToken } = useConversations();
+  const {
+    resumeSessionId,
+    threadId,
+    resumeToken,
+    resumeError,
+    reportResumeFailure,
+  } = useConversations();
   const lastHandledToken = useRef<number>(0);
 
   useEffect(() => {
@@ -49,6 +55,10 @@ export function useAcpResume() {
     //
     // We do NOT mutate the agent object directly (threadId/messages) — the
     // React Compiler treats it as immutable, and CopilotChat owns that state.
+    // Don't retry automatically after a failure: the stale session id has
+    // already been cleared, so refiring would just error again on reload.
+    if (resumeError) return;
+
     const id = setTimeout(() => {
       void agent
         .runAgent({
@@ -56,8 +66,18 @@ export function useAcpResume() {
         })
         .catch((err: unknown) => {
           console.error("[useAcpResume] resume run failed", err);
+          reportResumeFailure(
+            err instanceof Error ? err.message : String(err),
+          );
         });
     }, 0);
     return () => clearTimeout(id);
-  }, [agent, resumeSessionId, threadId, resumeToken]);
+  }, [
+    agent,
+    resumeSessionId,
+    threadId,
+    resumeToken,
+    resumeError,
+    reportResumeFailure,
+  ]);
 }

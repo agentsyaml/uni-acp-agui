@@ -13,8 +13,10 @@
 //! holds a shared `Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>` slot.
 //! On `Prompt`, it installs the per-prompt sender; when the prompt completes
 //! (success or error) it clears the slot. Notifications that arrive while
-//! the slot is empty are logged and dropped — they would be ACP protocol
-//! violations (notification outside any active turn).
+//! the slot is empty are spilled into a bounded buffer (capacity
+//! [`SPILL_CAPACITY`]) that the next prompt drains ahead of its own events;
+//! overflow warns and drops — they would be ACP protocol violations
+//! (notification outside any active turn).
 //!
 //! # Request handling
 //!
@@ -26,6 +28,7 @@
 //! - Filesystem and terminal request handlers are capability-gated by the
 //!   configured [`PermissionPolicy`] and the initialized platform backend.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -85,6 +88,20 @@ const MAX_LIST_PAGES: usize = 1000;
 
 type EventSlot = Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>;
 
+/// Bounded spill for `session/update` notifications that arrive with no
+/// active prompt. ACP treats out-of-turn updates as protocol violations, but
+/// they can also precede the actor's slot install by a scheduling hair —
+/// dropping them silently violates the "no silent drops" contract. The next
+/// prompt drains this buffer ahead of its own events; overflow warns and
+/// drops (the session state is already beyond recovery at that point).
+///
+/// ponytail: spill lives on the actor's flush path, not a dedicated side
+/// channel; if out-of-turn volume ever matters, replace with an unbounded
+/// dedicated stream wired through `BridgeStreamItem`.
+const SPILL_CAPACITY: usize = 32;
+
+type SpillBuffer = Arc<Mutex<Vec<agent_client_protocol::schema::v1::SessionUpdate>>>;
+
 /// Captures `session/update` notifications replayed by the agent during a
 /// `session/load` call. The agent streams the conversation history as
 /// notifications *before* any prompt is active, so they would otherwise be
@@ -136,14 +153,10 @@ impl BoundedSessionList {
 
     fn push_with_size(&mut self, summary: SessionSummary, bytes: usize) -> Result<(), BridgeError> {
         if self.summaries.len() >= MAX_LIST_SESSIONS {
-            return Err(session_limit_error(
-                "session/list result exceeds the entry limit",
-            ));
+            return Err(session_limit_error("MAX_LIST_SESSIONS", MAX_LIST_SESSIONS));
         }
         if bytes > MAX_LIST_BYTES || self.bytes > MAX_LIST_BYTES - bytes {
-            return Err(session_limit_error(
-                "session/list result exceeds the byte limit",
-            ));
+            return Err(session_limit_error("MAX_LIST_BYTES", MAX_LIST_BYTES));
         }
         self.bytes += bytes;
         self.summaries.push(summary);
@@ -162,20 +175,26 @@ impl BoundedSessionList {
 fn next_list_cursor(pages: usize, next: Option<String>) -> Result<Option<String>, BridgeError> {
     match next {
         Some(next) if pages < MAX_LIST_PAGES => Ok(Some(next)),
-        Some(_) => Err(session_limit_error(
-            "session/list exceeded the page limit before the final page",
-        )),
+        Some(_) => Err(session_limit_error("MAX_LIST_PAGES", MAX_LIST_PAGES)),
         None => Ok(None),
     }
 }
 
-fn session_limit_error(message: &'static str) -> BridgeError {
-    BridgeError::Acp(agent_client_protocol::Error::request_cancelled().data(message))
+/// Bridge budget violation for `session/list`. Reports `-32603`
+/// (internal error) with structured data naming the actual limit —
+/// `-32800` (`request_cancelled`) would falsely imply the caller cancelled.
+fn session_limit_error(limit: &'static str, cap: usize) -> BridgeError {
+    BridgeError::Acp(
+        agent_client_protocol::Error::internal_error()
+            .data(serde_json::json!({ "limit": limit, "cap": cap })),
+    )
 }
 
 fn load_history_limit_error() -> agent_client_protocol::Error {
-    agent_client_protocol::Error::request_cancelled()
-        .data("session/load history exceeds the bridge event or byte limit")
+    agent_client_protocol::Error::internal_error().data(serde_json::json!({
+        "limit": "MAX_LOAD_HISTORY",
+        "cap": { "events": MAX_LOAD_HISTORY_EVENTS, "bytes": MAX_LOAD_HISTORY_BYTES }
+    }))
 }
 
 pub(crate) async fn spawn_in_process_echo_session(
@@ -530,11 +549,7 @@ async fn list_sessions_inner(
             "session/list page received"
         );
 
-        if resp.sessions.len() > MAX_LIST_SESSIONS.saturating_sub(summaries.len()) {
-            return Err(session_limit_error(
-                "session/list result exceeds the entry limit",
-            ));
-        }
+        // Bound enforcement lives in `BoundedSessionList::push_with_size`.
         for info in resp.sessions {
             summaries.push(SessionSummary {
                 session_id: info.session_id.0.to_string(),
@@ -644,6 +659,9 @@ async fn run_actor<T>(
     let event_slot_for_notif = event_slot.clone();
     let event_slot_for_perm = event_slot.clone();
     let event_slot_for_session = event_slot.clone();
+    let spill: SpillBuffer = Arc::new(Mutex::new(Vec::new()));
+    let spill_for_notif = spill.clone();
+    let spill_for_teardown = spill.clone();
     let load_buffer: LoadBuffer = Arc::new(Mutex::new(None));
     let load_buffer_for_notif = load_buffer.clone();
     let load_buffer_for_session = load_buffer.clone();
@@ -755,9 +773,26 @@ async fn run_actor<T>(
                     if let Some(tx) = sender {
                         let _ = tx.send(BridgeStreamItem::Update(notification.update)).await;
                     } else {
-                        tracing::warn!(
-                            "received session/update notification with no active prompt; dropping"
-                        );
+                        // No active prompt. The SDK's dispatch loop only logs
+                        // errors from notification handlers (it cannot reply
+                        // to a notification), so returning Err would neither
+                        // surface the loss nor preserve the update — spill
+                        // into the bounded buffer for the next run instead.
+                        //
+                        // ponytail: slot check and spill push are not atomic —
+                        // an update observed here just before a prompt installs
+                        // its slot stays spilled and is delivered at the start
+                        // of the NEXT run. ACP treats out-of-turn updates as a
+                        // protocol violation anyway, so this seam is accepted.
+                        let mut spill = spill_for_notif.lock().expect("spill buffer poisoned");
+                        if spill.len() >= SPILL_CAPACITY {
+                            tracing::warn!(
+                                capacity = SPILL_CAPACITY,
+                                "out-of-turn session/update spill overflow; dropping update"
+                            );
+                        } else {
+                            spill.push(notification.update);
+                        }
                     }
                     Ok(())
                 }
@@ -1027,6 +1062,7 @@ async fn run_actor<T>(
             let init_state = init_state.clone();
             let load_session_id = load_session_id.clone();
             let load_buffer = load_buffer_for_session;
+            let spill = spill;
             async move {
                 let (session_id, supports_close) = match initialize(
                     &cx,
@@ -1102,6 +1138,21 @@ async fn run_actor<T>(
                                 }
                             }
 
+                            // Drain out-of-turn updates spilled by the
+                            // notification handler ahead of this turn's own
+                            // events (ordered capture, see SpillBuffer).
+                            let spilled: Vec<_> =
+                                std::mem::take(&mut *spill.lock().expect("spill buffer poisoned"));
+                            for update in spilled {
+                                if events_tx
+                                    .send(BridgeStreamItem::Update(update))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+
                             // Run the prompt while concurrently watching for
                             // a cancel notification (via the turn state) and for
                             // the SSE consumer dropping. A naive serial
@@ -1121,8 +1172,7 @@ async fn run_actor<T>(
 
                             let grace_expired = matches!(
                                 &res,
-                                Err(BridgeError::Timeout(timeout))
-                                    if *timeout == config.cancel_grace_timeout
+                                Err(BridgeError::CancelGraceExpired(_))
                             ) && turn.is_cancelled();
 
                             *event_slot.lock().expect("event slot poisoned") = None;
@@ -1141,48 +1191,14 @@ async fn run_actor<T>(
                             }
                         }
                         SessionCommand::SetMode { mode_id, ack } => {
-                            // Settings are deliberately actor-serial. A
-                            // prompt owns the ACP turn until it finishes, so
-                            // a queued setting cannot race a later setting or
-                            // overwrite its newer cached snapshot.
-                            //
-                            // The HTTP caller may time out while this command
-                            // waits behind a prompt. Do not apply a command
-                            // whose responder has already gone away.
-                            let mut ack = ack;
-                            if ack.is_closed() {
-                                continue;
-                            }
-                            let res = tokio::select! {
-                                _ = ack.closed() => {
-                                    // The caller disconnected while the ACP
-                                    // request was in flight. Its eventual
-                                    // response cannot safely update a session
-                                    // that may be reused, so close this actor.
-                                    unusable.store(true, Ordering::Release);
-                                    break;
-                                }
-                                result = tokio::time::timeout(
-                                    config.set_session_timeout,
-                                    send_set_mode(&cx, &session_id, &mode_id, init_state.clone()),
-                                ) => match result {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        unusable.store(true, Ordering::Release);
-                                        let _ = send_setting_ack(
-                                            ack,
-                                            Err(BridgeError::Timeout(config.set_session_timeout)),
-                                            &unusable,
-                                        );
-                                        break;
-                                    }
-                                },
-                            };
-                            if ack.is_closed() && res.is_ok() {
-                                unusable.store(true, Ordering::Release);
-                                break;
-                            }
-                            if !send_setting_ack(ack, res, &unusable) {
+                            let kept = run_setting_command(
+                                ack,
+                                config.set_session_timeout,
+                                &unusable,
+                                send_set_mode(&cx, &session_id, &mode_id, init_state.clone()),
+                            )
+                            .await;
+                            if !kept {
                                 break;
                             }
                         }
@@ -1191,45 +1207,20 @@ async fn run_actor<T>(
                             value,
                             ack,
                         } => {
-                            let mut ack = ack;
-                            if ack.is_closed() {
-                                continue;
-                            }
-                            let res = tokio::select! {
-                                _ = ack.closed() => {
-                                    // The caller disconnected while the ACP
-                                    // request was in flight. Do not keep a
-                                    // state-uncertain session alive.
-                                    unusable.store(true, Ordering::Release);
-                                    break;
-                                }
-                                result = tokio::time::timeout(
-                                    config.set_session_timeout,
-                                    send_set_config_option(
-                                        &cx,
-                                        &session_id,
-                                        &config_id,
-                                        &value,
-                                        init_state.clone(),
-                                    ),
-                                ) => match result {
-                                    Ok(result) => result,
-                                    Err(_) => {
-                                        unusable.store(true, Ordering::Release);
-                                        let _ = send_setting_ack(
-                                            ack,
-                                            Err(BridgeError::Timeout(config.set_session_timeout)),
-                                            &unusable,
-                                        );
-                                        break;
-                                    }
-                                },
-                            };
-                            if ack.is_closed() && res.is_ok() {
-                                unusable.store(true, Ordering::Release);
-                                break;
-                            }
-                            if !send_setting_ack(ack, res, &unusable) {
+                            let kept = run_setting_command(
+                                ack,
+                                config.set_session_timeout,
+                                &unusable,
+                                send_set_config_option(
+                                    &cx,
+                                    &session_id,
+                                    &config_id,
+                                    &value,
+                                    init_state.clone(),
+                                ),
+                            )
+                            .await;
+                            if !kept {
                                 break;
                             }
                         }
@@ -1318,6 +1309,21 @@ async fn run_actor<T>(
     unusable.store(true, Ordering::Release);
     turn_queue.clear();
 
+    // Actor shutdown with a non-empty spill buffer means those out-of-turn
+    // updates will never be drained by a future prompt — surface the loss
+    // instead of discarding silently.
+    let remaining_spill = spill_for_teardown
+        .lock()
+        .expect("spill buffer poisoned")
+        .len();
+    if remaining_spill > 0 {
+        tracing::warn!(
+            count = remaining_spill,
+            "session actor terminated with non-empty out-of-turn update spill buffer; \
+             buffered updates discarded"
+        );
+    }
+
     if let Err(err) = result {
         let sender = event_slot.lock().expect("event slot poisoned").clone();
         if let Some(tx) = sender {
@@ -1367,6 +1373,56 @@ fn send_setting_ack(
     } else {
         true
     }
+}
+
+/// Shared body of `SetMode`/`SetConfigOption`: run one actor-serial setting
+/// RPC and reconcile every caller-gone path.
+///
+/// Returns `false` only when the actor must shut down (the caller vanished at
+/// any point). All three poison cases — the responder closed while the ACP
+/// request raced it, the request itself timed out, and the acknowledgement
+/// failing to deliver — mark the session unusable before exiting, because a
+/// half-applied setting leaves the cached snapshot untrustworthy for reuse.
+async fn run_setting_command(
+    mut ack: oneshot::Sender<Result<(), BridgeError>>,
+    timeout: Duration,
+    unusable: &AtomicBool,
+    request: impl Future<Output = Result<(), BridgeError>>,
+) -> bool {
+    // Settings are deliberately actor-serial. A prompt owns the ACP turn
+    // until it finishes, so a queued setting cannot race a later setting or
+    // overwrite its newer cached snapshot. The HTTP caller may time out while
+    // this command waits behind a prompt; do not apply a command whose
+    // responder has already gone away.
+    if ack.is_closed() {
+        return true;
+    }
+
+    let res = tokio::select! {
+        _ = ack.closed() => {
+            // The caller disconnected while the ACP request was in flight.
+            // Its eventual response cannot safely update a session that may
+            // be reused, so close this actor.
+            unusable.store(true, Ordering::Release);
+            return false;
+        }
+        result = tokio::time::timeout(timeout, request) => match result {
+            Ok(result) => result,
+        Err(_) => {
+            // A timed-out setting leaves ACP state uncertain: report the
+            // timeout to the caller if it can still receive it, then always
+            // shut the actor down.
+            unusable.store(true, Ordering::Release);
+            let _ = send_setting_ack(ack, Err(BridgeError::Timeout(timeout)), unusable);
+            return false;
+        }
+        },
+    };
+    if ack.is_closed() && res.is_ok() {
+        unusable.store(true, Ordering::Release);
+        return false;
+    }
+    send_setting_ack(ack, res, unusable)
 }
 
 fn file_operation_error(error: BridgeError) -> agent_client_protocol::Error {
@@ -1859,7 +1915,7 @@ async fn run_prompt_with_cancel(
                     ?cancel_grace_timeout,
                     "agent did not acknowledge session/cancel within grace window"
                 );
-                break Err(BridgeError::Timeout(cancel_grace_timeout));
+                break Err(BridgeError::CancelGraceExpired(cancel_grace_timeout));
             }
         }
     };
@@ -3190,12 +3246,16 @@ mod tests {
         let entry_error = entries
             .push_with_size(summary("over"), 1)
             .expect_err("entry limit must be reported");
+        // Budget violations are internal errors with structured limit data,
+        // not -32800 (request_cancelled) — the caller did not cancel.
+        let (code, data) = match entry_error {
+            BridgeError::Acp(error) => (i32::from(error.code), error.data),
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert_eq!(code, -32603);
         assert_eq!(
-            i32::from(match entry_error {
-                BridgeError::Acp(error) => error.code,
-                other => panic!("unexpected error: {other:?}"),
-            }),
-            -32800
+            data,
+            Some(serde_json::json!({"limit": "MAX_LIST_SESSIONS", "cap": MAX_LIST_SESSIONS}))
         );
         assert_eq!(entries.len(), MAX_LIST_SESSIONS);
 

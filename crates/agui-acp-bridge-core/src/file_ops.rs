@@ -424,11 +424,44 @@ fn filesystem_io(error: std::io::Error) -> BridgeError {
         std::io::ErrorKind::Other
     };
     let message = if kind == std::io::ErrorKind::NotFound {
-        "filesystem resource not found"
+        // Keep the historical fixed string for the mapped-NotFound case.
+        "filesystem resource not found".to_string()
     } else {
-        "filesystem operation failed"
+        // Preserve fidelity: the display of an io::Error carries its kind and
+        // raw OS error (e.g. "PermissionDenied (os error 13)"), so the agent
+        // can distinguish EACCES vs EISDIR vs ENAMETOOLONG.
+        format!("filesystem operation failed: {error}")
     };
-    BridgeError::Io(std::io::Error::new(kind, message))
+    // Chain the original error as `source` (io::Error::source() forwards to
+    // the inner error) without changing the public FileErrorKind taxonomy:
+    // `error_kind()` still sees the same preserved `kind`.
+    BridgeError::Io(std::io::Error::new(
+        kind,
+        SourcedIoMessage {
+            message,
+            source: error,
+        },
+    ))
+}
+
+/// Message wrapper keeping the original [`std::io::Error`] reachable as the
+/// [`std::error::Error::source`] of the wrapped io error.
+#[derive(Debug)]
+struct SourcedIoMessage {
+    message: String,
+    source: std::io::Error,
+}
+
+impl std::fmt::Display for SourcedIoMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SourcedIoMessage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Canonicalize `cwd` for use as a sandbox root.
@@ -846,6 +879,41 @@ mod tests {
         let result = read_text_file(dir.path(), &absolute(&dir, "invalid.txt"), None).await;
         let error = result.expect_err("invalid UTF-8 must fail");
         assert_eq!(error_kind(&error), FileErrorKind::Internal);
+    }
+
+    #[test]
+    fn filesystem_io_preserves_source_error_fidelity() {
+        use std::error::Error as _;
+
+        // Raw os error 13 (EACCES) without pulling libc into the deps.
+        let original = std::io::Error::from_raw_os_error(13);
+        let wrapped = filesystem_io(original);
+        let BridgeError::Io(wrapped) = &wrapped else {
+            panic!("filesystem_io must return BridgeError::Io");
+        };
+        // Kind and taxonomy preserved: non-NotFound io errors collapse to
+        // `Other` by design (see `filesystem_io`), never a specific kind.
+        assert_eq!(wrapped.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error_kind(&BridgeError::Io(clone_io(wrapped))),
+            FileErrorKind::Internal
+        );
+        // Display carries the kind + raw os error, not a fixed opaque string.
+        let text = wrapped.to_string();
+        assert!(
+            text.contains("os error 13"),
+            "message must keep the os error, got: {text}"
+        );
+        // The original error stays reachable as `source`.
+        let source = wrapped
+            .source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .expect("original io error must be chained as source");
+        assert_eq!(source.raw_os_error(), Some(13));
+    }
+
+    fn clone_io(error: &std::io::Error) -> std::io::Error {
+        std::io::Error::new(error.kind(), error.to_string())
     }
 
     #[tokio::test]
