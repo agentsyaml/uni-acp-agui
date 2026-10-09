@@ -10,38 +10,42 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "bun test tests && node --test tests/katex-compat.test.mjs tests/undici-compat.test.mjs tests/uuid-compat.test.mjs",
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@ag-ui/client": "0.0.53",
-    "@copilotkit/react-core": "1.58.0",
-    "@copilotkit/react-ui": "1.58.0",
-    "@copilotkit/runtime": "1.58.0",
-    "next": "16.2.11",
+    "@ag-ui/client": "0.0.57",
+    "@copilotkit/react-core": "1.67.1",
+    "@copilotkit/react-ui": "1.67.1",
+    "@copilotkit/runtime": "1.67.1",
+    "next": "16.3.8",
     "react": "19.2.4",
     "react-dom": "19.2.4",
-    "zod": "^4.4.3"
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@standard-schema/spec": "^1.1.0",
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.11",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "@tailwindcss/postcss": "^4.3.3",
+    "@types/node": "^20.19.43",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "eslint": "^9.39.5",
+    "eslint-config-next": "16.3.8",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3"
   },
   "overrides": {
-    "sharp": "0.35.3",
+    "sharp": "0.35.5",
     "postcss": "8.5.23",
     "nanoid": "3.3.18",
-    "js-yaml": "4.3.1",
-    "hono": "4.12.34",
-    "ip-address": "10.3.1",
-    "dompurify": "3.4.7",
-    "fast-uri": "3.1.5"
+    "js-yaml": "4.3.2",
+    "hono": "4.13.7",
+    "ip-address": "10.7.1",
+    "dompurify": "3.4.16",
+    "katex": "0.18.2",
+    "fast-uri": "3.1.8",
+    "undici": "6.29.0",
+    "uuid": "11.1.1"
   },
   "ignoreScripts": [
     "sharp",
@@ -50,5 +54,8 @@
   "trustedDependencies": [
     "sharp",
     "unrs-resolver"
-  ]
+  ],
+  "patchedDependencies": {
+    "braces@3.0.3": "patches/braces@3.0.3.patch"
+  }
 }

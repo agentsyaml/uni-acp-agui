@@ -13,6 +13,7 @@ use async_trait::async_trait;
 
 use crate::acp::{AcpClient, AcpSessionHandle, SessionConfig};
 use crate::error::BridgeError;
+use crate::guarded_transport::{GuardedAgent, ProcessDiagnostic};
 use crate::session::{delete_session_via, list_sessions_via, spawn_session};
 use crate::stream::SessionSummary;
 
@@ -72,10 +73,14 @@ impl ProcessAcpClient {
     }
 
     fn agent(&self) -> AcpAgent {
+        let mut env = self.env.clone();
+        for key in ["AGUI_ACP_BRIDGE_TOKEN", "AGUI_BRIDGE_TOKEN"] {
+            env.insert(key.to_string(), String::new());
+        }
         AcpAgent::new(
             AcpAgentConfig::new(self.command.clone())
                 .args(self.args.clone())
-                .envs(self.env.clone()),
+                .envs(env),
         )
     }
 }
@@ -83,14 +88,16 @@ impl ProcessAcpClient {
 #[async_trait]
 impl AcpClient for ProcessAcpClient {
     async fn open_session(&self, cfg: SessionConfig) -> Result<AcpSessionHandle, BridgeError> {
-        spawn_session(self.agent(), cfg).await
+        let (agent, diagnostic) = GuardedAgent::new(self.agent());
+        prefer_observed_process_failure(spawn_session(agent, cfg).await, &diagnostic)
     }
 
     async fn list_sessions(&self, cfg: SessionConfig) -> Result<Vec<SessionSummary>, BridgeError> {
         // Spawn a fresh, short-lived agent process for the listing query.
         // The connection (and subprocess) is torn down when the transient
         // connection task completes inside `list_sessions_via`.
-        list_sessions_via(self.agent(), cfg).await
+        let (agent, diagnostic) = GuardedAgent::new(self.agent());
+        prefer_observed_process_failure(list_sessions_via(agent, cfg).await, &diagnostic)
     }
 
     async fn delete_session(
@@ -99,7 +106,31 @@ impl AcpClient for ProcessAcpClient {
         session_id: agent_client_protocol::schema::v1::SessionId,
     ) -> Result<(), BridgeError> {
         // Spawn a fresh, short-lived agent process for the delete query.
-        delete_session_via(self.agent(), cfg, session_id).await
+        let (agent, diagnostic) = GuardedAgent::new(self.agent());
+        prefer_observed_process_failure(
+            delete_session_via(agent, cfg, session_id).await,
+            &diagnostic,
+        )
+    }
+}
+
+fn prefer_observed_process_failure<T>(
+    result: Result<T, BridgeError>,
+    diagnostic: &ProcessDiagnostic,
+) -> Result<T, BridgeError> {
+    match result {
+        Err(BridgeError::Acp(error))
+            if agent_client_protocol::is_incoming_transport_closed(&error) =>
+        {
+            let (Some(status), stderr) = diagnostic.snapshot() else {
+                return Err(BridgeError::Acp(error));
+            };
+            Err(BridgeError::Io(std::io::Error::other(format!(
+                "ACP agent exited with {status}; stderr: {}",
+                String::from_utf8_lossy(&stderr)
+            ))))
+        }
+        other => other,
     }
 }
 
@@ -107,10 +138,79 @@ impl AcpClient for ProcessAcpClient {
 mod tests {
     use super::*;
 
+    fn incoming_closed_error() -> agent_client_protocol::Error {
+        agent_client_protocol::Error::internal_error().data(
+            serde_json::json!({"reason": agent_client_protocol::INCOMING_TRANSPORT_CLOSED_REASON}),
+        )
+    }
+
+    #[cfg(unix)]
+    fn failed_diagnostic() -> ProcessDiagnostic {
+        use std::os::unix::process::ExitStatusExt;
+        let diagnostic = ProcessDiagnostic::default();
+        diagnostic.observe_failure(&std::process::ExitStatus::from_raw(17 << 8));
+        diagnostic.append_stderr(b"bounded stderr");
+        diagnostic
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_exit_only_overrides_incoming_transport_closed() {
+        let diagnostic = failed_diagnostic();
+        let error = prefer_observed_process_failure::<()>(
+            Err(BridgeError::Acp(incoming_closed_error())),
+            &diagnostic,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, BridgeError::Io(ref e) if e.to_string().contains("17") && e.to_string().contains("bounded stderr"))
+        );
+
+        let mut domain = agent_client_protocol::Error::internal_error();
+        domain.message = "incoming transport closed".to_string();
+        let result =
+            prefer_observed_process_failure::<()>(Err(BridgeError::Acp(domain)), &diagnostic)
+                .unwrap_err();
+        assert!(
+            matches!(result, BridgeError::Acp(ref e) if e.message == "incoming transport closed")
+        );
+
+        let timeout = BridgeError::Timeout(std::time::Duration::from_secs(1));
+        assert!(matches!(
+            prefer_observed_process_failure::<()>(Err(timeout), &diagnostic),
+            Err(BridgeError::Timeout(_))
+        ));
+    }
+
+    #[test]
+    fn empty_diagnostic_and_success_are_unchanged() {
+        let diagnostic = ProcessDiagnostic::default();
+        let result = prefer_observed_process_failure::<()>(
+            Err(BridgeError::Acp(incoming_closed_error())),
+            &diagnostic,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(result, BridgeError::Acp(ref e) if agent_client_protocol::is_incoming_transport_closed(e))
+        );
+        assert!(
+            prefer_observed_process_failure(Ok::<_, BridgeError>(7), &diagnostic).unwrap() == 7
+        );
+    }
+
     #[test]
     fn structured_config_preserves_args_and_env() {
         let mut env = HashMap::new();
         env.insert("FOO".to_string(), "bar".to_string());
+        env.insert(
+            "AGUI_ACP_BRIDGE_TOKEN".to_string(),
+            "admin-secret-one".to_string(),
+        );
+        env.insert(
+            "AGUI_BRIDGE_TOKEN".to_string(),
+            "admin-secret-two".to_string(),
+        );
+        env.insert("VENDOR_API_KEY".to_string(), "vendor-secret".to_string());
         let client = ProcessAcpClient::new("agent with space")
             .with_args(["arg with space", "--flag"])
             .with_env(env);
@@ -120,6 +220,27 @@ mod tests {
         assert_eq!(
             config.environment().get("FOO").map(String::as_str),
             Some("bar")
+        );
+        assert_eq!(
+            config
+                .environment()
+                .get("VENDOR_API_KEY")
+                .map(String::as_str),
+            Some("vendor-secret")
+        );
+        assert_eq!(
+            config
+                .environment()
+                .get("AGUI_ACP_BRIDGE_TOKEN")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
+            config
+                .environment()
+                .get("AGUI_BRIDGE_TOKEN")
+                .map(String::as_str),
+            Some("")
         );
         assert!(!format!("{client:?}").contains("bar"));
     }

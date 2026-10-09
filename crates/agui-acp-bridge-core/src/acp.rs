@@ -62,6 +62,7 @@ pub struct PendingPermission {
     /// `Allow` decision is checked against this set; `Deny` always passes.
     pub(crate) valid_option_ids: HashSet<String>,
     pub(crate) turn: Arc<TurnState>,
+    pub(crate) _budget: PermissionReservation,
 }
 
 impl PendingPermission {
@@ -69,11 +70,13 @@ impl PendingPermission {
         resolver: oneshot::Sender<PermissionDecision>,
         valid_option_ids: HashSet<String>,
         turn: Arc<TurnState>,
+        budget: PermissionReservation,
     ) -> Self {
         Self {
             resolver,
             valid_option_ids,
             turn,
+            _budget: budget,
         }
     }
 
@@ -99,6 +102,29 @@ pub type PendingPermissions = Arc<DashMap<String, PendingPermission>>;
 /// and the entry is drained, or it observes the flag and responds cancelled
 /// without entering the map.
 static NEXT_TURN_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_PENDING_PERMISSIONS_PER_TURN: usize = 128;
+pub(crate) const MAX_PENDING_PERMISSION_BYTES_PER_REQUEST: usize = 64 * 1024;
+const MAX_PENDING_PERMISSION_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct PermissionBudget {
+    count: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct PermissionReservation {
+    budget: Arc<StdMutex<PermissionBudget>>,
+    bytes: usize,
+}
+
+impl Drop for PermissionReservation {
+    fn drop(&mut self) {
+        let mut budget = self.budget.lock().expect("permission budget poisoned");
+        budget.count -= 1;
+        budget.bytes -= self.bytes;
+    }
+}
 
 /// Opaque identity for one queued or in-flight prompt turn.
 ///
@@ -113,6 +139,9 @@ pub(crate) struct TurnState {
     id: TurnId,
     cancelled: AtomicBool,
     pending_ids: StdMutex<HashSet<String>>,
+    permission_budget: Arc<StdMutex<PermissionBudget>>,
+    failed: AtomicBool,
+    pub(crate) failure_notify: tokio::sync::Notify,
     pub(crate) cancel_notify: tokio::sync::Notify,
 }
 
@@ -122,6 +151,9 @@ impl TurnState {
             id: TurnId(NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed)),
             cancelled: AtomicBool::new(false),
             pending_ids: StdMutex::new(HashSet::new()),
+            permission_budget: Arc::new(StdMutex::new(PermissionBudget::default())),
+            failed: AtomicBool::new(false),
+            failure_notify: tokio::sync::Notify::new(),
             cancel_notify: tokio::sync::Notify::new(),
         }
     }
@@ -134,6 +166,50 @@ impl TurnState {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    pub(crate) fn reserve_permission(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<PermissionReservation> {
+        let mut budget = self
+            .permission_budget
+            .lock()
+            .expect("permission budget poisoned");
+        if budget.count >= MAX_PENDING_PERMISSIONS_PER_TURN
+            || bytes > MAX_PENDING_PERMISSION_BYTES_PER_REQUEST
+            || bytes > MAX_PENDING_PERMISSION_BYTES_PER_TURN
+            || budget.bytes > MAX_PENDING_PERMISSION_BYTES_PER_TURN - bytes
+            || self.is_cancelled()
+        {
+            return None;
+        }
+        budget.count += 1;
+        budget.bytes += bytes;
+        Some(PermissionReservation {
+            budget: self.permission_budget.clone(),
+            bytes,
+        })
+    }
+
+    pub(crate) fn fail(&self) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.failure_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Register a pending permission under `interrupt_id`.
+    ///
+    /// Returns `false` if the turn is cancelled **or** if `interrupt_id` is
+    /// already registered. A duplicate must never silently clobber a live
+    /// entry: `DashMap::insert` would replace another turn's oneshot
+    /// resolver while the first turn's `pending_ids` still holds the id, so
+    /// a later `cancel_and_drain` on that turn would resolve a permission
+    /// the UI surfaced for a different turn. The trait contract says the
+    /// interrupt id is bridge-assigned, so the bridge owns the uniqueness
+    /// invariant here.
     pub(crate) fn register_pending(
         &self,
         pending_permissions: &PendingPermissions,
@@ -144,9 +220,17 @@ impl TurnState {
         if self.is_cancelled() {
             return false;
         }
-        pending_permissions.insert(interrupt_id.clone(), pending);
-        ids.insert(interrupt_id);
-        true
+        // The DashMap entry API makes the occupancy check + insert atomic
+        // per shard, closing the cross-turn race the separate `contains_key`
+        // call would leave open.
+        match pending_permissions.entry(interrupt_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => false,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(pending);
+                ids.insert(interrupt_id);
+                true
+            }
+        }
     }
 
     pub(crate) fn remove_pending(
@@ -765,6 +849,13 @@ impl AcpSessionHandle {
         self.unusable.load(Ordering::Acquire)
     }
 
+    /// Wait until the session actor has retired and can no longer deliver
+    /// events. Long-lived stream writers can select on this alongside a
+    /// downstream send to escape legacy unbounded-send mode after retirement.
+    pub async fn closed(&self) {
+        self.cmd_tx.closed().await;
+    }
+
     /// The real ACP session identifier returned by `session/new` or
     /// `session/load`.
     #[must_use]
@@ -890,6 +981,83 @@ mod tests {
 
         assert_eq!(queue.len(), 0);
         assert!(queue.try_enqueue().is_ok());
+    }
+
+    #[test]
+    fn pending_permission_admission_is_bounded_and_released() {
+        let turn = Arc::new(TurnState::new());
+        let mut leases: Vec<_> = (0..MAX_PENDING_PERMISSIONS_PER_TURN)
+            .map(|_| turn.reserve_permission(32).expect("within pending cap"))
+            .collect();
+        assert!(turn.reserve_permission(1).is_none());
+        drop(leases.pop());
+        assert!(turn.reserve_permission(1).is_some());
+        assert!(
+            turn.reserve_permission(MAX_PENDING_PERMISSION_BYTES_PER_REQUEST + 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn duplicate_interrupt_id_must_not_clobber_another_turns_pending_permission() {
+        let pending_permissions: PendingPermissions = Arc::new(DashMap::new());
+        let turn_a = Arc::new(TurnState::new());
+        let turn_b = Arc::new(TurnState::new());
+
+        let (tx_a, mut rx_a) = oneshot::channel();
+        let (_tx_b_rejected, _rx_b_rejected) = oneshot::channel();
+        let (tx_b_own, mut rx_b_own) = oneshot::channel();
+
+        // Both turns request the *same* bridge-assigned interrupt id (a
+        // misbehaving policy reusing an id). Only the first registration
+        // may succeed; the second must be rejected without dropping
+        // turn A's live resolver.
+        assert!(turn_a.register_pending(
+            &pending_permissions,
+            "shared-id".to_string(),
+            PendingPermission::new(
+                tx_a,
+                HashSet::new(),
+                turn_a.clone(),
+                turn_a.reserve_permission(0).unwrap(),
+            ),
+        ));
+        assert!(
+            !turn_b.register_pending(
+                &pending_permissions,
+                "shared-id".to_string(),
+                PendingPermission::new(
+                    _tx_b_rejected,
+                    HashSet::new(),
+                    turn_b.clone(),
+                    turn_b.reserve_permission(0).unwrap(),
+                ),
+            ),
+            "duplicate interrupt id must be rejected"
+        );
+        // Turn B also holds a legitimate pending permission under its own
+        // id, as would happen mid-turn alongside the colliding request.
+        assert!(turn_b.register_pending(
+            &pending_permissions,
+            "turn-b-own".to_string(),
+            PendingPermission::new(
+                tx_b_own,
+                HashSet::new(),
+                turn_b.clone(),
+                turn_b.reserve_permission(0).unwrap(),
+            ),
+        ));
+
+        // Turn A cancels: it drains exactly its own single entry.
+        turn_a.cancel_and_drain(&pending_permissions);
+        assert!(matches!(rx_a.try_recv(), Ok(PermissionDecision::Deny)));
+
+        // Turn B's legitimate permission was untouched by turn A's drain:
+        // still pending, resolvable with a real decision.
+        match rx_b_own.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            other => panic!("turn B's permission must stay pending, got {other:?}"),
+        }
     }
 
     #[tokio::test]

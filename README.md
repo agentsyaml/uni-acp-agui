@@ -9,6 +9,8 @@ The bridge translates supported ACP turns and updates into AG-UI events, with op
 
 中文版：[README.zh.md](./README.zh.md)
 
+Security boundaries and current dependency advisories: [Security notes](./docs/SECURITY_NOTES.md).
+
 ## Quick start
 
 Spin up an in-process echo gateway (no external agent binary required):
@@ -27,6 +29,14 @@ curl -N -X POST http://127.0.0.1:8080/ \
 ```
 
 All seven fields are required, camelCase. Send `Accept: text/event-stream` (a missing or `*/*` Accept is treated as SSE; an explicit protobuf `Accept` is rejected with `406`). The response is an SSE stream of `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`.
+
+While a turn is in flight, the stream emits a `CUSTOM` event with name
+`agent:keepalive` every 15 seconds so idle stretches (a long tool call, a
+deferred permission) do not trip proxy/load-balancer idle timeouts. Consumers
+should ignore its value. Other bridge `CUSTOM` events carry meaningful
+payloads — `agent:session_init`, `agent:mode_update`,
+`agent:commands_available`, `agent:usage_update`, plus the opaque
+`acp.session_update` / `acp.tool_call_raw_output` passthroughs.
 
 To wrap a real agent binary, swap `--in-process` for the executable path:
 
@@ -74,13 +84,17 @@ Run `agui-acp-bridge --help` for the full list. Logs go to stderr; tune verbosit
 
 | Path        | Method | Purpose                                                                    |
 | ----------- | ------ | -------------------------------------------------------------------------- |
-| `/`         | POST   | AG-UI `RunAgentInput` → AG-UI event SSE stream (16 MiB body limit by default) |
+| `/`         | POST   | AG-UI `RunAgentInput` → AG-UI event SSE stream (16 MiB body limit, not adjustable via the public API) |
 | `/health`   | GET    | `200 {"status":"ok"}`                                                       |
 | `/sessions` | GET    | List the agent's persisted conversations via ACP `session/list` (`501` if unsupported) |
 | `/approval` | POST   | Resolve a permission request deferred by `--policy interrupt`              |
 | `/session/cancel` | POST | Cancel the current turn for a cached session (`404` if absent) |
 | `/session/close` | POST | Gracefully close a cached ACP session when the agent advertises `sessionCapabilities.close` |
 | `/session/delete` | POST | Remove a persisted ACP session from `session/list` when the agent advertises `sessionCapabilities.delete` |
+
+When `POST /` cannot admit a run because session capacity is full, it returns
+`503`; other session-opening failures return `500`. These are run-route
+responses, not `/approval` outcomes.
 
 `POST /session/close` accepts `{ "threadId": "..." }` and uses the real ACP
 `SessionId` returned during initialization. It returns `204` after a successful
@@ -116,6 +130,9 @@ the bridge surfaces them statelessly — it stores no history of its own:
 
 - `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`.
   `sessionId` is the ACP identity; it never doubles as an AG-UI `threadId`.
+  Each query forks a short-lived agent connection, so results are cached for
+  2 seconds and concurrent requests collapse into one query; errors are never
+  cached.
 - To **resume** a conversation, choose an AG-UI `threadId` and POST a run
   whose `forwardedProps` contains
   `{"acpResume":{"sessionId":"<ACP sessionId>"}}`. This typed marker is
@@ -132,15 +149,23 @@ the bridge surfaces them statelessly — it stores no history of its own:
 `/approval` request body and status codes:
 
 ```json
-{ "interruptId": "<uuid from STATE_SNAPSHOT>", "approved": true, "optionId": "allow_once" }
+{
+  "threadId": "<the same threadId the run used>",
+  "interruptId": "<uuid from STATE_SNAPSHOT>",
+  "approved": true,
+  "optionId": "allow_once"
+}
 ```
+
+The lookup is scoped to the live session bound to `threadId` — a pending
+interrupt can only be resolved from its own thread.
 
 | Status                     | Trigger                                                                        |
 | -------------------------- | ------------------------------------------------------------------------------ |
 | `200 OK`                   | Decision delivered to the session actor                                        |
-| `400 Bad Request`          | `approved=true` but `optionId` is missing                                      |
-| `404 Not Found`            | `interruptId` is unknown (already answered, timed out, or never existed)       |
-| `422 Unprocessable Entity` | `optionId` is not one the agent advertised (the pending request is preserved for retry) |
+| `400 Bad Request`          | Body is not valid JSON, or `approved=true` but `optionId` is missing           |
+| `404 Not Found`            | The thread has no live session, or `interruptId` is unknown (already answered, timed out, or never existed) |
+| `422 Unprocessable Entity` | `threadId` is missing or malformed, or `optionId` is not one the agent advertised (the pending request is preserved for retry) |
 
 ## Permission policies
 
@@ -206,7 +231,8 @@ BridgeAppState::builder(client, PathBuf::from("."))
     .build();
 ```
 
-If 16 MiB is the wrong default body limit for you, call `build_router_inner` and add your own `DefaultBodyLimit` layer.
+The 16 MiB body limit covers every route including `POST /` and cannot be
+raised from the public API; oversized AG-UI bodies are rejected with HTTP 413.
 
 Workspace layout:
 

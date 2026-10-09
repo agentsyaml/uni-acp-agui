@@ -22,7 +22,7 @@
 //! Use `agui-acp-bridge --help` for the full flag list.
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -396,10 +396,8 @@ async fn run(cli: Cli) -> Result<()> {
                 drain = ?DRAIN_WINDOW,
                 "drain window elapsed with streams still open; forcing stop"
             );
-            // Graceful teardown did not finish, so any subprocess-backed
-            // sessions have not run their normal drop path. Kill our agent
-            // child processes best-effort so a SIGKILL of this bridge does
-            // not orphan them.
+            // Graceful teardown did not finish; the Linux-only sweep is a
+            // best-effort fallback after guarded-connection cleanup.
             if !cli.in_process {
                 kill_agent_children();
             }
@@ -425,19 +423,14 @@ where
         .map_err(|_: tokio::time::error::Elapsed| ())
 }
 
-/// Best-effort kill of any leftover agent child processes after an
-/// ungraceful exit. Normally the ACP SDK's connection teardown
-/// (`ChildGuard`) SIGKILLs each spawned process group when the session
-/// drops — but that only runs on graceful task teardown. If the drain
-/// window expires and our own process is then SIGKILLed, we must not
-/// orphan the agents.
+/// Best-effort Linux-only sweep for direct agent children after the bounded
+/// drain expires. Normal cleanup is owned by the guarded transport connection;
+/// this fallback does not promise cleanup on other platforms or after forced
+/// termination of the bridge.
 ///
-/// ponytail: one-level /proc scan for OUR direct children only (ACP agents
-/// are spawned as direct children of this process, and as their own process
-/// group leaders, so pgid == pid). Not per-session PID tracking — the bridge
-/// does not expose its session table to the CLI; this is a last-resort safety
-/// net on the shutdown path, not a process manager.
-#[cfg(unix)]
+/// ponytail: one-level `/proc` scan of direct children only, not a process
+/// manager or a guarantee that every descendant will be stopped.
+#[cfg(target_os = "linux")]
 fn kill_agent_children() {
     let Some(children) = (|| -> Option<Vec<i32>> {
         let my_pid = std::process::id() as i32;
@@ -463,6 +456,9 @@ fn kill_agent_children() {
         }
         Some(found)
     })() else {
+        tracing::warn!(
+            "agent-child sweep unavailable (/proc unreadable); guarded-connection cleanup may still run"
+        );
         return;
     };
 
@@ -480,8 +476,12 @@ fn kill_agent_children() {
     }
 }
 
-#[cfg(not(unix))]
-fn kill_agent_children() {}
+#[cfg(not(target_os = "linux"))]
+fn kill_agent_children() {
+    tracing::debug!(
+        "agent-child sweep skipped (Linux-only /proc scan); guarded-connection cleanup is platform-specific"
+    );
+}
 
 fn require_non_loopback_auth(
     host: IpAddr,
@@ -497,11 +497,43 @@ fn require_non_loopback_auth(
     Ok(())
 }
 
+/// Log-safe description of the agent command: the executable name and the
+/// argument count only. Agent argv routinely carries credentials
+/// (`--api-key sk-…`), so raw arguments must never reach the logs.
+///
+/// Element 0 is treated with extra care: it is *usually* the program path,
+/// but a mistyped invocation (e.g. `agui-acp-bridge -- --api-key=sk-…`) makes
+/// it a flag token that can itself be the credential. So we log only its file
+/// name (a full path can also carry a token, e.g. `/tmp/sk-…/my-agent`), and
+/// if element 0 starts with `-` it is not a program name at all, so we elide
+/// it rather than echo it back — parsing mistakes belong in an error message,
+/// not in a log line that must stay credential-free.
+fn agent_summary(agent_command: &[String]) -> String {
+    match agent_command.split_first() {
+        Some((bin, args)) => {
+            // ponytail: basename only; no secret-redaction framework —
+            // pattern-matching secret-looking flags is unreliable, the real
+            // fix is that raw argv never reaches the log at all.
+            let name = if bin.starts_with('-') {
+                "<malformed>".to_string()
+            } else {
+                Path::new(bin)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
+                    .to_string()
+            };
+            format!("{name} ({} args)", args.len())
+        }
+        None => "<none>".to_string(),
+    }
+}
+
 fn log_startup(cli: &Cli, addr: SocketAddr) {
     let agent = if cli.in_process {
         "in-process echo agent".to_string()
     } else {
-        cli.agent_command.join(" ")
+        agent_summary(&cli.agent_command)
     };
     tracing::info!(
         addr = %addr,
@@ -656,6 +688,48 @@ mod tests {
         let capabilities = policy.filesystem_capabilities();
         assert!(!capabilities.read_text_file);
         assert!(!capabilities.write_text_file);
+    }
+
+    #[test]
+    fn agent_summary_never_logs_argument_values() {
+        // Agents are routinely launched with inline credentials; the log
+        // summary must expose only the binary name and argument count.
+        let secret = "sk-fake-secret-0123456789abcdef";
+        let cli = Cli::parse_from([
+            "agui-acp-bridge",
+            "--",
+            "./my-agent",
+            "--api-key",
+            secret,
+            "--token",
+            "hunter2",
+        ]);
+        let summary = agent_summary(&cli.agent_command);
+        assert_eq!(summary, "my-agent (4 args)");
+        assert!(!summary.contains(secret));
+        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("--api-key"));
+
+        let empty = Cli::parse_from(["agui-acp-bridge"]);
+        assert_eq!(agent_summary(&empty.agent_command), "<none>");
+    }
+
+    #[test]
+    fn agent_summary_elides_flag_like_element_zero_and_basenames_paths() {
+        // A mistyped invocation (`agui-acp-bridge -- --api-key=sk-…`) makes
+        // the flag token element 0 of `agent_command`; it must never be
+        // echoed verbatim because that token may itself be the credential.
+        let malformed = vec!["--api-key=sk-live-XXXX".to_string(), "extra".to_string()];
+        let summary = agent_summary(&malformed);
+        assert_eq!(summary, "<malformed> (1 args)");
+        assert!(!summary.contains("sk-live-XXXX"));
+        assert!(!summary.contains("--api-key"));
+
+        // A full path in element 0 is reduced to its file name so a token
+        // hidden in a directory component cannot leak either.
+        let summary = agent_summary(&["/tmp/sk-dir-token/my-agent".to_string()]);
+        assert_eq!(summary, "my-agent (0 args)");
+        assert!(!summary.contains("sk-dir-token"));
     }
 
     #[test]

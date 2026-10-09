@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::message_state::MessageState;
 use crate::stream::{SessionModelsInit, SessionModesInit};
@@ -13,6 +13,12 @@ use agui_rs_core::events::{
 };
 use agui_rs_core::types::TextMessageRole;
 use serde_json::json;
+
+/// Cap on concurrently open tool calls the translator tracks for one AG-UI
+/// run. Evicts the oldest when exceeded.
+const MAX_OPEN_TOOL_CALLS: usize = 256;
+/// Cap on tracked suppressed tool-call ids (see `suppressed_ids`).
+const MAX_SUPPRESSED_IDS: usize = 256;
 
 /// Build the AG-UI CUSTOM event a fresh prompt should emit before any agent
 /// updates so the frontend can render mode / model pickers.
@@ -52,6 +58,10 @@ pub struct Translator {
     thought: Option<String>,
     thought_acp_message_id: Option<String>,
     open_tool_calls: HashSet<String>,
+    // ponytail: insertion order of open tool calls, only used to evict the
+    // OLDEST entry when MAX_OPEN_TOOL_CALLS is exceeded. Upgrade to a
+    // proper LRU (e.g. `lru` crate) if access-order eviction ever matters.
+    open_tool_call_order: VecDeque<String>,
     /// Tool titles the agent will report on `session/update` for tool calls
     /// that the bridge is *also* driving via its in-process MCP endpoint.
     /// We suppress those native session-side events so frontend hooks see
@@ -66,7 +76,7 @@ pub struct Translator {
     /// agent's session/update path and were suppressed. Their later
     /// `ToolCallUpdate` events must also be suppressed so we don't emit
     /// stray `TOOL_CALL_END` for an id the frontend never saw.
-    suppressed_ids: HashSet<String>,
+    suppressed_ids: VecDeque<String>,
     /// Last complete plan snapshot, keyed by entry content (ACP exposes no
     /// separate entry id). Only state edges produce AG-UI step events.
     plan_entries: Vec<PlanEntryState>,
@@ -74,9 +84,16 @@ pub struct Translator {
     plan_seen: bool,
     /// Latest raw output for each open tool call. A later ACP snapshot replaces
     /// the earlier value; it is emitted only when the call closes.
+    ///
+    /// Bounded by [`MAX_OPEN_TOOL_CALLS`]: an agent that streams tool calls
+    /// with fresh ids and never closes them cannot grow this map for the
+    /// lifetime of the run. Oldest entries are evicted along with their
+    /// open-call tracking.
     raw_tool_outputs: HashMap<String, serde_json::Value>,
     /// Latest complete raw input for each open tool call. ACP updates replace
     /// this snapshot; AG-UI receives one args payload when the call closes.
+    ///
+    /// Bounded by [`MAX_OPEN_TOOL_CALLS`] like `raw_tool_outputs`.
     raw_tool_inputs: HashMap<String, serde_json::Value>,
 }
 
@@ -127,6 +144,7 @@ impl Translator {
         let tool_name = tool_name.into();
 
         let mut events = self.close_open_messages();
+        events.extend(self.insert_open_tool_call(tool_call_id.clone()));
 
         events.push(Event::ToolCallStart(ToolCallStartEvent {
             tool_call_id: tool_call_id.clone(),
@@ -146,8 +164,60 @@ impl Translator {
             }
         }
 
-        self.open_tool_calls.insert(tool_call_id);
         events
+    }
+
+    /// Track a newly open tool call, evicting the OLDEST open entry when the
+    /// cap is exceeded. An evicted call is closed cleanly: its cached
+    /// raw input/output are dropped with it and its `open_tool_calls` /
+    /// order entries are removed together, and the returned events close the
+    /// evicted call before the replacement call is started.
+    fn insert_open_tool_call(&mut self, tool_call_id: String) -> Vec<Event> {
+        let mut events = Vec::new();
+        if self.open_tool_calls.insert(tool_call_id.clone()) {
+            self.open_tool_call_order.push_back(tool_call_id.clone());
+            while self.open_tool_call_order.len() > MAX_OPEN_TOOL_CALLS {
+                let oldest = self
+                    .open_tool_call_order
+                    .pop_front()
+                    .expect("len just checked above cap");
+                if self.open_tool_calls.remove(&oldest) {
+                    events.extend(self.close_tool_call(&oldest));
+                }
+            }
+        }
+        events
+    }
+
+    fn close_tool_call(&mut self, tool_call_id: &str) -> Vec<Event> {
+        let mut events = Vec::new();
+        if let Some(input) = self.raw_tool_inputs.remove(tool_call_id)
+            && let Some(event) = tool_call_args_event(tool_call_id, &input)
+        {
+            events.push(event);
+        }
+        events.push(Event::ToolCallEnd(ToolCallEndEvent {
+            tool_call_id: tool_call_id.to_string(),
+            base: BaseEventFields::default(),
+        }));
+        if let Some(output) = self.raw_tool_outputs.remove(tool_call_id) {
+            events.push(tool_call_result_event(tool_call_id, &output));
+        }
+        events
+    }
+
+    fn remove_open_tool_call(&mut self, tool_call_id: &str) -> bool {
+        if !self.open_tool_calls.remove(tool_call_id) {
+            return false;
+        }
+        if let Some(position) = self
+            .open_tool_call_order
+            .iter()
+            .position(|id| id == tool_call_id)
+        {
+            self.open_tool_call_order.remove(position);
+        }
+        true
     }
 
     /// Emit an AG-UI `TOOL_CALL_END` for a bridge-driven tool call. Used
@@ -155,17 +225,12 @@ impl Translator {
     /// Idempotent — emits nothing if the id is unknown (the call was
     /// already closed by `flush()` or a prior call).
     pub fn translate_frontend_tool_end(&mut self, tool_call_id: &str) -> Vec<Event> {
-        if !self.open_tool_calls.remove(tool_call_id) {
+        if !self.remove_open_tool_call(tool_call_id) {
             self.raw_tool_inputs.remove(tool_call_id);
             self.raw_tool_outputs.remove(tool_call_id);
             return Vec::new();
         }
-        self.raw_tool_inputs.remove(tool_call_id);
-        self.raw_tool_outputs.remove(tool_call_id);
-        vec![Event::ToolCallEnd(ToolCallEndEvent {
-            tool_call_id: tool_call_id.to_string(),
-            base: BaseEventFields::default(),
-        })]
+        self.close_tool_call(tool_call_id)
     }
 
     pub fn translate(&mut self, update: SessionUpdate) -> Vec<Event> {
@@ -263,22 +328,12 @@ impl Translator {
 
         // Close all open tool calls in stable id order. END must precede the
         // single cached RESULT for each call.
-        let mut tool_ids: Vec<String> = self.open_tool_calls.drain().collect();
+        let mut tool_ids: Vec<String> = self.open_tool_call_order.drain(..).collect();
         tool_ids.sort();
         for tc_id in tool_ids {
-            if let Some(raw_input) = self.raw_tool_inputs.remove(&tc_id)
-                && let Some(event) = tool_call_args_event(&tc_id, &raw_input)
-            {
-                out.push(event);
-            }
-            out.push(Event::ToolCallEnd(ToolCallEndEvent {
-                tool_call_id: tc_id.clone(),
-                base: BaseEventFields::default(),
-            }));
-            if let Some(raw_output) = self.raw_tool_outputs.remove(&tc_id) {
-                out.push(tool_call_result_event(&tc_id, &raw_output));
-            }
+            out.extend(self.close_tool_call(&tc_id));
         }
+        self.open_tool_calls.clear();
         self.raw_tool_inputs.clear();
         self.raw_tool_outputs.clear();
         self.suppressed_ids.clear();
@@ -298,7 +353,17 @@ impl Translator {
         // preserved — the *next* event on the stream (ours, from the MCP
         // path) will then open the canonical TOOL_CALL_* envelope.
         if self.suppressed_titles.contains(&tool_name) {
-            self.suppressed_ids.insert(tool_call_id);
+            // ponytail: FIFO cap on suppressed ids; ids are also pruned on
+            // their terminal update, so this only matters for calls that
+            // never terminate.
+            if !matches!(
+                tc.status,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            ) && !self.suppressed_ids.contains(&tool_call_id)
+                && self.suppressed_ids.len() < MAX_SUPPRESSED_IDS
+            {
+                self.suppressed_ids.push_back(tool_call_id);
+            }
             return self.close_open_messages();
         }
 
@@ -307,17 +372,11 @@ impl Translator {
         // Close open messages before starting a tool call (AG-UI protocol rule)
         events.append(&mut self.close_open_messages());
 
-        // Emit TOOL_CALL_START
-        events.push(Event::ToolCallStart(ToolCallStartEvent {
-            tool_call_id: tool_call_id.clone(),
-            tool_call_name: tool_name,
-            parent_message_id: None,
-            base: BaseEventFields::default(),
-        }));
-
-        // ACP raw_input is a complete replacement snapshot, while AG-UI args
-        // are append-only deltas. Cache it and emit one payload at close so
-        // replacement snapshots can never be concatenated into invalid JSON.
+        let already_open = self.open_tool_calls.contains(&tool_call_id);
+        let terminal = matches!(
+            tc.status,
+            ToolCallStatus::Completed | ToolCallStatus::Failed
+        );
         if let Some(ref raw_input) = tc.raw_input {
             self.raw_tool_inputs
                 .insert(tool_call_id.clone(), raw_input.clone());
@@ -326,25 +385,21 @@ impl Translator {
             self.raw_tool_outputs
                 .insert(tool_call_id.clone(), raw_output.clone());
         }
-
-        if matches!(
-            tc.status,
-            ToolCallStatus::Completed | ToolCallStatus::Failed
-        ) {
-            if let Some(raw_input) = self.raw_tool_inputs.remove(&tool_call_id)
-                && let Some(event) = tool_call_args_event(&tool_call_id, &raw_input)
-            {
-                events.push(event);
+        if !already_open {
+            if !terminal {
+                events.extend(self.insert_open_tool_call(tool_call_id.clone()));
             }
-            events.push(Event::ToolCallEnd(ToolCallEndEvent {
+            // Emit TOOL_CALL_START after any eviction closures.
+            events.push(Event::ToolCallStart(ToolCallStartEvent {
                 tool_call_id: tool_call_id.clone(),
+                tool_call_name: tool_name,
+                parent_message_id: None,
                 base: BaseEventFields::default(),
             }));
-            if let Some(raw_output) = self.raw_tool_outputs.remove(&tool_call_id) {
-                events.push(tool_call_result_event(&tool_call_id, &raw_output));
-            }
-        } else {
-            self.open_tool_calls.insert(tool_call_id);
+        }
+        if terminal {
+            self.remove_open_tool_call(&tool_call_id);
+            events.extend(self.close_tool_call(&tool_call_id));
         }
         events
     }
@@ -365,7 +420,7 @@ impl Translator {
             if let Some(ref status) = update.fields.status
                 && matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed)
             {
-                self.suppressed_ids.remove(&tool_call_id);
+                self.suppressed_ids.retain(|id| id != &tool_call_id);
             }
             return Vec::new();
         }
@@ -391,19 +446,8 @@ impl Translator {
         }
 
         if terminal {
-            self.open_tool_calls.remove(&tool_call_id);
-            if let Some(raw_input) = self.raw_tool_inputs.remove(&tool_call_id)
-                && let Some(event) = tool_call_args_event(&tool_call_id, &raw_input)
-            {
-                events.push(event);
-            }
-            events.push(Event::ToolCallEnd(ToolCallEndEvent {
-                tool_call_id: tool_call_id.clone(),
-                base: BaseEventFields::default(),
-            }));
-            if let Some(raw_output) = self.raw_tool_outputs.remove(&tool_call_id) {
-                events.push(tool_call_result_event(&tool_call_id, &raw_output));
-            }
+            self.remove_open_tool_call(&tool_call_id);
+            events.extend(self.close_tool_call(&tool_call_id));
         }
 
         events
@@ -1731,5 +1775,188 @@ mod tests {
             })
             .collect();
         assert!(kinds.contains(&"start"), "got {kinds:?}");
+    }
+
+    #[test]
+    fn tool_tracking_limit_closes_every_started_call_once() {
+        let mut t = Translator::new();
+        let mut trace = Vec::new();
+        // Push more fresh open calls than the cap. The oldest are evicted
+        // together with their cached raw input/output — no dangling partial
+        // state.
+        for i in 0..(MAX_OPEN_TOOL_CALLS + 64) {
+            let call = ToolCall::new(ToolCallId::new(format!("flood-{i}")), "Read file")
+                .raw_input(serde_json::json!({"i": i}))
+                .raw_output(serde_json::json!({"out": i}));
+            let events = t.translate(SessionUpdate::ToolCall(call));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, Event::ToolCallStart(_)))
+            );
+            trace.extend(events);
+            assert_eq!(t.open_tool_calls.len(), t.open_tool_call_order.len());
+            assert!(t.open_tool_calls.len() <= MAX_OPEN_TOOL_CALLS);
+            assert!(t.raw_tool_inputs.len() <= MAX_OPEN_TOOL_CALLS);
+            assert!(t.raw_tool_outputs.len() <= MAX_OPEN_TOOL_CALLS);
+        }
+
+        let replacement_start = trace.iter().position(|e| matches!(e, Event::ToolCallStart(s) if s.tool_call_id == format!("flood-{MAX_OPEN_TOOL_CALLS}"))).unwrap();
+        let first_end = trace
+            .iter()
+            .position(|e| matches!(e, Event::ToolCallEnd(end) if end.tool_call_id == "flood-0"))
+            .unwrap();
+        assert!(first_end < replacement_start);
+        assert!(
+            matches!(&trace[first_end-1], Event::ToolCallArgs(a) if a.tool_call_id == "flood-0" && a.delta == r#"{"i":0}"#)
+        );
+        assert!(
+            matches!(&trace[first_end+1], Event::ToolCallResult(r) if r.tool_call_id == "flood-0" && r.content == r#"{"out":0}"#)
+        );
+
+        // An evicted id's later terminal update must not resurrect state.
+        let stale = ToolCallUpdate::new(
+            "flood-0",
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        );
+        assert!(t.translate(SessionUpdate::ToolCallUpdate(stale)).is_empty());
+        assert!(!t.open_tool_calls.contains("flood-0"));
+
+        // Flushing the survivors emits one well-formed END per open call,
+        // never a dangling partial envelope.
+        let flushed = t.flush();
+        trace.extend(flushed.clone());
+        assert_eq!(
+            flushed
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCallEnd(_)))
+                .count(),
+            MAX_OPEN_TOOL_CALLS
+        );
+        for end in flushed.iter().filter_map(|event| match event {
+            Event::ToolCallEnd(end) => Some(end.tool_call_id.as_str()),
+            _ => None,
+        }) {
+            assert!(end.starts_with("flood-"));
+        }
+        assert!(t.flush().is_empty(), "flush must be idempotent after flood");
+        for i in 0..(MAX_OPEN_TOOL_CALLS + 64) {
+            let id = format!("flood-{i}");
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|e| matches!(e, Event::ToolCallStart(s) if s.tool_call_id == id))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                trace
+                    .iter()
+                    .filter(|e| matches!(e, Event::ToolCallEnd(e) if e.tool_call_id == id))
+                    .count(),
+                1
+            );
+        }
+
+        let mut frontend = Translator::new();
+        let mut frontend_trace = Vec::new();
+        for i in 0..(MAX_OPEN_TOOL_CALLS + 1) {
+            frontend_trace.extend(frontend.translate_frontend_tool_call(
+                format!("frontend-{i}"),
+                "tool",
+                None,
+            ));
+        }
+        frontend_trace.extend(frontend.flush());
+        assert_eq!(
+            frontend_trace
+                .iter()
+                .filter(|e| matches!(e, Event::ToolCallStart(_)))
+                .count(),
+            MAX_OPEN_TOOL_CALLS + 1
+        );
+        assert_eq!(
+            frontend_trace
+                .iter()
+                .filter(|e| matches!(e, Event::ToolCallEnd(_)))
+                .count(),
+            MAX_OPEN_TOOL_CALLS + 1
+        );
+        let old_end = frontend_trace
+            .iter()
+            .position(|e| matches!(e, Event::ToolCallEnd(end) if end.tool_call_id == "frontend-0"))
+            .unwrap();
+        let new_start = frontend_trace.iter().position(|e| matches!(e, Event::ToolCallStart(start) if start.tool_call_id == format!("frontend-{MAX_OPEN_TOOL_CALLS}"))).unwrap();
+        assert!(old_end < new_start);
+
+        let mut snapshots = Translator::new();
+        let pending =
+            ToolCall::new(ToolCallId::new("repeat"), "tool").raw_input(serde_json::json!({"v":1}));
+        snapshots.translate(SessionUpdate::ToolCall(pending));
+        let completed = ToolCall::new(ToolCallId::new("repeat"), "tool")
+            .status(ToolCallStatus::Completed)
+            .raw_input(serde_json::json!({"v":2}))
+            .raw_output(serde_json::json!({"ok":true}));
+        let closed = snapshots.translate(SessionUpdate::ToolCall(completed));
+        assert!(!closed.iter().any(|e| matches!(e, Event::ToolCallStart(_))));
+        assert!(matches!(
+            closed.as_slice(),
+            [
+                Event::ToolCallArgs(_),
+                Event::ToolCallEnd(_),
+                Event::ToolCallResult(_)
+            ]
+        ));
+        assert!(snapshots.flush().is_empty());
+        assert!(
+            snapshots
+                .translate(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    "repeat",
+                    ToolCallUpdateFields::new().status(ToolCallStatus::Completed)
+                )))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn suppressed_ids_stay_bounded_when_calls_never_terminate() {
+        let mut t = Translator::new();
+        t.set_suppressed_titles(["agui-acp-bridge_say_hello"]);
+        for i in 0..(MAX_SUPPRESSED_IDS + 64) {
+            let tc = ToolCall::new(
+                ToolCallId::new(format!("ghost-{i}")),
+                "agui-acp-bridge_say_hello",
+            );
+            assert!(t.translate(SessionUpdate::ToolCall(tc)).is_empty());
+            assert!(t.suppressed_ids.len() <= MAX_SUPPRESSED_IDS);
+        }
+        let repeated = ToolCall::new(
+            ToolCallId::new(format!("ghost-{}", MAX_SUPPRESSED_IDS + 63)),
+            "agui-acp-bridge_say_hello",
+        );
+        t.translate(SessionUpdate::ToolCall(repeated));
+        assert_eq!(
+            t.suppressed_ids
+                .iter()
+                .filter(|id| id.as_str() == format!("ghost-{}", MAX_SUPPRESSED_IDS + 63))
+                .count(),
+            0
+        );
+        let terminal = ToolCall::new(
+            ToolCallId::new("terminal-ghost"),
+            "agui-acp-bridge_say_hello",
+        )
+        .status(ToolCallStatus::Completed);
+        t.translate(SessionUpdate::ToolCall(terminal));
+        assert!(!t.suppressed_ids.contains(&"terminal-ghost".to_string()));
+        // Terminating a surviving (non-evicted) suppressed id still prunes it.
+        let terminal = ToolCallUpdate::new(
+            format!("ghost-{}", MAX_SUPPRESSED_IDS + 63),
+            ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+        );
+        assert!(
+            t.translate(SessionUpdate::ToolCallUpdate(terminal))
+                .is_empty()
+        );
     }
 }

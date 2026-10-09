@@ -9,6 +9,8 @@ Bridge 把受支持的 ACP turn/update 翻译为 AG-UI 事件，并可选提供�
 
 English: [README.md](./README.md)
 
+安全边界与当前依赖审计提示：[安全说明](./docs/SECURITY_NOTES.md)。
+
 ## 快速开始
 
 启动一个进程内 Echo 网关（不需要外部 Agent 二进制）：
@@ -27,6 +29,8 @@ curl -N -X POST http://127.0.0.1:8080/ \
 ```
 
 七个字段全部必填，camelCase；请发送 `Accept: text/event-stream`（缺省或 `*/*` 按 SSE 处理；显式的 protobuf `Accept` 会返回 `406`）。响应是 SSE 流，依次包含 `RUN_STARTED → TEXT_MESSAGE_START → TEXT_MESSAGE_CONTENT* → TEXT_MESSAGE_END → RUN_FINISHED`。
+
+turn 进行期间，流每 15 秒发出一个名为 `agent:keepalive` 的 `CUSTOM` 事件，避免长时间空闲（长工具调用、等待权限决议）触发代理/负载均衡的 idle 超时。消费端应忽略其 value。其余 bridge `CUSTOM` 事件携带有效数据——`agent:session_init`、`agent:mode_update`、`agent:commands_available`、`agent:usage_update`，以及不透明透传的 `acp.session_update` / `acp.tool_call_raw_output`。
 
 要换成真实 Agent 二进制，把 `--in-process` 换成可执行文件路径即可：
 
@@ -72,13 +76,16 @@ agui-acp-bridge [OPTIONS] [-- AGENT_COMMAND...]
 
 | 路径        | 方法 | 说明                                                          |
 | ----------- | ---- | ------------------------------------------------------------- |
-| `/`         | POST | AG-UI `RunAgentInput` → AG-UI 事件 SSE 流（默认 16 MiB body 上限） |
+| `/`         | POST | AG-UI `RunAgentInput` → AG-UI 事件 SSE 流（16 MiB body 上限，公开 API 无法调整） |
 | `/health`   | GET  | `200 {"status":"ok"}`                                          |
 | `/sessions` | GET  | 通过 ACP `session/list` 列出 Agent 持久化的会话（不支持时返回 `501`） |
 | `/approval` | POST | 决议被 `--policy interrupt` 推迟的权限请求                    |
 | `/session/cancel` | POST | 取消缓存会话的当前 turn（不存在时返回 `404`） |
 | `/session/close` | POST | Agent 声明 `sessionCapabilities.close` 时优雅关闭缓存 ACP 会话 |
 | `/session/delete` | POST | Agent 声明 `sessionCapabilities.delete` 时从 `session/list` 移除持久化会话 |
+
+`POST /` 因会话容量已满而无法接收 run 时返回 `503`；其他会话打开失败返回
+`500`。这是 run 路由的响应，不是 `/approval` 的状态码。
 
 `POST /session/close` 接收 `{ "threadId": "..." }`，并使用初始化阶段返回的
 真实 ACP `SessionId`。成功返回 `204`；无缓存会话返回 `404`；存在 active/queued
@@ -106,7 +113,8 @@ Bridge 生成的 synthetic event 使用自身的 fallback ID。
 当 ACP Agent 声明了 `session/list` 与 `loadSession` 能力时，桥以**无状态**方式透传——自身不存任何历史：
 
 - `GET /sessions` → `{"sessions":[{"sessionId","cwd","title?","updatedAt?"}]}`，其中
-  `sessionId` 是 ACP 身份，不是 AG-UI `threadId`。
+  `sessionId` 是 ACP 身份，不是 AG-UI `threadId`。每次查询会派生一个短生命周期
+  Agent 连接，因此结果缓存 2 秒，并发请求合并为一次查询；错误不缓存。
 - **恢复**会话：选择一个独立的 AG-UI `threadId`，并 POST 一个
   `forwardedProps` 含 `{"acpResume":{"sessionId":"<ACP sessionId>"}}` 的
   run。只有这个 typed marker 会启用私有恢复路径；布尔或格式错误的 marker 返回
@@ -121,15 +129,17 @@ Bridge 生成的 synthetic event 使用自身的 fallback ID。
 `/approval` 请求体与状态码：
 
 ```json
-{ "interruptId": "<STATE_SNAPSHOT 中的 uuid>", "approved": true, "optionId": "allow_once" }
+{ "threadId": "<发起该 run 的 AG-UI threadId>", "interruptId": "<STATE_SNAPSHOT 中的 uuid>", "approved": true, "optionId": "allow_once" }
 ```
+
+查找范围限定在 `threadId` 绑定的活跃会话——pending 权限只能在其所属 thread 上决议。
 
 | 状态                       | 触发条件                                                       |
 | -------------------------- | -------------------------------------------------------------- |
 | `200 OK`                   | 决议送达 session actor                                         |
-| `400 Bad Request`          | `approved=true` 但缺 `optionId`                                |
-| `404 Not Found`            | `interruptId` 不存在（已答复 / 超时 / 从未存在）               |
-| `422 Unprocessable Entity` | `optionId` 不在 agent 候选集中（pending 请求保留以便重试）     |
+| `400 Bad Request`          | 请求体不是合法 JSON，或 `approved=true` 但缺 `optionId`          |
+| `404 Not Found`            | 该 thread 无活跃会话，或 `interruptId` 不存在（已答复 / 超时 / 从未存在） |
+| `422 Unprocessable Entity` | 缺 `threadId` 或其格式非法，或 `optionId` 不在 agent 候选集中（pending 请求保留以便重试） |
 
 ## 权限策略
 
@@ -194,7 +204,8 @@ BridgeAppState::builder(client, PathBuf::from("."))
     .build();
 ```
 
-如果 16 MiB body 上限不合适，调用 `build_router_inner` 自己加 `DefaultBodyLimit` 层即可。
+16 MiB body 上限覆盖所有路由（含 `POST /`），且无法通过公开 API 调整；超限的
+AG-UI 请求体会返回 HTTP 413。
 
 仓库结构：
 

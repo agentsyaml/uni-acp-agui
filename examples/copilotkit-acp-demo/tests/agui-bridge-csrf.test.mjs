@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mock, test } from "bun:test";
+import { approvalRequestBody } from "../src/lib/approval.ts";
 
 // `server-only` is a Next build-time marker and is intentionally not a runtime
 // dependency of this demo. Mock it so this pure bridge contract test can run in Bun.
@@ -116,4 +117,53 @@ test("keeps origin-less CLI and GET requests available", () => {
     ),
     null,
   );
+});
+
+// The bridge's `POST /approval` is thread-scoped: its `ApprovalRequest` has
+// `threadId` as a REQUIRED field, so a body without it is rejected with HTTP
+// 422 (plain text) by the JSON extractor before any handler code runs.
+test("approval body always carries the required threadId", () => {
+  const body = approvalRequestBody({
+    threadId: "thread-1",
+    interruptId: "interrupt-1",
+    approved: true,
+    optionId: "allow_once",
+  });
+
+  assert.deepEqual(body, {
+    threadId: "thread-1",
+    interruptId: "interrupt-1",
+    approved: true,
+    optionId: "allow_once",
+  });
+});
+
+test("approval body is refused instead of posting thread-less (would 422)", () => {
+  assert.equal(
+    approvalRequestBody({
+      threadId: null,
+      interruptId: "interrupt-1",
+      approved: false,
+    }),
+    null,
+  );
+  assert.equal(
+    approvalRequestBody({
+      threadId: "",
+      interruptId: "interrupt-1",
+      approved: false,
+    }),
+    null,
+  );
+});
+
+test("deny request omits optionId from the wire body", () => {
+  const body = approvalRequestBody({
+    threadId: "thread-1",
+    interruptId: "interrupt-1",
+    approved: false,
+  });
+
+  assert.equal(body.optionId, undefined);
+  assert.equal(JSON.stringify(body).includes("optionId"), false);
 });

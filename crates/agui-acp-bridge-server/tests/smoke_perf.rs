@@ -948,7 +948,7 @@ async fn max_sessions_does_not_evict_busy_sessions() {
     let (sa, ba) = a.await.unwrap();
     let (sb, bb) = b.await.unwrap();
     assert_eq!(sa, StatusCode::OK);
-    assert_eq!(sb, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(sb, StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         ba.contains("\"type\":\"RUN_FINISHED\""),
         "busy session A must complete cleanly, not be evicted mid-flight:\n{ba}"
@@ -1002,7 +1002,7 @@ async fn max_sessions_hard_cap_bounds_concurrent_first_use() {
     let mut rejected = 0;
     for task in tasks {
         let (status, _) = task.await.expect("concurrent request task");
-        if status == StatusCode::INTERNAL_SERVER_ERROR {
+        if status == StatusCode::SERVICE_UNAVAILABLE {
             rejected += 1;
         }
     }
@@ -1016,6 +1016,72 @@ async fn max_sessions_hard_cap_bounds_concurrent_first_use() {
         2,
         "concurrent first-use must open at most the configured cap"
     );
+}
+
+#[tokio::test]
+async fn capacity_rejection_is_503_but_open_failure_stays_500() {
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = opens.clone();
+    let state = BridgeAppState::builder(
+        client_for(move |s| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            test_agents::run_slow_prompt_agent(s, 500)
+        }),
+        PathBuf::from("/"),
+    )
+    .with_config(BridgeConfig {
+        max_sessions: 1,
+        ..BridgeConfig::default()
+    })
+    .build();
+    let holder = {
+        let state = state.clone();
+        tokio::spawn(
+            async move { collect_sse_body(state, user_input("holder", "r1", "wait")).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, body) =
+        collect_sse_body(state.clone(), user_input("contender", "r1", "reject")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = holder.await.expect("holder");
+
+    struct FailingOpen;
+    #[async_trait::async_trait]
+    impl AcpClient for FailingOpen {
+        async fn open_session(
+            &self,
+            _: SessionConfig,
+        ) -> Result<agui_acp_bridge_server::AcpSessionHandle, agui_acp_bridge_server::BridgeError>
+        {
+            Err(agui_acp_bridge_server::BridgeError::Unsupported(
+                "ACP_SESSION_CAPACITY ordinary open failure".into(),
+            ))
+        }
+        async fn list_sessions(
+            &self,
+            _: SessionConfig,
+        ) -> Result<Vec<agui_acp_bridge_core::SessionSummary>, agui_acp_bridge_server::BridgeError>
+        {
+            unreachable!()
+        }
+    }
+    let app = build_router(BridgeAppState::new(
+        Arc::new(FailingOpen),
+        PathBuf::from("/"),
+    ));
+    let body = serde_json::to_vec(&user_input("failure", "r1", "fail")).unwrap();
+    let response = tower::ServiceExt::oneshot(
+        app,
+        axum::http::Request::post("/")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]

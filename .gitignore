@@ -3,6 +3,9 @@
 Cargo.lock.bak
 .DS_Store
 
+node_modules/
+dist/
+
 .agents
 .kiro
 .omo

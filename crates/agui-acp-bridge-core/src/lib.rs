@@ -7,6 +7,7 @@ pub mod echo_agent;
 pub mod error;
 pub mod file_ops;
 pub mod frontend_tools;
+mod guarded_transport;
 pub mod message_state;
 pub mod policy;
 pub mod process;

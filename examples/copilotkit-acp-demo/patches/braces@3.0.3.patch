@@ -1,0 +1,89 @@
+diff --git a/node_modules/braces/.bun-tag-7316419491986234 b/.bun-tag-7316419491986234
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/index.js b/index.js
+index d222c13b579d2d476dc26d692219dbaee1665b88..da403814a2a59b9bbd23a6b04f76c43eb368f089 100644
+--- a/index.js
++++ b/index.js
+@@ -4,6 +4,25 @@ const stringify = require('./lib/stringify');
+ const compile = require('./lib/compile');
+ const expand = require('./lib/expand');
+ const parse = require('./lib/parse');
++const MAX_DEPTH = 100;
++
++const assertAstDepth = ast => {
++  const pending = [[ast, 0]];
++  const seen = new WeakSet();
++  while (pending.length) {
++    const [node, depth] = pending.pop();
++    if (depth > MAX_DEPTH + 2) {
++      throw new SyntaxError(`AST exceeds maximum nesting depth of ${MAX_DEPTH}`);
++    }
++    if (!node || typeof node !== 'object' || seen.has(node)) {
++      throw new SyntaxError(`AST exceeds maximum nesting depth of ${MAX_DEPTH}`);
++    }
++    seen.add(node);
++    if (Array.isArray(node.nodes)) {
++      for (const child of node.nodes) pending.push([child, depth + 1]);
++    }
++  }
++};
+ 
+ /**
+  * Expand the given pattern or create a regex-compatible string.
+@@ -75,6 +94,7 @@ braces.stringify = (input, options = {}) => {
+   if (typeof input === 'string') {
+     return stringify(braces.parse(input, options), options);
+   }
++  assertAstDepth(input);
+   return stringify(input, options);
+ };
+ 
+@@ -97,6 +117,7 @@ braces.compile = (input, options = {}) => {
+   if (typeof input === 'string') {
+     input = braces.parse(input, options);
+   }
++  assertAstDepth(input);
+   return compile(input, options);
+ };
+ 
+@@ -121,6 +142,7 @@ braces.expand = (input, options = {}) => {
+   if (typeof input === 'string') {
+     input = braces.parse(input, options);
+   }
++  assertAstDepth(input);
+ 
+   let result = expand(input, options);
+ 
+diff --git a/lib/parse.js b/lib/parse.js
+index 3a6988e629f52aee6609dc5ec290a5e9ff47cecb..29645caec0e6b893bedcae50379bda8aba00830c 100644
+--- a/lib/parse.js
++++ b/lib/parse.js
+@@ -1,6 +1,7 @@
+ 'use strict';
+ 
+ const stringify = require('./stringify');
++const MAX_DEPTH = 100;
+ 
+ /**
+  * Constants
+@@ -143,6 +144,9 @@ const parse = (input, options = {}) => {
+      */
+ 
+     if (value === CHAR_LEFT_PARENTHESES) {
++      if (stack.length > MAX_DEPTH) {
++        throw new SyntaxError(`Input exceeds maximum nesting depth of ${MAX_DEPTH}`);
++      }
+       block = push({ type: 'paren', nodes: [] });
+       stack.push(block);
+       push({ type: 'text', value });
+@@ -195,6 +199,9 @@ const parse = (input, options = {}) => {
+      */
+ 
+     if (value === CHAR_LEFT_CURLY_BRACE) {
++      if (stack.length > MAX_DEPTH) {
++        throw new SyntaxError(`Input exceeds maximum nesting depth of ${MAX_DEPTH}`);
++      }
+       depth++;
+ 
+       const dollar = prev.value && prev.value.slice(-1) === '$' || block.dollar === true;

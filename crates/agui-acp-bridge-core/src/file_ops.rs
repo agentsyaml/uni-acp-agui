@@ -21,6 +21,8 @@
 //! once at construction.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 
 use crate::error::BridgeError;
 
@@ -32,21 +34,20 @@ mod linux_secure_write {
     use std::io;
     use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-    use std::os::raw::{c_char, c_int, c_long, c_uint};
+    use std::os::raw::{c_int, c_uint};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-    const AT_FDCWD: RawFd = -100;
-    const SYS_OPENAT2: c_long = 437;
-
-    const O_RDONLY: c_int = 0;
-    const O_WRONLY: c_int = 1;
-    const O_CREAT: c_int = 0o100;
-    const O_TRUNC: c_int = 0o1000;
-    const O_DIRECTORY: c_int = 0o200000;
-    const O_CLOEXEC: c_int = 0o2000000;
-    const O_PATH: c_int = 0o10000000;
+    const AT_FDCWD: RawFd = libc::AT_FDCWD;
+    const SYS_OPENAT2: libc::c_long = libc::SYS_openat2;
+    const O_RDONLY: libc::c_int = libc::O_RDONLY;
+    const O_WRONLY: libc::c_int = libc::O_WRONLY;
+    const O_CREAT: libc::c_int = libc::O_CREAT;
+    const O_TRUNC: libc::c_int = libc::O_TRUNC;
+    const O_DIRECTORY: libc::c_int = libc::O_DIRECTORY;
+    const O_CLOEXEC: libc::c_int = libc::O_CLOEXEC;
+    const O_PATH: libc::c_int = libc::O_PATH;
 
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
     const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -64,21 +65,14 @@ mod linux_secure_write {
         resolve: u64,
     }
 
-    unsafe extern "C" {
-        fn syscall(number: c_long, ...) -> c_long;
-        fn mkdirat(dirfd: c_int, path: *const c_char, mode: c_uint) -> c_int;
-    }
-
     pub(super) struct RootDirectory {
         fd: OwnedFd,
     }
 
-    // ponytail: retain bindings for the existing `Path` API; an explicit
-    // per-session sandbox owner can replace this registry if teardown matters.
-    static ROOT_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, Arc<RootDirectory>>>> =
+    static ROOT_DIRECTORIES: OnceLock<Mutex<HashMap<PathBuf, Weak<RootDirectory>>>> =
         OnceLock::new();
 
-    fn root_directories() -> &'static Mutex<HashMap<PathBuf, Arc<RootDirectory>>> {
+    fn root_directories() -> &'static Mutex<HashMap<PathBuf, Weak<RootDirectory>>> {
         ROOT_DIRECTORIES.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
@@ -104,7 +98,7 @@ mod linux_secure_write {
         // SAFETY: `path` and `how` remain alive for the syscall, and the
         // kernel writes no memory through either pointer.
         let fd = unsafe {
-            syscall(
+            libc::syscall(
                 SYS_OPENAT2,
                 dirfd,
                 path.as_ptr(),
@@ -124,7 +118,7 @@ mod linux_secure_write {
     fn mkdirat_dir(dirfd: RawFd, path: &Path) -> io::Result<()> {
         let path = path_cstring(path)?;
         // SAFETY: `path` remains alive for the syscall and is NUL-terminated.
-        let result = unsafe { mkdirat(dirfd, path.as_ptr(), 0o777) };
+        let result = unsafe { libc::mkdirat(dirfd, path.as_ptr(), 0o777) };
         if result < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -155,23 +149,29 @@ mod linux_secure_write {
         })
     }
 
-    pub(super) fn initialize_root(cwd: &Path) -> io::Result<()> {
-        let _ = root_for(cwd)?;
-        Ok(())
-    }
-
     pub(super) fn root_for(cwd: &Path) -> io::Result<Arc<RootDirectory>> {
         let mut roots = root_directories()
             .lock()
             .map_err(|_| io::Error::other("sandbox root registry is poisoned"))?;
-        if let Some(root) = roots.get(cwd).cloned() {
+        roots.retain(|_, root| root.strong_count() != 0);
+        if let Some(root) = roots.get(cwd).and_then(Weak::upgrade) {
             return Ok(root);
         }
         let root = Arc::new(RootDirectory {
             fd: open_root(cwd)?,
         });
-        roots.insert(cwd.to_path_buf(), root.clone());
+        roots.insert(cwd.to_path_buf(), Arc::downgrade(&root));
         Ok(root)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_root_paths() -> Vec<PathBuf> {
+        root_directories()
+            .lock()
+            .expect("sandbox root registry is poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub(super) fn supported() -> bool {
@@ -302,8 +302,10 @@ pub(crate) fn write_text_file_supported() -> bool {
     read_text_file_supported()
 }
 
+#[cfg(all(test, not(target_os = "linux")))]
+use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use tokio::sync::Notify;
 
@@ -323,7 +325,11 @@ pub(crate) struct WriteGate {
 #[cfg(test)]
 static TEST_WRITE_GATE: OnceLock<Mutex<Option<Arc<WriteGate>>>> = OnceLock::new();
 
-#[cfg(test)]
+/// Install a write gate. Only the Linux-gated symlink-swap and cancellation
+/// probes drive these; they pair with the `#[cfg(target_os = "linux")]` gate on
+/// those tests, which is why this is gated to Linux as well — on other
+/// platforms the secure-open path does not exist to be probed.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn install_write_gate(gate: Arc<WriteGate>) {
     *TEST_WRITE_GATE
         .get_or_init(|| Mutex::new(None))
@@ -331,7 +337,7 @@ pub(crate) fn install_write_gate(gate: Arc<WriteGate>) {
         .expect("write gate lock") = Some(gate);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_write_gate() {
     if let Some(slot) = TEST_WRITE_GATE.get() {
         *slot.lock().expect("write gate lock") = None;
@@ -360,7 +366,8 @@ pub(crate) struct ReadGate {
 #[cfg(test)]
 static TEST_READ_GATE: OnceLock<Mutex<Option<Arc<ReadGate>>>> = OnceLock::new();
 
-#[cfg(test)]
+/// Install a read gate. See `install_write_gate` for why this is Linux-gated.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn install_read_gate(gate: Arc<ReadGate>) {
     *TEST_READ_GATE
         .get_or_init(|| Mutex::new(None))
@@ -368,7 +375,7 @@ pub(crate) fn install_read_gate(gate: Arc<ReadGate>) {
         .expect("read gate lock") = Some(gate);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_read_gate() {
     if let Some(slot) = TEST_READ_GATE.get() {
         *slot.lock().expect("read gate lock") = None;
@@ -482,16 +489,47 @@ pub fn canonicalize_cwd(cwd: &Path) -> std::io::Result<PathBuf> {
         Err(_) => std::path::absolute(cwd),
     }?;
 
+    Ok(cwd)
+}
+
+/// A strong lease on the filesystem directory identity used by secure file
+/// operations. Keep this alive for the lifetime of a session that uses the
+/// same canonical root across requests; a `PathBuf` alone does not retain that
+/// identity and may refer to a replacement directory later.
+#[must_use = "the lease must stay alive to retain the anchored filesystem root"]
+pub struct FilesystemRootGuard {
+    #[cfg(target_os = "linux")]
+    _root: std::sync::Arc<linux_secure_write::RootDirectory>,
+    #[cfg(not(target_os = "linux"))]
+    _private: (),
+}
+
+/// Pin a canonical filesystem root for a session or other multi-operation
+/// owner. Individual read/write calls also hold an operation lease while in
+/// flight. This does not canonicalize `cwd`; callers must pass the exact
+/// canonical path used for their operations.
+///
+/// ```no_run
+/// # use std::path::Path;
+/// # use agui_acp_bridge_core::file_ops::pin_filesystem_root;
+/// let canonical_cwd = std::fs::canonicalize(".")?;
+/// let _root_lease = pin_filesystem_root(&canonical_cwd)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn pin_filesystem_root(cwd: &Path) -> std::io::Result<FilesystemRootGuard> {
     #[cfg(target_os = "linux")]
     {
-        // Bind the sandbox to the directory object while it is constructed.
-        // A later rename/replace of this path must not make file operations
-        // reopen a different root. If the native primitive is unavailable,
-        // operations fail closed instead of falling back to path-based opens.
-        let _ = linux_secure_write::initialize_root(&cwd);
+        let root = linux_secure_write::root_for(cwd)?;
+        Ok(FilesystemRootGuard { _root: root })
     }
-
-    Ok(cwd)
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cwd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "secure filesystem roots are unsupported on this platform",
+        ))
+    }
 }
 
 /// Return a "clean" form of `cwd` suitable for sending to an ACP agent in
@@ -577,33 +615,18 @@ fn secure_filesystem_error(error: std::io::Error) -> BridgeError {
 }
 
 #[cfg(target_os = "linux")]
-async fn open_secure_read(cwd: &Path, path: &Path) -> Result<tokio::fs::File, BridgeError> {
-    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
-    let cwd = cwd.to_path_buf();
-    let path = path.to_path_buf();
-    let file =
-        tokio::task::spawn_blocking(move || linux_secure_write::open_read(&root, &cwd, &path))
-            .await
-            .map_err(|_| filesystem_io(std::io::Error::other("filesystem operation failed")))?
-            .map_err(secure_filesystem_error)?;
-    Ok(tokio::fs::File::from_std(file))
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn open_secure_read(_cwd: &Path, _path: &Path) -> Result<tokio::fs::File, BridgeError> {
-    Err(BridgeError::Io(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "secure filesystem reads are unsupported on this platform",
-    )))
-}
-
-#[cfg(target_os = "linux")]
-async fn write_to_secure_path(cwd: &Path, path: &Path, content: &str) -> Result<(), BridgeError> {
-    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
+async fn write_to_secure_path(
+    cwd: &Path,
+    path: &Path,
+    content: &str,
+    root: Arc<linux_secure_write::RootDirectory>,
+    permit: Option<crate::session::WorkPermit>,
+) -> Result<(), BridgeError> {
     let cwd = cwd.to_path_buf();
     let path = path.to_path_buf();
     let content = content.to_owned();
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let mut file = linux_secure_write::open(&root, &cwd, &path)?;
         std::io::Write::write_all(&mut file, content.as_bytes())
     })
@@ -617,6 +640,7 @@ async fn write_to_secure_path(
     _cwd: &Path,
     _path: &Path,
     _content: &str,
+    _permit: Option<crate::session::WorkPermit>,
 ) -> Result<(), BridgeError> {
     // ponytail: fail closed outside Linux; enable other targets only with
     // their native descriptor/handle-relative traversal primitive.
@@ -677,20 +701,51 @@ pub async fn read_text_file_range(
     line: Option<usize>,
     limit: Option<usize>,
 ) -> Result<String, BridgeError> {
+    read_text_file_range_with_work(cwd, path, line, limit, None).await
+}
+
+pub(crate) async fn read_text_file_range_with_work(
+    cwd: &Path,
+    path: &str,
+    line: Option<usize>,
+    limit: Option<usize>,
+    permit: Option<crate::session::WorkPermit>,
+) -> Result<String, BridgeError> {
     let start_line = line.unwrap_or(1);
     if start_line == 0 {
         return Err(invalid_params("ACP read line is 1-based"));
     }
 
+    require_absolute(path)?;
+    #[cfg(target_os = "linux")]
+    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
     let full_path = safe_resolve_read(cwd, path)?;
     #[cfg(test)]
     wait_for_read_gate(&full_path).await;
-    let file = open_secure_read(cwd, &full_path).await?;
-    let mut bounded = tokio::io::AsyncReadExt::take(file, (MAX_TEXT_FILE_BYTES + 1) as u64);
-    let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut bytes)
-        .await
-        .map_err(filesystem_io)?;
+    let _cwd = cwd.to_path_buf();
+    let full_path = full_path.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(target_os = "linux")]
+        {
+            let mut file = linux_secure_write::open_read(&root, &_cwd, &full_path)
+                .map_err(secure_filesystem_error)?;
+            let mut bytes = Vec::new();
+            let mut bounded = std::io::Read::take(&mut file, (MAX_TEXT_FILE_BYTES + 1) as u64);
+            std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(filesystem_io)?;
+            Ok::<_, BridgeError>(bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = full_path;
+            Err::<Vec<u8>, _>(BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "secure filesystem reads are unsupported on this platform",
+            )))
+        }
+    })
+    .await
+    .map_err(|_| filesystem_io(std::io::Error::other("filesystem operation failed")))??;
     if bytes.len() > MAX_TEXT_FILE_BYTES {
         return Err(invalid_params("text file exceeds the core size limit"));
     }
@@ -729,14 +784,33 @@ pub async fn read_text_file_range(
 /// an opened `cwd` directory so intermediate symlink swaps cannot redirect
 /// it. Missing parent directories are created relative to that directory.
 pub async fn write_text_file(cwd: &Path, path: &str, content: &str) -> Result<(), BridgeError> {
+    write_text_file_with_work(cwd, path, content, None).await
+}
+
+pub(crate) async fn write_text_file_with_work(
+    cwd: &Path,
+    path: &str,
+    content: &str,
+    permit: Option<crate::session::WorkPermit>,
+) -> Result<(), BridgeError> {
     if content.len() > MAX_TEXT_FILE_BYTES {
         return Err(invalid_params("text file exceeds the core size limit"));
     }
 
+    require_absolute(path)?;
+    #[cfg(target_os = "linux")]
+    let root = linux_secure_write::root_for(cwd).map_err(secure_filesystem_error)?;
     let full_path = safe_resolve_write(cwd, path)?;
     #[cfg(test)]
     wait_for_write_gate(&full_path).await;
-    write_to_secure_path(cwd, &full_path, content).await
+    #[cfg(target_os = "linux")]
+    {
+        write_to_secure_path(cwd, &full_path, content, root, permit).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        write_to_secure_path(cwd, &full_path, content, permit).await
+    }
 }
 
 #[cfg(test)]
@@ -813,6 +887,8 @@ mod tests {
         }
     }
 
+    // ponytail: covers the openat2(RESOLVE_BENEATH) Linux path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_within_cwd_succeeds() {
         let dir = temp_cwd();
@@ -834,6 +910,9 @@ mod tests {
         let root = dir.path().to_path_buf();
         let target = root.join("target.txt");
         std::fs::write(&target, "original").unwrap();
+        let session_lease = pin_filesystem_root(&root).unwrap();
+        let operation_lease = linux_secure_write::root_for(&root).unwrap();
+        let operation_weak = Arc::downgrade(&operation_lease);
 
         let original = root.with_file_name(format!(
             "agui-fileops-root-original-{}",
@@ -862,6 +941,65 @@ mod tests {
             std::fs::read_to_string(root.join("target.txt")).unwrap(),
             "replacement"
         );
+        drop(session_lease);
+        assert!(operation_weak.upgrade().is_some());
+        drop(operation_lease);
+        assert!(operation_weak.upgrade().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_root_survives_replacement_and_churn_releases_roots() {
+        assert!(
+            write_text_file_supported(),
+            "Linux openat2 must be supported"
+        );
+        let prefix = std::env::temp_dir().join(format!("agui-root-churn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let mut retired_roots = Vec::new();
+
+        for index in 0..512 {
+            let raw = prefix.join(format!("nested-{index}"));
+            std::fs::create_dir_all(&raw).unwrap();
+            let root = std::fs::canonicalize(&raw).unwrap();
+            let lease = pin_filesystem_root(&root).unwrap();
+            let weak = linux_secure_write::root_for(&root)
+                .map(|root| Arc::downgrade(&root))
+                .unwrap();
+            let path = root.join("entry.txt").to_string_lossy().into_owned();
+            write_text_file(&root, &path, "live").await.unwrap();
+            assert_eq!(read_text_file(&root, &path, None).await.unwrap(), "live");
+            drop(lease);
+            assert!(
+                weak.upgrade().is_none(),
+                "expired lease retained root {index}"
+            );
+            retired_roots.push(root);
+        }
+
+        let sentinel = prefix.join("sentinel");
+        std::fs::create_dir(&sentinel).unwrap();
+        let sentinel = std::fs::canonicalize(sentinel).unwrap();
+        let _sentinel_lease = pin_filesystem_root(&sentinel).unwrap();
+        let roots = linux_secure_write::cached_root_paths();
+        assert!(
+            roots
+                .iter()
+                .all(|path| !path.starts_with(&prefix) || path == &sentinel)
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                let target = std::fs::read_link(entry.unwrap().path()).unwrap_or_default();
+                assert!(
+                    !retired_roots.iter().any(|root| target.starts_with(root)),
+                    "retired root descriptor remains open: {}",
+                    target.display()
+                );
+            }
+        }
+        std::fs::remove_dir_all(prefix).unwrap();
     }
 
     #[tokio::test]
@@ -916,6 +1054,8 @@ mod tests {
         std::io::Error::new(error.kind(), error.to_string())
     }
 
+    // ponytail: covers the openat2(RESOLVE_BENEATH) Linux path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn oversized_text_file_is_rejected_before_line_buffering() {
         let dir = temp_cwd();
@@ -1217,6 +1357,8 @@ mod tests {
         std::fs::remove_dir_all(outside).unwrap();
     }
 
+    // ponytail: covers the openat2(RESOLVE_BENEATH) Linux path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_limit_counts_lines_and_preserves_multibyte_text() {
         let dir = temp_cwd();
@@ -1227,6 +1369,8 @@ mod tests {
         assert_eq!(out, "one\n世界\n");
     }
 
+    // ponytail: covers the openat2(RESOLVE_BENEATH) Linux path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_line_and_limit_use_one_based_line_ranges() {
         let dir = temp_cwd();
@@ -1246,6 +1390,8 @@ mod tests {
         assert!(result.is_err(), "ACP line numbers are 1-based");
     }
 
+    // ponytail: covers the openat2(RESOLVE_BENEATH) Linux path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_limit_zero_returns_no_lines() {
         let dir = temp_cwd();

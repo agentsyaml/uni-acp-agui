@@ -232,7 +232,13 @@ async fn run_mcp_using_agent(
                         };
 
                     // Echo the tool result back as a text chunk that includes
-                    // a recognisable prefix the test asserts on.
+                    // a recognisable prefix the test asserts on. The
+                    // `TOOL_IS_ERROR` marker surfaces the MCP envelope's
+                    // `isError` flag so error-propagation tests can pin it.
+                    let is_error = call_result
+                        .get("isError")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let echo = call_result
                         .get("content")
                         .and_then(|c| c.as_array())
@@ -244,7 +250,9 @@ async fn run_mcp_using_agent(
                     cx.send_notification(SessionNotification::new(
                         req.session_id.clone(),
                         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                            TextContent::new(format!("TOOL_RESULT={echo}")),
+                            TextContent::new(format!(
+                                "TOOL_RESULT={echo}\nTOOL_IS_ERROR={is_error}"
+                            )),
                         ))),
                     ))?;
 
@@ -454,20 +462,28 @@ fn say_hello_tool() -> Tool {
 }
 
 /// Closure type used by `drive_run` to react to a tool call. Returns a
-/// fresh `Value` on each invocation so the test can express
-/// non-deterministic results.
-type OnToolCall =
-    Box<dyn Fn(String, String, Option<Value>) -> Box<dyn Fn() -> Value + Send> + Send + Sync>;
+/// fresh `(result, is_error)` pair on each invocation so the test can
+/// express non-deterministic results — including *failing* handlers,
+/// which the bridge must surface as an MCP `isError` envelope.
+type OnToolCall = Box<
+    dyn Fn(String, String, Option<Value>) -> Box<dyn Fn() -> (Value, bool) + Send> + Send + Sync,
+>;
 
 /// Subscribe to SSE, parse `data: {...}` lines as events, drive a
 /// `/tool-response` POST when a `TOOL_CALL_END` arrives. Collects all
 /// event types in order and stops when `RUN_FINISHED` or `RUN_ERROR`
 /// arrives, or after the supplied deadline.
+///
+/// Returns the event-type list plus the *agent-visible* text transcript:
+/// every `TEXT_MESSAGE_CONTENT` delta concatenated in order. The mock
+/// agent echoes tool results (and error text) into that transcript via
+/// `TOOL_RESULT=...` / `TOOL_IS_ERROR=...` marker lines, so assertions on
+/// what the agent actually received go through this string.
 async fn drive_run(
     bound: SocketAddr,
     input: &RunAgentInput,
     on_tool_call: OnToolCall,
-) -> Vec<String> {
+) -> (Vec<String>, String) {
     use futures::StreamExt;
 
     let url = format!("http://{}/", bound);
@@ -489,6 +505,8 @@ async fn drive_run(
     let mut events: Vec<String> = Vec::new();
     // Per tool_call_id: the tool name + accumulated args delta.
     let mut active_call: Option<(String, String, String)> = None;
+    // All agent-visible text content, concatenated in arrival order.
+    let mut agent_text = String::new();
 
     let tool_response_url = format!("http://{}/tool-response", bound);
 
@@ -521,6 +539,11 @@ async fn drive_run(
                     .unwrap_or("<no-type>")
                     .to_string();
                 events.push(ty.clone());
+                if ty == "TEXT_MESSAGE_CONTENT"
+                    && let Some(delta) = event.get("delta").and_then(|v| v.as_str())
+                {
+                    agent_text.push_str(delta);
+                }
                 match ty.as_str() {
                     "TOOL_CALL_START" => {
                         let id = event
@@ -552,12 +575,12 @@ async fn drive_run(
                         if let Some((id, name, args)) = active_call.take() {
                             let parsed_args = serde_json::from_str::<Value>(&args).ok();
                             let factory = on_tool_call(id.clone(), name, parsed_args);
-                            let result = factory();
+                            let (result, is_error) = factory();
                             let body = json!({
                                 "threadId": input.thread_id,
                                 "toolCallId": id,
                                 "content": result.to_string(),
-                                "isError": false,
+                                "isError": is_error,
                             });
                             let r = http
                                 .post(&tool_response_url)
@@ -577,18 +600,28 @@ async fn drive_run(
                         // closed the call from its side. Nothing more to
                         // do here; we just continue to RUN_FINISHED.
                     }
-                    "RUN_FINISHED" | "RUN_ERROR" => return events,
+                    "RUN_FINISHED" | "RUN_ERROR" => return (events, agent_text),
                     _ => {}
                 }
             }
         }
     }
 
-    events
+    (events, agent_text)
 }
 
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Extract the value after a `MARKER=` tag in the agent-visible transcript.
+/// Chunks concatenate without separators, so we cannot rely on line splits.
+fn marker_value<'a>(transcript: &'a str, marker: &str) -> Option<&'a str> {
+    let start = transcript.find(marker)? + marker.len();
+    let end = transcript[start..]
+        .find('\n')
+        .map_or(transcript.len(), |i| start + i);
+    Some(&transcript[start..end])
 }
 
 // --------------------------------------------------------------------------
@@ -609,10 +642,10 @@ async fn frontend_tool_round_trip_streams_call_and_returns_browser_result() {
             .unwrap_or("there")
             .to_string();
         let response = format!("hello, {resolved}! (from {name})");
-        Box::new(move || json!({ "echo": response }))
+        Box::new(move || (json!({ "echo": response }), false))
     });
 
-    let events = tokio::time::timeout(
+    let (events, _agent_text) = tokio::time::timeout(
         Duration::from_secs(20),
         drive_run(bound, &input, on_tool_call),
     )
@@ -654,9 +687,10 @@ async fn frontend_tool_is_ready_for_an_immediate_prompt_call() {
     let signals = ImmediateCallSignals::default();
     let (bound, _captured) = spawn_immediate_bridge(signals.clone()).await;
     let input = input_with_tool("thread-ft-immediate", "run-ft-immediate", say_hello_tool());
-    let on_tool_call: OnToolCall = Box::new(|_id, _name, _args| Box::new(|| json!({"ok": true})));
+    let on_tool_call: OnToolCall =
+        Box::new(|_id, _name, _args| Box::new(|| (json!({"ok": true}), false)));
 
-    let (events, (), ()) = tokio::time::timeout(Duration::from_secs(20), async {
+    let ((events, _agent_text), (), ()) = tokio::time::timeout(Duration::from_secs(20), async {
         tokio::join!(
             drive_run(bound, &input, on_tool_call),
             signals.prompt_started.notified(),
@@ -675,9 +709,9 @@ async fn frontend_tool_mcp_url_encodes_special_thread_path_segment() {
     let (bound, captured) = spawn_bridge().await;
     let thread_id = "thread/slash?query#fragment";
     let input = input_with_tool(thread_id, "run-special-path", say_hello_tool());
-    let on_tool_call: OnToolCall = Box::new(|_, _, _| Box::new(|| json!({"ok": true})));
+    let on_tool_call: OnToolCall = Box::new(|_, _, _| Box::new(|| (json!({"ok": true}), false)));
 
-    let events = tokio::time::timeout(
+    let (events, _agent_text) = tokio::time::timeout(
         Duration::from_secs(20),
         drive_run(bound, &input, on_tool_call),
     )
@@ -699,85 +733,150 @@ async fn frontend_tool_mcp_url_encodes_special_thread_path_segment() {
 
 #[tokio::test]
 async fn frontend_tool_call_with_no_active_prompt_returns_mcp_error() {
-    use serde_json::json;
-
+    // The name claims the no-active-prompt `tools/call` branch: a thread
+    // whose tools are registered (entry exists) but whose SSE prompt is
+    // NOT running must get an MCP `isError: true` *result* (HTTP 200,
+    // JSON-RPC ok) with the "no active AG-UI prompt" text — not a
+    // JSON-RPC error and not a hang.
+    //
+    // We create the entry by POSTing a RunAgentInput: the handler stores
+    // the tool list before opening the session, so the registry entry
+    // exists. The mock agent immediately finishes its prompt and the
+    // sender slot clears, leaving no active prompt by the time we call.
     let (bound, _captured) = spawn_bridge().await;
+    let thread_id = "thread-no-active-prompt";
+    let url = format!("http://{}/", bound);
+    let mcp_url = format!("http://{}/mcp/{}", bound, thread_id);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
 
-    // The thread has no active prompt: nobody POSTed `/`. Calling
-    // `/mcp/<thread>` directly must:
-    // - succeed for `initialize`,
-    // - return 404 / unknown-thread for `tools/list` (no entry yet),
-    // - and for `tools/call` after we *create* an entry (empty tool set,
-    //   no active sender) return an MCP-side isError result.
-    //
-    // The simplest way to create a thread entry with no active sender is
-    // to POST a RunAgentInput, immediately drop the SSE stream, and then
-    // attempt to call the MCP endpoint. We instead synthesize the
-    // condition by populating tools but not opening an SSE prompt.
-    //
-    // For this test we call /mcp directly with a known-bad thread, so
-    // unknown-thread is the path we exercise.
-    let mcp_url = format!("http://{}/mcp/no-such-thread", bound);
-    let http = reqwest::Client::builder().build().unwrap();
-    let init = http
+    // Populate the registry entry with `say_hello` (the entry exists,
+    // but nobody is holding an active SSE prompt for the thread).
+    let input = input_with_tool(thread_id, "run-no-active", say_hello_tool());
+    let resp = http
+        .post(&url)
+        .header("Accept", "text/event-stream")
+        .json(&input)
+        .send()
+        .await
+        .expect("post run");
+    drop(resp);
+
+    // initialize first (unknown-thread-friendly), then tools/call.
+    let init: Value = http
         .post(&mcp_url)
         .json(&json!({
-            "jsonrpc":"2.0", "id":1, "method":"initialize",
-            "params": {"protocolVersion":"2024-11-05","capabilities":{}}
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05","capabilities":{}}
         }))
         .send()
         .await
-        .expect("init");
-    assert!(init.status().is_success(), "init status={}", init.status());
-    let init_json: Value = init.json().await.unwrap();
-    assert_eq!(init_json["result"]["serverInfo"]["name"], "agui-acp-bridge");
-
-    let list = http
-        .post(&mcp_url)
-        .json(&json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/list","params":{}
-        }))
-        .send()
+        .expect("init")
+        .json()
         .await
-        .expect("list");
-    // 404 is fine; either NOT_FOUND or the JSON-RPC error envelope is
-    // acceptable for "thread does not exist".
-    let body: Value = list.json().await.unwrap();
+        .expect("parse init");
+    assert!(init.get("result").is_some(), "init must succeed: {init}");
+
+    // Deterministic sync: dropping `resp` does not guarantee the bridge has
+    // cleared its SSE sender slot yet (no sleep-based ordering). If a call
+    // races against the still-live sender it parks on `/tool-response`
+    // instead of returning the no-active-prompt error, so retry the call
+    // until the sender is observed cleared. A bounded deadline means a real
+    // regression fails as an assertion here, not as a transport panic.
+    // ponytail: 2s per attempt (a parked call eats one attempt), 15s budget.
+    let mcp_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let body = loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tools/call never returned the no-active-prompt MCP error within 15s"
+        );
+        let posted = mcp_http
+            .post(&mcp_url)
+            .json(&json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"say_hello","arguments":{"name":"world"}}
+            }))
+            .send()
+            .await;
+        let Ok(response) = posted else {
+            // Transport-level failure (parked call timing out): retry.
+            continue;
+        };
+        let Ok(parsed) = response.json::<Value>().await else {
+            continue; // unparseable mid-teardown response: retry.
+        };
+        // Done only when the sender slot is cleared: JSON-RPC ok whose
+        // result is the no-active-prompt MCP error envelope.
+        let is_expected = parsed.get("error").is_none()
+            && parsed["result"]["isError"] == serde_json::Value::Bool(true)
+            && parsed["result"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("no active"));
+        if is_expected {
+            break parsed;
+        }
+    };
+
+    // The bridge must answer with a *successful* JSON-RPC response whose
+    // result is an MCP error envelope — that is how MCP surfaces tool
+    // failure to the LLM. A JSON-RPC-level error here would be wrong.
     assert!(
-        body.get("error").is_some(),
-        "expected JSON-RPC error for unknown thread, got: {body}"
+        body.get("error").is_none(),
+        "tools/call must not be a JSON-RPC error, got: {body}"
+    );
+    assert_eq!(body["result"]["isError"], true, "got: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("no active"),
+        "error text should mention the missing active prompt, got: {text}"
     );
 }
 
 #[tokio::test]
 async fn frontend_tool_error_response_propagates_as_is_error() {
-    // Spin a fresh bridge but use an agent that just returns whatever
-    // tools/call hands back. The harness's `on_tool_call` posts an
-    // is_error response; we assert the agent's textbook output reflects
-    // it (the MCP isError envelope is rendered in the test agent's
-    // `TOOL_RESULT=...` chunk by virtue of pulling out `content[0].text`,
-    // and the text is exactly what we sent).
+    // The frontend handler returns a *failing* result (is_error=true).
+    // The bridge must convert it into an MCP error envelope — HTTP 200,
+    // JSON-RPC ok, `isError: true` and our content preserved verbatim —
+    // so the agent's LLM sees the failure instead of a success.
     let (bound, _captured) = spawn_bridge().await;
     let input = input_with_tool("thread-ft-err", "run-ft-err", say_hello_tool());
 
     let on_tool_call: OnToolCall = Box::new(|_id, _name, _args| {
-        // Simulate a frontend handler that errored. Our harness only
-        // exposes `is_error: false` via on_tool_call, so we cheat by
-        // POSTing a different shape directly. Wrap into a closure:
-        Box::new(|| json!({"this":"is the result"}))
+        // Simulate a frontend handler that errored.
+        Box::new(|| (json!({"this":"is the result"}), true))
     });
 
-    // Simpler validation: we just verify the standard happy-path here
-    // returned the expected AG-UI lifecycle. is_error propagation has a
-    // dedicated unit test on the MCP endpoint helpers.
-    let events = tokio::time::timeout(
+    let (events, agent_text) = tokio::time::timeout(
         Duration::from_secs(20),
         drive_run(bound, &input, on_tool_call),
     )
     .await
     .expect("test deadlocked");
-    assert!(events.iter().any(|e| e == "TOOL_CALL_START"), "{events:?}");
+
+    assert!(events.iter().any(|e| e == "TOOL_CALL_END"), "{events:?}");
     assert!(events.iter().any(|e| e == "RUN_FINISHED"), "{events:?}");
+
+    // The agent's echo carries the MCP envelope: the failing flag AND the
+    // exact content we posted, surviving the round trip.
+    let result_line = marker_value(&agent_text, "TOOL_RESULT=")
+        .unwrap_or_else(|| panic!("no TOOL_RESULT in agent transcript: {agent_text:?}"));
+    let is_error_line = marker_value(&agent_text, "TOOL_IS_ERROR=")
+        .unwrap_or_else(|| panic!("no TOOL_IS_ERROR in agent transcript: {agent_text:?}"));
+    let payload: Value = serde_json::from_str(result_line).expect("tool result must be valid JSON");
+    assert_eq!(payload["this"], "is the result");
+    assert_eq!(
+        is_error_line.trim_start_matches("TOOL_IS_ERROR="),
+        "true",
+        "agent must see isError=true, transcript: {agent_text:?}"
+    );
 }
 
 #[tokio::test]
@@ -855,7 +954,8 @@ async fn unknown_tool_call_returns_mcp_error() {
 async fn structured_json_result_round_trips_to_agent() {
     // Generative-UI-style tool: handler returns a JSON object, the bridge
     // wraps it as MCP text content. The mock agent re-emits the textual
-    // payload so the test can assert the JSON survived the roundtrip.
+    // payload so the test can assert the JSON survived the roundtrip —
+    // including the `marker` field, proving no truncation/mangling.
     let (bound, _captured) = spawn_bridge().await;
     let input = input_with_tool("thread-genui", "run-genui", say_hello_tool());
 
@@ -868,10 +968,10 @@ async fn structured_json_result_round_trips_to_agent() {
             "echoed": args.unwrap_or(json!({})),
             "marker": "GENUI_OK",
         });
-        Box::new(move || payload.clone())
+        Box::new(move || (payload.clone(), false))
     });
 
-    let events = tokio::time::timeout(
+    let (events, agent_text) = tokio::time::timeout(
         Duration::from_secs(20),
         drive_run(bound, &input, on_tool_call),
     )
@@ -880,36 +980,66 @@ async fn structured_json_result_round_trips_to_agent() {
 
     assert!(events.contains(&"TOOL_CALL_END".into()), "{events:?}");
     assert!(events.contains(&"RUN_FINISHED".into()), "{events:?}");
+
+    // The structured payload must arrive at the agent intact: parseable
+    // as JSON, with both fields present and correct.
+    let result_line = marker_value(&agent_text, "TOOL_RESULT=")
+        .unwrap_or_else(|| panic!("no TOOL_RESULT in agent transcript: {agent_text:?}"));
+    let payload: Value = serde_json::from_str(result_line).unwrap_or_else(|e| {
+        panic!("round-tripped payload must be valid JSON ({e}): {agent_text:?}")
+    });
+    assert_eq!(payload["marker"], "GENUI_OK");
+    assert_eq!(
+        payload["echoed"],
+        json!({"name": "world"}),
+        "args must survive the round trip too"
+    );
 }
 
 #[tokio::test]
 async fn frontend_tool_handler_failure_propagates_as_mcp_error_envelope() {
-    // The browser-side handler throws (we model that as POSTing
-    // is_error=true). The bridge must convert that into an MCP isError
-    // envelope and the agent's `tools/call` should still return cleanly.
+    // The browser-side handler throws (modeled as is_error=true with an
+    // error message). The bridge must convert that into an MCP isError
+    // envelope and the agent's `tools/call` must still return cleanly:
+    // JSON-RPC ok, `isError: true`, and the error message preserved so
+    // the LLM can react to it.
     let (bound, _captured) = spawn_bridge().await;
     let input = input_with_tool("thread-err", "run-err", say_hello_tool());
 
+    const FAILURE_MESSAGE: &str = "FRONTEND_HANDLER_THREW: cannot render widget";
+
     let on_tool_call: OnToolCall = Box::new(|_id, _name, _args| {
-        // The harness's drive_run always sends is_error=false; for this
-        // test we use the lower-level direct POST below. drive_run is
-        // sufficient here because the harness's response body wraps the
-        // value in `content`, which our test agent will surface to text.
-        Box::new(|| json!({"ok": true}))
+        // Model a thrown browser-side handler as an is_error response
+        // carrying the failure message.
+        Box::new(move || (json!(FAILURE_MESSAGE), true))
     });
 
-    let events = tokio::time::timeout(
+    let (events, agent_text) = tokio::time::timeout(
         Duration::from_secs(20),
         drive_run(bound, &input, on_tool_call),
     )
     .await
     .expect("deadlocked");
 
-    // We assert the canonical happy-path arrives — the actual is_error
-    // propagation is unit-tested in `mcp_endpoint::tests::mcp_text_content_shape_matches_spec`
-    // and the integration smoke is enough here.
     assert!(events.contains(&"TOOL_CALL_END".into()), "{events:?}");
     assert!(events.contains(&"RUN_FINISHED".into()), "{events:?}");
+
+    // The failure message must reach the agent verbatim inside the error
+    // envelope, and the envelope must be flagged as an error.
+    let result_line = marker_value(&agent_text, "TOOL_RESULT=")
+        .unwrap_or_else(|| panic!("no TOOL_RESULT in agent transcript: {agent_text:?}"));
+    let message = result_line.trim_matches('"');
+    assert!(
+        message.contains(FAILURE_MESSAGE),
+        "error message must reach the agent verbatim, got: {message:?}"
+    );
+    let is_error_line = marker_value(&agent_text, "TOOL_IS_ERROR=")
+        .unwrap_or_else(|| panic!("no TOOL_IS_ERROR in agent transcript: {agent_text:?}"));
+    assert_eq!(
+        is_error_line.trim_start_matches("TOOL_IS_ERROR="),
+        "true",
+        "handler failure must surface as isError=true"
+    );
 }
 
 #[tokio::test]

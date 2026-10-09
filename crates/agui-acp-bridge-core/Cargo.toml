@@ -22,6 +22,7 @@ agent-client-protocol = { workspace = true }
 agui-rs-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -29,6 +30,9 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 agui-acp-bridge-policy = { path = "../agui-acp-bridge-policy" }

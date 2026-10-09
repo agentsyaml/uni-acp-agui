@@ -256,6 +256,20 @@ unsafe extern "C" {
     fn fchdir(fd: RawFd) -> i32;
 }
 
+pub(crate) fn kill_acp_process_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid)
+        && pid > 0
+    {
+        let result = unsafe { kill_process_group(-pid, SIGKILL) };
+        if result != 0 && io::Error::last_os_error().raw_os_error() != Some(ESRCH) {
+            tracing::debug!(pid, "failed to signal ACP process group");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 #[cfg(target_os = "linux")]
 fn open_approved_unix(root: &Path, canonical: &Path) -> io::Result<std::fs::File> {
     let _ = root;
@@ -304,7 +318,7 @@ fn open_linux_dir(dirfd: RawFd, path: &Path, resolve: u64) -> io::Result<OwnedFd
         resolve,
     };
     let fd = unsafe {
-        syscall(
+        libc::syscall(
             SYS_OPENAT2,
             dirfd,
             path.as_ptr(),
@@ -321,13 +335,13 @@ fn open_linux_dir(dirfd: RawFd, path: &Path, resolve: u64) -> io::Result<OwnedFd
 }
 
 #[cfg(target_os = "linux")]
-const AT_FDCWD: RawFd = -100;
+const AT_FDCWD: RawFd = libc::AT_FDCWD;
 #[cfg(target_os = "linux")]
-const O_DIRECTORY: i32 = 0o200000;
+const O_DIRECTORY: i32 = libc::O_DIRECTORY;
 #[cfg(target_os = "linux")]
-const O_CLOEXEC: i32 = 0o2000000;
+const O_CLOEXEC: i32 = libc::O_CLOEXEC;
 #[cfg(target_os = "linux")]
-const O_PATH: i32 = 0o10000000;
+const O_PATH: i32 = libc::O_PATH;
 #[cfg(target_os = "linux")]
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 #[cfg(target_os = "linux")]
@@ -335,7 +349,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 #[cfg(target_os = "linux")]
 const RESOLVE_BENEATH: u64 = 0x08;
 #[cfg(target_os = "linux")]
-const SYS_OPENAT2: LibcLong = 437;
+const SYS_OPENAT2: LibcLong = libc::SYS_openat2;
 #[cfg(target_os = "linux")]
 #[repr(C)]
 struct OpenHow {
@@ -589,17 +603,22 @@ pub(crate) async fn create_request(
     registry: TerminalRegistry,
     cancellation: RequestCancellation,
     responder: agent_client_protocol::Responder<CreateTerminalResponse>,
+    permit: Option<crate::session::WorkPermit>,
 ) -> Result<(), agent_client_protocol::Error> {
     // fork/exec under the registry's std Mutex is blocking work; keep it off
     // the async dispatch thread without restructuring the lock-around-spawn
     // invariant that makes the per-session cap race-free.
     let created = cancellation
         .run_until_cancelled(async move {
-            let create_result =
-                match tokio::task::spawn_blocking(move || registry.create(&request)).await {
-                    Ok(result) => result,
-                    Err(_) => return Err(wire_error(TerminalError::Internal)),
-                };
+            let create_result = match tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                registry.create(&request)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return Err(wire_error(TerminalError::Internal)),
+            };
             create_result.map_err(wire_error)
         })
         .await;
@@ -1004,7 +1023,7 @@ impl LinuxLeader {
 
     fn kill(&self) -> io::Result<()> {
         let result = unsafe {
-            syscall(
+            libc::syscall(
                 SYS_PIDFD_SEND_SIGNAL,
                 self.pidfd.as_raw_fd(),
                 SIGKILL,
@@ -1021,10 +1040,10 @@ impl LinuxLeader {
 }
 
 #[cfg(target_os = "linux")]
-const SYS_PIDFD_OPEN: LibcLong = 434;
+const SYS_PIDFD_OPEN: LibcLong = libc::SYS_pidfd_open;
 
 #[cfg(target_os = "linux")]
-const SYS_PIDFD_SEND_SIGNAL: LibcLong = 424;
+const SYS_PIDFD_SEND_SIGNAL: LibcLong = libc::SYS_pidfd_send_signal;
 
 #[cfg(target_os = "linux")]
 type LibcLong = std::os::raw::c_long;
@@ -1036,13 +1055,9 @@ struct LinuxSigInfo {
 }
 
 #[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn syscall(number: LibcLong, ...) -> LibcLong;
-}
-
 #[cfg(target_os = "linux")]
 fn pidfd_open(pid: i32) -> io::Result<OwnedFd> {
-    let fd = unsafe { syscall(SYS_PIDFD_OPEN, pid, 0_u32) };
+    let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid, 0_u32) };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -2073,6 +2088,8 @@ fn signal_name(signal: i32) -> String {
 mod tests {
     use super::*;
 
+    // ponytail: covers the fd-bound approved-cwd openat2 path; non-Linux fails closed by design, nothing to assert.
+    #[cfg(target_os = "linux")]
     #[cfg(unix)]
     #[tokio::test]
     async fn approved_cwd_is_fd_bound_across_replacement() {

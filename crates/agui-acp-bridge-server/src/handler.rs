@@ -18,6 +18,7 @@
 //! **same** `thread_id` are rejected at the AG-UI admission boundary. The
 //! DashMaps protect the run claim and lazy-creation races.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -306,6 +307,10 @@ fn acp_failure_run_error(error: &BridgeError) -> Event {
 
 const MIN_BEARER_TOKEN_LEN: usize = 16;
 
+tokio::task_local! {
+    static CAPACITY_REJECTED: Cell<bool>;
+}
+
 fn validate_bearer_token(token: &str) -> Result<(), String> {
     if token.is_empty() {
         return Err("AGUI_ACP_BRIDGE_TOKEN must not be empty".into());
@@ -381,7 +386,14 @@ async fn bridge_security_middleware(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if bearer_token.is_none()
+    let scoped_mcp_post = request.method() == Method::POST
+        && request
+            .uri()
+            .path()
+            .strip_prefix("/mcp/")
+            .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'));
+    if scoped_mcp_post
+        || bearer_token.is_none()
         || is_anonymous_health_probe(&request)
         || has_valid_bearer(
             request.headers(),
@@ -429,7 +441,15 @@ fn guarded_event_stream(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SseSendError {
     Closed,
+    ActorClosed,
     TimedOut,
+}
+
+const RETIRED_SSE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Default)]
+struct RetiredSseDrain {
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// Send one item to the downstream SSE channel without allowing a stalled
@@ -447,6 +467,34 @@ async fn send_sse_with_timeout<T>(
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(SseSendError::Closed),
         Err(_) => Err(SseSendError::TimedOut),
+    }
+}
+
+async fn send_sse_while_session<T>(
+    tx: &mpsc::Sender<T>,
+    item: T,
+    timeout: std::time::Duration,
+    session: &AcpSessionHandle,
+    retired: &mut RetiredSseDrain,
+) -> Result<(), SseSendError> {
+    if !timeout.is_zero() {
+        return send_sse_with_timeout(tx, item, timeout).await;
+    }
+    let send = tx.send(item);
+    tokio::pin!(send);
+    loop {
+        if let Some(deadline) = retired.deadline {
+            tokio::select! {
+                biased;
+                result = &mut send => return result.map_err(|_| SseSendError::Closed),
+                () = tokio::time::sleep_until(deadline) => return Err(SseSendError::ActorClosed),
+            }
+        }
+        tokio::select! {
+            biased;
+            result = &mut send => return result.map_err(|_| SseSendError::Closed),
+            () = session.closed() => retired.deadline = Some(tokio::time::Instant::now() + RETIRED_SSE_DRAIN_GRACE),
+        }
     }
 }
 
@@ -470,9 +518,18 @@ fn log_sse_send_failure(
         SseSendError::Closed => {
             tracing::debug!(thread_id, run_id, stream_kind, "SSE receiver closed");
         }
+        SseSendError::ActorClosed => {
+            tracing::debug!(
+                thread_id,
+                run_id,
+                stream_kind,
+                "ACP actor closed during SSE send"
+            );
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_prompt_sse(
     tx: &mpsc::Sender<AgUiResult<Event>>,
     item: AgUiResult<Event>,
@@ -481,8 +538,9 @@ async fn send_prompt_sse(
     thread_id: &str,
     run_id: &str,
     turn_id: TurnId,
+    retired: &mut RetiredSseDrain,
 ) -> Result<(), SseSendError> {
-    let result = send_sse_with_timeout(tx, item, timeout).await;
+    let result = send_sse_while_session(tx, item, timeout, session, retired).await;
     if let Err(failure) = result {
         log_sse_send_failure(failure, thread_id, run_id, timeout, "prompt");
         if let Err(error) = session.cancel_turn(turn_id) {
@@ -503,8 +561,10 @@ async fn send_history_sse(
     timeout: std::time::Duration,
     thread_id: &str,
     run_id: &str,
+    session: &AcpSessionHandle,
+    retired: &mut RetiredSseDrain,
 ) -> Result<(), SseSendError> {
-    let result = send_sse_with_timeout(tx, item, timeout).await;
+    let result = send_sse_while_session(tx, item, timeout, session, retired).await;
     if let Err(failure) = result {
         log_sse_send_failure(failure, thread_id, run_id, timeout, "history");
     }
@@ -523,11 +583,21 @@ struct SessionEntry {
     /// drop entries with `active_prompts > 0` even if their `last_used` is
     /// stale: a long-running prompt would otherwise be killed mid-flight.
     active_prompts: std::sync::atomic::AtomicUsize,
+    mcp_credential: Option<Arc<McpCredential>>,
+}
+
+struct McpCredential(String);
+
+impl std::fmt::Debug for McpCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("McpCredential([redacted])")
+    }
 }
 
 #[derive(Debug)]
 enum SessionAdmissionError {
     Http(AgUiError),
+    Capacity(String),
     ResumeUnsupported(String),
     ResumeFailed(String),
     ResumeMappingMismatch(String),
@@ -548,13 +618,124 @@ fn semaphore_for(max_sessions: usize) -> Option<Arc<Semaphore>> {
     (max_sessions != 0).then(|| Arc::new(Semaphore::new(max_sessions)))
 }
 
+/// Validate a listed ACP session's cwd for resume, returning the spelling to
+/// hand back to the agent.
+///
+/// Containment is checked against the **canonicalized** path, so a symlink
+/// pointing outside the bridge root is rejected. But the path returned is the
+/// agent's own spelling: `session/load` compares the cwd it is given against
+/// the cwd it persisted, and on a symlinked prefix (macOS `/var` ->
+/// `private/var`, which every `std::env::temp_dir()` path goes through) the
+/// canonical form differs textually, so returning it would fail every resume
+/// with "session/load cwd does not match persisted cwd".
+fn resume_cwd(reported: &Path, root: &Path) -> Result<PathBuf, SessionAdmissionError> {
+    if !reported.is_absolute() {
+        return Err(SessionAdmissionError::ResumeFailed(
+            "listed ACP session has a non-absolute cwd".into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(reported).map_err(|error| {
+        SessionAdmissionError::ResumeFailed(format!(
+            "listed ACP session cwd could not be canonicalized: {error}"
+        ))
+    })?;
+    if !canonical.is_absolute() {
+        return Err(SessionAdmissionError::ResumeFailed(
+            "listed ACP session has a non-absolute cwd".into(),
+        ));
+    }
+    if !canonical.starts_with(root) {
+        return Err(SessionAdmissionError::ResumeFailed(
+            "listed ACP session cwd is outside the bridge root".into(),
+        ));
+    }
+    Ok(reported.to_path_buf())
+}
+
+/// One cached `GET /sessions` snapshot. Bounded by construction: a single
+/// slot holding at most one snapshot. Only successes are cached — errors
+/// return uncached (they still hit the gate, so concurrency stays bounded).
+struct SessionsListCacheEntry {
+    summaries: Vec<agui_acp_bridge_core::SessionSummary>,
+    fetched_at: Instant,
+}
+
+/// How long a `GET /sessions` snapshot may be reused before the next request
+/// re-queries the agent (which forks a subprocess).
+const SESSIONS_LIST_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl Inner {
+    /// Return the sessions list, serving a fresh-enough cache entry when
+    /// available.
+    ///
+    /// Burst protection: all concurrent requests on a cache miss queue behind
+    /// `sessions_list_gate`, then re-check the cache after taking it — so a
+    /// burst of N requests produces at most one concurrent agent
+    /// subprocess (`session/list` forks one). The gate IS the concurrency
+    /// bound; there is no separate semaphore. The call itself is additionally
+    /// bounded by `open_session_timeout`.
+    async fn sessions_list(
+        &self,
+        cfg: SessionConfig,
+    ) -> Result<Vec<agui_acp_bridge_core::SessionSummary>, BridgeError> {
+        if let Some(entry) = self.sessions_list_cache.lock().await.as_ref()
+            && entry.fetched_at.elapsed() < SESSIONS_LIST_CACHE_TTL
+        {
+            return Ok(entry.summaries.clone());
+        }
+        let _gate = self.sessions_list_gate.lock().await;
+        // Re-check under the gate: another waiter likely just fetched.
+        if let Some(entry) = self.sessions_list_cache.lock().await.as_ref()
+            && entry.fetched_at.elapsed() < SESSIONS_LIST_CACHE_TTL
+        {
+            return Ok(entry.summaries.clone());
+        }
+        let client = self.client.clone();
+        let timeout = self.config.open_session_timeout;
+        let summaries = tokio::time::timeout(timeout, client.list_sessions(cfg))
+            .await
+            .map_err(|_| BridgeError::Timeout(timeout))??;
+        *self.sessions_list_cache.lock().await = Some(SessionsListCacheEntry {
+            summaries: summaries.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(summaries)
+    }
+
+    /// Drop any cached `GET /sessions` snapshot so the next request
+    /// re-queries the agent. Called whenever the set of persisted sessions
+    /// can change (open/close/delete) so create-then-list flows stay fresh;
+    /// bursts still collapse because only mutations clear the slot.
+    ///
+    /// Takes `sessions_list_gate` so an invalidation cannot be overtaken by
+    /// an in-flight query writing its PRE-mutation snapshot afterwards (the
+    /// stale-until-TTL hole). Deadlock-safe: `sessions_list` holds the gate
+    /// only across the ACP query and never calls back into any path that
+    /// invalidates, and invalidation itself performs no awaits while holding
+    /// the gate beyond the cache-mutex swap.
+    async fn invalidate_sessions_list_cache(&self) {
+        let _gate = self.sessions_list_gate.lock().await;
+        *self.sessions_list_cache.lock().await = None;
+    }
+}
+
 impl SessionEntry {
+    #[cfg(test)]
     fn new(handle: Arc<AcpSessionHandle>, capacity_permit: Option<OwnedSemaphorePermit>) -> Self {
+        Self::new_scoped(handle, capacity_permit, None)
+    }
+
+    fn new_scoped(
+        handle: Arc<AcpSessionHandle>,
+        capacity_permit: Option<OwnedSemaphorePermit>,
+        mcp_credential: Option<Arc<McpCredential>>,
+    ) -> Self {
         Self {
             handle,
             _capacity_permit: capacity_permit,
             last_used: std::sync::Mutex::new(Instant::now()),
             active_prompts: std::sync::atomic::AtomicUsize::new(0),
+            mcp_credential,
         }
     }
 
@@ -577,6 +758,26 @@ impl SessionEntry {
         self.touch();
         PromptGuard {
             entry: self.clone(),
+        }
+    }
+}
+
+struct OpeningMcpCredential {
+    inner: Arc<Inner>,
+    thread_id: String,
+    credential: Arc<McpCredential>,
+    committed: bool,
+}
+
+impl Drop for OpeningMcpCredential {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self
+                .inner
+                .mcp_credentials
+                .remove_if(&self.thread_id, |_, current| {
+                    Arc::ptr_eq(current, &self.credential)
+                });
         }
     }
 }
@@ -665,6 +866,7 @@ pub struct BridgeAppState {
 
 struct Inner {
     sessions: DashMap<String, Arc<SessionEntry>>,
+    mcp_credentials: DashMap<String, Arc<McpCredential>>,
     /// One mutually-exclusive run/lifecycle claim per thread. Run claims carry
     /// the AG-UI run id; lifecycle claims carry their short operation reason.
     /// The owning guard removes its exact claim conditionally on drop.
@@ -680,6 +882,15 @@ struct Inner {
     /// Serializes the short semaphore/idle-victim selection section. This is
     /// never held across ACP actor creation or handshake.
     capacity_gate: tokio::sync::Mutex<()>,
+    /// Caches `GET /sessions` results so bursts collapse into one
+    /// `session/list` spawn (each one forks a subprocess). Single-slot and
+    /// TTL-bounded; only successes are cached — errors return uncached. The
+    /// `sessions_list_gate` mutex also caps concurrent uncached listings at
+    /// one, which is the actual spawn bound.
+    sessions_list_cache: tokio::sync::Mutex<Option<SessionsListCacheEntry>>,
+    /// Fairness gate for the sessions-list cache; held across the ACP
+    /// `session/list` call (which has its own `open_session_timeout` bound).
+    sessions_list_gate: tokio::sync::Mutex<()>,
     /// Real live-session capacity. `None` is the explicit unlimited mode.
     session_capacity: Option<Arc<Semaphore>>,
     client: Arc<dyn AcpClient>,
@@ -850,6 +1061,7 @@ fn remove_session_if_same(inner: &Inner, thread_id: &str, expected: &Arc<Session
         .sessions
         .remove_if(thread_id, |_, current| Arc::ptr_eq(current, expected));
     if removed.is_some() {
+        revoke_mcp_credential(inner, thread_id, expected);
         inner.frontend_tools.drop_thread(thread_id);
         true
     } else {
@@ -867,11 +1079,20 @@ fn remove_session_if_handle(
     let removed = inner.sessions.remove_if(thread_id, |_, current| {
         Arc::ptr_eq(&current.handle, expected)
     });
-    if removed.is_some() {
+    if let Some((_, entry)) = removed {
+        revoke_mcp_credential(inner, thread_id, &entry);
         inner.frontend_tools.drop_thread(thread_id);
         true
     } else {
         false
+    }
+}
+
+fn revoke_mcp_credential(inner: &Inner, thread_id: &str, entry: &SessionEntry) {
+    if let Some(expected) = &entry.mcp_credential {
+        let _ = inner
+            .mcp_credentials
+            .remove_if(thread_id, |_, current| Arc::ptr_eq(current, expected));
     }
 }
 
@@ -943,10 +1164,13 @@ impl BridgeAppState {
         Self {
             inner: Arc::new(Inner {
                 sessions: DashMap::new(),
+                mcp_credentials: DashMap::new(),
                 active_runs: DashMap::new(),
                 active_settings: DashMap::new(),
                 create_locks: DashMap::new(),
                 capacity_gate: tokio::sync::Mutex::new(()),
+                sessions_list_cache: tokio::sync::Mutex::new(None),
+                sessions_list_gate: tokio::sync::Mutex::new(()),
                 session_capacity: semaphore_for(config.max_sessions),
                 client,
                 cwd,
@@ -1007,8 +1231,11 @@ impl BridgeAppState {
 
     /// List persisted sessions via ACP `session/list`.
     ///
-    /// Stateless pass-through: opens a short-lived ACP connection, queries
-    /// the agent, and returns its summaries. Returns
+    /// Each underlying query opens a short-lived ACP connection (which forks
+    /// a subprocess agent), so results are cached for
+    /// [`SESSIONS_LIST_CACHE_TTL`] and concurrent requests collapse into one
+    /// query. Only successes are cached; errors return uncached but still
+    /// share the single-query concurrency gate. Returns
     /// [`BridgeError::Unsupported`] when the agent does not advertise the
     /// `session/list` capability. The HTTP layer maps that to `501`.
     pub async fn list_sessions(
@@ -1018,12 +1245,7 @@ impl BridgeAppState {
         // (unused) MCP URL slot — listing issues no prompts, so no MCP
         // endpoint is needed.
         let cfg = self.session_config_for("__list__");
-        tokio::time::timeout(
-            self.inner.config.open_session_timeout,
-            self.inner.client.list_sessions(cfg),
-        )
-        .await
-        .map_err(|_| BridgeError::Timeout(self.inner.config.open_session_timeout))?
+        self.inner.sessions_list(cfg).await
     }
 
     async fn validated_resume_cwd(
@@ -1051,75 +1273,56 @@ impl BridgeAppState {
             )));
         };
 
-        let reported_cwd = Path::new(&summary.cwd);
-        if !reported_cwd.is_absolute() {
-            return Err(SessionAdmissionError::ResumeFailed(
-                "listed ACP session has a non-absolute cwd".into(),
-            ));
-        }
-        let canonical_cwd = std::fs::canonicalize(reported_cwd).map_err(|error| {
-            SessionAdmissionError::ResumeFailed(format!(
-                "listed ACP session cwd could not be canonicalized: {error}"
-            ))
-        })?;
-        if !canonical_cwd.is_absolute() {
-            return Err(SessionAdmissionError::ResumeFailed(
-                "listed ACP session has a non-absolute cwd".into(),
-            ));
-        }
-        if !canonical_cwd.starts_with(&self.inner.cwd) {
-            return Err(SessionAdmissionError::ResumeFailed(
-                "listed ACP session cwd is outside the bridge root".into(),
-            ));
-        }
-        Ok(canonical_cwd)
+        resume_cwd(Path::new(&summary.cwd), &self.inner.cwd)
     }
 
-    /// Resolve a deferred permission request for any cached session.
+    /// Resolve a deferred permission request for the session bound to a
+    /// specific thread.
     ///
-    /// Looks up the pending interrupt id across every live session and, if
-    /// found, delivers the decision after validating it against the
-    /// agent-advertised option set (see [`AcpSessionHandle::resolve_permission`]
-    /// for details). Returns:
+    /// The route body supplies `thread_id` — the same thread id that produced
+    /// the pending interrupt — so one client's stale/malicious interrupt id
+    /// can never consume a pending permission parked on a *different* thread
+    /// (the cross-session hole the previous global scan left open). Mirrors
+    /// the thread-scoping of `FrontendToolRegistry::resolve_for_thread`.
+    /// Validates the decision against the agent-advertised option set (see
+    /// [`AcpSessionHandle::resolve_permission`] for details). Returns:
     /// - `ResolveOutcome::Resolved` — the decision was accepted and delivered.
     /// - `ResolveOutcome::InvalidOption` — an `Allow` decision named an
     ///   `option_id` the agent did not offer; the entry remains pending.
-    /// - `ResolveOutcome::NotFound` — no session has a pending permission
-    ///   with that id (already resolved, timed out, or never existed).
+    /// - `ResolveOutcome::NotFound` — the thread has no live session, or no
+    ///   pending permission with that id (already resolved, timed out, or
+    ///   never existed).
     #[must_use]
     pub fn resolve_permission(
         &self,
+        thread_id: &str,
         interrupt_id: &str,
         decision: agui_acp_bridge_core::PermissionDecision,
     ) -> ResolveOutcome {
-        // Quick check: which session (if any) has the entry, and is the
-        // option valid? We do this without consuming the entry first, so an
-        // `InvalidOption` outcome leaves the request retryable.
-        for entry in self.inner.sessions.iter() {
-            let pending = entry.value().handle.pending_permissions();
-            let Some(record) = pending.get(interrupt_id) else {
-                continue;
-            };
-            if let agui_acp_bridge_core::PermissionDecision::Allow { ref option_id } = decision
-                && !record.allows_option(option_id.0.as_ref())
-            {
-                return ResolveOutcome::InvalidOption;
-            }
-            // Drop the read-guard before calling resolve (which takes a
-            // write-guard via DashMap::remove) to avoid deadlock.
-            drop(record);
-            if entry
-                .value()
-                .handle
-                .resolve_permission(interrupt_id, decision)
-            {
-                return ResolveOutcome::Resolved;
-            }
-            // Lost a race against another resolver — fall through to keep
-            // scanning, though in practice the entry is now gone.
+        let Some(entry) = self.inner.sessions.get(thread_id).map(|e| e.clone()) else {
             return ResolveOutcome::NotFound;
+        };
+        // Quick check: is the entry there, and is the option valid? We do
+        // this without consuming the entry first, so an `InvalidOption`
+        // outcome leaves the request retryable.
+        let pending = entry.handle.pending_permissions();
+        let Some(record) = pending.get(interrupt_id) else {
+            return ResolveOutcome::NotFound;
+        };
+        if let agui_acp_bridge_core::PermissionDecision::Allow { ref option_id } = decision
+            && !record.allows_option(option_id.0.as_ref())
+        {
+            return ResolveOutcome::InvalidOption;
         }
-        ResolveOutcome::NotFound
+        // Drop the read-guard before calling resolve (which takes a
+        // write-guard via DashMap::remove) to avoid deadlock.
+        drop(record);
+        if entry.handle.resolve_permission(interrupt_id, decision) {
+            ResolveOutcome::Resolved
+        } else {
+            // Lost a race against another resolver.
+            ResolveOutcome::NotFound
+        }
     }
 
     /// Snapshot the cached `SessionInitState` for an existing thread, or
@@ -1140,6 +1343,7 @@ impl BridgeAppState {
             Arc::ptr_eq(entry, expected) && entry.handle.is_unusable()
         });
         if removed.is_some() {
+            revoke_mcp_credential(&self.inner, thread_id, expected);
             self.inner.frontend_tools.drop_thread(thread_id);
         }
     }
@@ -1412,6 +1616,7 @@ impl BridgeAppState {
         match entry.handle.close().await {
             Ok(()) => {
                 remove_session_if_same(&self.inner, thread_id, &entry);
+                self.inner.invalidate_sessions_list_cache().await;
                 Ok(())
             }
             Err(BridgeError::Unsupported(_)) => {
@@ -1489,10 +1694,12 @@ impl BridgeAppState {
                 entry.touch();
             } else {
                 remove_session_if_same(&self.inner, thread_id, &entry);
+                self.inner.invalidate_sessions_list_cache().await;
             }
             Err(status)
         } else {
             remove_session_if_same(&self.inner, thread_id, &entry);
+            self.inner.invalidate_sessions_list_cache().await;
             Ok(())
         }
     }
@@ -1569,6 +1776,7 @@ impl BridgeAppState {
                             && now.saturating_duration_since(v.last_used()) >= idle
                     });
                     if removed.is_some() {
+                        revoke_mcp_credential(&inner, &key, &victim);
                         tracing::info!(thread_id = %key, "reaping idle ACP session");
                         to_close.push((key, victim, lifecycle_guard));
                     }
@@ -1612,12 +1820,30 @@ impl BridgeAppState {
         Arc::new(self.inner.mcp_allowed_origins.clone())
     }
 
-    fn mcp_headers(&self) -> Vec<HttpHeader> {
-        self.inner
-            .bearer_token
-            .as_ref()
-            .map(|token| vec![HttpHeader::new("Authorization", format!("Bearer {token}"))])
+    /// Headers handed to the ACP agent's MCP HTTP endpoint.
+    ///
+    /// MCP requests use a per-session opening credential, not the bridge's
+    /// admin bearer token. The credential is scoped to this thread's MCP
+    /// endpoint and is revoked when its session is removed.
+    fn mcp_headers(&self, credential: Option<&McpCredential>) -> Vec<HttpHeader> {
+        credential
+            .map(|token| {
+                vec![HttpHeader::new(
+                    "Authorization",
+                    format!("Bearer {}", token.0),
+                )]
+            })
             .unwrap_or_default()
+    }
+
+    pub(crate) fn mcp_credential_valid(&self, thread_id: &str, headers: &HeaderMap) -> bool {
+        if self.inner.bearer_token.is_none() {
+            return true;
+        }
+        let Some(expected) = self.inner.mcp_credentials.get(thread_id) else {
+            return false;
+        };
+        has_valid_bearer(headers, expected.0.as_bytes())
     }
 
     /// Resolve a frontend tool call posted back from the browser in its
@@ -1674,7 +1900,7 @@ impl BridgeAppState {
             .map(|base| format!("{base}/mcp/{}", Self::encode_mcp_path_segment(thread_token)));
         let mcp_headers = mcp_url
             .as_ref()
-            .map(|_| self.mcp_headers())
+            .map(|_| self.mcp_headers(None))
             .unwrap_or_default();
         SessionConfig {
             cwd,
@@ -1686,6 +1912,20 @@ impl BridgeAppState {
         }
     }
 
+    fn session_config_for_open(
+        &self,
+        thread: &str,
+        cwd: PathBuf,
+        load: Option<SessionId>,
+        credential: Option<&McpCredential>,
+    ) -> SessionConfig {
+        let mut config = self.session_config_for_with_cwd(thread, cwd, load);
+        if config.mcp_url.is_some() {
+            config.mcp_headers = self.mcp_headers(credential);
+        }
+        config
+    }
+
     /// Try to reserve one real live-session slot. The short gate protects
     /// idle-victim selection and permit acquisition; it is released before
     /// the ACP handshake begins. An evicted entry may still hold its permit
@@ -1695,12 +1935,34 @@ impl BridgeAppState {
         let Some(semaphore) = self.inner.session_capacity.clone() else {
             return Ok(None);
         };
+        // Fast path WITHOUT the gate or any eviction: if a free permit
+        // exists, take it and leave every cached session alone. Only a pool
+        // at genuine capacity falls through to LRU eviction — a permit-then-
+        // validate caller must never cost an idle session its slot.
+        match semaphore.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(Some(permit)),
+            Err(TryAcquireError::Closed) => return Err("session capacity is unavailable"),
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        self.reserve_session_capacity_with_eviction(&semaphore)
+            .await
+    }
+
+    /// The eviction fallback of [`Self::reserve_session_capacity`], reached
+    /// only when no free permit exists. Removes the least-recently-used idle
+    /// entry that is not claimed by a run, setting, or close operation, then
+    /// retries acquisition.
+    async fn reserve_session_capacity_with_eviction(
+        &self,
+        semaphore: &Arc<Semaphore>,
+    ) -> Result<Option<OwnedSemaphorePermit>, &'static str> {
         let (key, victim, lifecycle_guard) = {
             // The gate protects only selection/removal. Never hold it across
             // the bounded ACP close below, or a slow agent would block every
             // unrelated capacity admission.
             let _capacity_gate = self.inner.capacity_gate.lock().await;
 
+            // Re-check under the gate: another waiter may have freed a slot.
             match semaphore.clone().try_acquire_owned() {
                 Ok(permit) => return Ok(Some(permit)),
                 Err(TryAcquireError::Closed) => {
@@ -1747,6 +2009,7 @@ impl BridgeAppState {
             if removed.is_none() {
                 return Err("session capacity reached: all cached sessions are busy");
             }
+            revoke_mcp_credential(&self.inner, &key, &victim);
             tracing::info!(thread_id = %key, "evicting LRU idle session to honour max_sessions");
             (key, victim, lifecycle_guard)
         };
@@ -1754,14 +2017,13 @@ impl BridgeAppState {
         let _ = graceful_close_removed(&self.inner, &key, victim, lifecycle_guard, "lru-eviction")
             .await;
 
-        match semaphore.try_acquire_owned() {
+        match semaphore.clone().try_acquire_owned() {
             Ok(permit) => Ok(Some(permit)),
             Err(TryAcquireError::Closed | TryAcquireError::NoPermits) => {
                 Err("session capacity reached: all cached sessions are busy")
             }
         }
     }
-
     async fn session_for(
         &self,
         thread_id: &str,
@@ -1826,6 +2088,7 @@ impl BridgeAppState {
         }
 
         let resume_requested = resume.is_some();
+
         let load_cwd = match resume.as_ref() {
             Some(session_id) => match self.validated_resume_cwd(session_id).await {
                 Ok(cwd) => cwd,
@@ -1837,24 +2100,42 @@ impl BridgeAppState {
             None => self.inner.cwd.clone(),
         };
 
-        // Reserve a real live-session permit before opening the ACP actor. The
-        // semaphore/idle-selection gate is released before this handshake, so
-        // a slow agent cannot serialize unrelated first-use requests.
         let capacity_permit = match self.reserve_session_capacity().await {
             Ok(permit) => permit,
             Err(reason) => {
                 self.inner.frontend_tools.drop_thread(thread_id);
-                return Err(SessionAdmissionError::Http(AgUiError::other(format!(
-                    "ACP_SESSION_CAPACITY: {reason}"
-                ))));
+                return Err(SessionAdmissionError::Capacity(reason.to_string()));
             }
         };
 
+        let mut opening_credential =
+            if self.inner.bearer_token.is_some() && self.inner.self_url.is_some() {
+                let credential = Arc::new(McpCredential(uuid::Uuid::new_v4().to_string()));
+                self.inner
+                    .mcp_credentials
+                    .insert(thread_id.to_string(), credential.clone());
+                Some(OpeningMcpCredential {
+                    inner: self.inner.clone(),
+                    thread_id: thread_id.to_string(),
+                    credential,
+                    committed: false,
+                })
+            } else {
+                None
+            };
+
         let handle_result = tokio::time::timeout(
             self.inner.config.open_session_timeout,
-            self.inner
-                .client
-                .open_session(self.session_config_for_with_cwd(thread_id, load_cwd, resume)),
+            self.inner.client.open_session(
+                self.session_config_for_open(
+                    thread_id,
+                    load_cwd,
+                    resume,
+                    opening_credential
+                        .as_ref()
+                        .map(|guard| guard.credential.as_ref()),
+                ),
+            ),
         )
         .await;
 
@@ -1885,10 +2166,21 @@ impl BridgeAppState {
                 });
             }
         };
-        let entry = Arc::new(SessionEntry::new(Arc::new(handle), capacity_permit));
+        let credential = opening_credential
+            .as_ref()
+            .map(|guard| guard.credential.clone());
+        let entry = Arc::new(SessionEntry::new_scoped(
+            Arc::new(handle),
+            capacity_permit,
+            credential,
+        ));
         self.inner
             .sessions
             .insert(thread_id.to_string(), entry.clone());
+        if let Some(guard) = opening_credential.as_mut() {
+            guard.committed = true;
+        }
+        self.inner.invalidate_sessions_list_cache().await;
         Ok(entry)
     }
 }
@@ -1942,12 +2234,14 @@ impl BridgeHandler {
         };
         let translated_buffer = self.state.inner.config.event_buffer.max(1);
         let slow_consumer_timeout = self.state.inner.config.slow_consumer_timeout;
+        let session = prompt_guard.entry.handle.clone();
         Ok(build_history_stream(
             thread_id,
             run_id,
             drain,
             translated_buffer,
             slow_consumer_timeout,
+            session,
             prompt_guard,
             run_guard,
         ))
@@ -2141,6 +2435,14 @@ impl RunHandler for BridgeHandler {
                 // failed admission must remove that speculative state.
                 self.state.inner.frontend_tools.drop_thread(&thread_id);
                 return Err(error);
+            }
+            Err(SessionAdmissionError::Capacity(reason)) => {
+                self.state.inner.frontend_tools.drop_thread(&thread_id);
+                let _ = CAPACITY_REJECTED.try_with(|flag| flag.set(true));
+                return Err(AgUiError::http(
+                    503,
+                    format!("ACP_SESSION_CAPACITY: {reason}"),
+                ));
             }
         };
 
@@ -2354,6 +2656,32 @@ fn build_event_stream(
     prompt_guard: PromptGuard,
     run_guard: RunAdmissionGuard,
 ) -> BoxStream<'static, AgUiResult<Event>> {
+    build_event_stream_with_keepalive(
+        thread_id,
+        run_id,
+        prompt_stream,
+        context,
+        translated_buffer,
+        prompt_guard,
+        run_guard,
+        SSE_KEEPALIVE_INTERVAL,
+    )
+}
+
+// ponytail: the split-out interval parameter exists only so tests can shrink
+// it to milliseconds; threading it through a config struct for that alone
+// would touch every call site for no production benefit.
+#[allow(clippy::too_many_arguments)]
+fn build_event_stream_with_keepalive(
+    thread_id: String,
+    run_id: String,
+    prompt_stream: PromptStream,
+    context: EventStreamContext,
+    translated_buffer: usize,
+    prompt_guard: PromptGuard,
+    run_guard: RunAdmissionGuard,
+    keepalive_interval: std::time::Duration,
+) -> BoxStream<'static, AgUiResult<Event>> {
     let EventStreamContext {
         session,
         state,
@@ -2386,6 +2714,12 @@ fn build_event_stream(
         // draining ACP events until Finished/RunError/disconnect.
         let mut mcp_tool_rx = Some(mcp_tool_rx);
         let session_for_stream = session;
+        // Measure idle time between successful SSE sends, not incoming ACP
+        // updates: suppressed or cached progress may produce no output.
+        // Heartbeats also reset the deadline after delivery so a past
+        // deadline cannot flood the client.
+        let mut keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
+        let mut retired = RetiredSseDrain::default();
 
         if send_prompt_sse(
             &tx,
@@ -2395,6 +2729,7 @@ fn build_event_stream(
             &thread_id,
             &run_id,
             turn_id,
+            &mut retired,
         )
         .await
         .is_err()
@@ -2452,9 +2787,11 @@ fn build_event_stream(
             // and time out on its end. Fair scheduling is required for
             // correctness.
             let item = tokio::select! {
-                acp = events.recv() => match acp {
-                    Some(it) => it,
-                    None => break,
+                acp = events.recv() => {
+                    match acp {
+                        Some(it) => it,
+                        None => break,
+                    }
                 },
                 // Only while the MCP channel is still open. Once every
                 // sender clone is gone mid-run (e.g. a newer overlapping
@@ -2464,13 +2801,39 @@ fn build_event_stream(
                 // Breaking out here would silently discard the remaining
                 // ACP updates for the rest of the turn and lose the
                 // disconnect-cancellation path below.
-                mcp = async { mcp_tool_rx.as_mut().unwrap().recv().await }, if mcp_tool_rx.is_some() => match mcp {
-                    Some(it) => it,
-                    None => {
-                        mcp_tool_rx = None;
-                        continue;
+                mcp = async { mcp_tool_rx.as_mut().unwrap().recv().await }, if mcp_tool_rx.is_some() => {
+                    match mcp {
+                        Some(it) => it,
+                        None => {
+                            mcp_tool_rx = None;
+                            continue;
+                        }
                     }
                 },
+                // SSE keepalive: an idle turn (agent inside a long tool
+                // call) otherwise emits zero bytes and proxy/ALB idle
+                // timeouts (~60s) kill the connection, discarding the
+                // turn's work. See `SSE_KEEPALIVE_INTERVAL`. Re-arm after
+                // a successful send so slow sends cannot flood the client.
+                _ = tokio::time::sleep_until(keepalive_deadline) => {
+                    if send_prompt_sse(
+                        &tx,
+                        Ok(keepalive_event()),
+                        slow_consumer_timeout,
+                        &session_for_stream,
+                        &thread_id,
+                        &run_id,
+                        turn_id,
+                        &mut retired,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
+                    continue;
+                }
                 // Detect client disconnect even while idle. When the SSE
                 // consumer drops, `tx` closes. Without this branch the loop
                 // would park on `events.recv()` / `mcp_tool_rx.recv()` and
@@ -2496,12 +2859,14 @@ fn build_event_stream(
                             &thread_id,
                             &run_id,
                             turn_id,
+                            &mut retired,
                         )
                         .await
                         .is_err()
                         {
                             return;
                         }
+                        keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
                     }
                 }
                 BridgeStreamItem::SessionInit {
@@ -2525,12 +2890,14 @@ fn build_event_stream(
                         &thread_id,
                         &run_id,
                         turn_id,
+                        &mut retired,
                     )
                     .await
                     .is_err()
                     {
                         return;
                     }
+                    keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
                 }
                 BridgeStreamItem::Finished { .. } => {
                     break;
@@ -2567,12 +2934,14 @@ fn build_event_stream(
                         &thread_id,
                         &run_id,
                         turn_id,
+                        &mut retired,
                     )
                     .await
                     .is_err()
                     {
                         return;
                     }
+                    keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
                 }
                 BridgeStreamItem::FrontendToolCall {
                     tool_call_id,
@@ -2600,12 +2969,14 @@ fn build_event_stream(
                             &thread_id,
                             &run_id,
                             turn_id,
+                            &mut retired,
                         )
                         .await
                         .is_err()
                         {
                             return;
                         }
+                        keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
                     }
                 }
                 BridgeStreamItem::FrontendToolEnd { tool_call_id } => {
@@ -2618,12 +2989,14 @@ fn build_event_stream(
                             &thread_id,
                             &run_id,
                             turn_id,
+                            &mut retired,
                         )
                         .await
                         .is_err()
                         {
                             return;
                         }
+                        keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
                     }
                 }
             }
@@ -2638,6 +3011,7 @@ fn build_event_stream(
                 &thread_id,
                 &run_id,
                 turn_id,
+                &mut retired,
             )
             .await
             .is_err()
@@ -2659,6 +3033,7 @@ fn build_event_stream(
                 &thread_id,
                 &run_id,
                 turn_id,
+                &mut retired,
             )
             .await;
             return;
@@ -2684,6 +3059,7 @@ fn build_event_stream(
             &thread_id,
             &run_id,
             turn_id,
+            &mut retired,
         )
         .await;
     });
@@ -2697,26 +3073,57 @@ fn build_event_stream(
 /// no frontend-tool routing is needed (history replay carries no live tool
 /// calls). Both guards keep the session and thread admission alive until the
 /// stream terminates.
+#[allow(clippy::too_many_arguments)]
 fn build_history_stream(
     thread_id: String,
     run_id: String,
     drain_stream: PromptStream,
     translated_buffer: usize,
     slow_consumer_timeout: std::time::Duration,
+    session: Arc<AcpSessionHandle>,
     prompt_guard: PromptGuard,
     run_guard: RunAdmissionGuard,
+) -> BoxStream<'static, AgUiResult<Event>> {
+    build_history_stream_with_keepalive(
+        thread_id,
+        run_id,
+        drain_stream,
+        translated_buffer,
+        slow_consumer_timeout,
+        session,
+        prompt_guard,
+        run_guard,
+        SSE_KEEPALIVE_INTERVAL,
+    )
+}
+
+// ponytail: see build_event_stream_with_keepalive for the parameter note.
+#[allow(clippy::too_many_arguments)]
+fn build_history_stream_with_keepalive(
+    thread_id: String,
+    run_id: String,
+    drain_stream: PromptStream,
+    translated_buffer: usize,
+    slow_consumer_timeout: std::time::Duration,
+    session: Arc<AcpSessionHandle>,
+    prompt_guard: PromptGuard,
+    run_guard: RunAdmissionGuard,
+    keepalive_interval: std::time::Duration,
 ) -> BoxStream<'static, AgUiResult<Event>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<AgUiResult<Event>>(translated_buffer);
 
     tokio::spawn(async move {
         let _prompt_guard = prompt_guard;
         let _run_guard = run_guard;
+        let mut retired = RetiredSseDrain::default();
         if send_history_sse(
             &tx,
             Ok(factory::run_started(thread_id.clone(), run_id.clone())),
             slow_consumer_timeout,
             &thread_id,
             &run_id,
+            &session,
+            &mut retired,
         )
         .await
         .is_err()
@@ -2729,18 +3136,51 @@ fn build_history_stream(
             finished,
         } = drain_stream;
         let mut translator = Translator::new();
+        // Keepalive starts one full interval after creation (so after the
+        // RUN_STARTED send above): `interval`'s first `tick()` completes
+        // immediately, which would emit a stray frame right after the run
+        // header.
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + keepalive_interval,
+            keepalive_interval,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut drain_error: Option<String> = None;
-        while let Some(item) = tokio::select! {
-            item = events.recv() => item,
-            () = tx.closed() => return,
-        } {
+        loop {
+            let item = tokio::select! {
+                item = events.recv() => item,
+                // SSE keepalive for the history replay; see
+                // `SSE_KEEPALIVE_INTERVAL`. Loops back without consuming a
+                // stream item.
+                _ = keepalive.tick() => {
+                    if send_history_sse(&tx, Ok(keepalive_event()), slow_consumer_timeout, &thread_id, &run_id, &session, &mut retired)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                () = tx.closed() => return,
+            };
+            let Some(item) = item else {
+                break;
+            };
             match item {
                 BridgeStreamItem::Update(update) => {
                     for ev in translator.translate(update) {
-                        if send_history_sse(&tx, Ok(ev), slow_consumer_timeout, &thread_id, &run_id)
-                            .await
-                            .is_err()
+                        if send_history_sse(
+                            &tx,
+                            Ok(ev),
+                            slow_consumer_timeout,
+                            &thread_id,
+                            &run_id,
+                            &session,
+                            &mut retired,
+                        )
+                        .await
+                        .is_err()
                         {
                             return;
                         }
@@ -2756,9 +3196,17 @@ fn build_history_stream(
                         models.as_ref(),
                         config_options.as_deref(),
                     );
-                    if send_history_sse(&tx, Ok(ev), slow_consumer_timeout, &thread_id, &run_id)
-                        .await
-                        .is_err()
+                    if send_history_sse(
+                        &tx,
+                        Ok(ev),
+                        slow_consumer_timeout,
+                        &thread_id,
+                        &run_id,
+                        &session,
+                        &mut retired,
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
@@ -2776,9 +3224,17 @@ fn build_history_stream(
 
         // Flush all open messages before the single history terminal event.
         for ev in translator.flush() {
-            if send_history_sse(&tx, Ok(ev), slow_consumer_timeout, &thread_id, &run_id)
-                .await
-                .is_err()
+            if send_history_sse(
+                &tx,
+                Ok(ev),
+                slow_consumer_timeout,
+                &thread_id,
+                &run_id,
+                &session,
+                &mut retired,
+            )
+            .await
+            .is_err()
             {
                 return;
             }
@@ -2810,6 +3266,8 @@ fn build_history_stream(
             slow_consumer_timeout,
             &thread_id,
             &run_id,
+            &session,
+            &mut retired,
         )
         .await;
     });
@@ -2847,6 +3305,34 @@ impl Drop for ClearOnDrop {
 
 const DEFAULT_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
+/// How often an idle SSE stream emits a keepalive frame.
+///
+/// The vendored `agui-rs-server` `sse_body` can only emit encoded AG-UI
+/// `Event`s (`data: {json}\n\n`); a bare SSE `:comment` frame is not
+/// expressible through it. The keepalive is therefore a protocol-legal
+/// `CUSTOM` event (`agent:keepalive`) — the same mechanism the bridge already
+/// uses for `agent:session_init`. It exists purely to defeat proxy/ALB idle
+/// timeouts (~60s) while the agent sits inside a long tool call; consumers
+/// should ignore its value.
+const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Test hook: the keepalive interval for streams created inside tests. Tests
+/// shrink it so cadence assertions run in milliseconds instead of seconds;
+/// production callers go through [`build_event_stream`]/[`build_history_stream`],
+/// which default to [`SSE_KEEPALIVE_INTERVAL`].
+#[cfg(test)]
+fn keepalive_interval_for_tests() -> std::time::Duration {
+    std::time::Duration::from_millis(50)
+}
+
+fn keepalive_event() -> Event {
+    Event::Custom(agui_rs_core::events::CustomEvent {
+        name: "agent:keepalive".to_string(),
+        value: serde_json::Value::Null,
+        base: agui_rs_core::events::BaseEventFields::default(),
+    })
+}
+
 fn invalid_agui_body(message: impl std::fmt::Display) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -2860,7 +3346,8 @@ fn invalid_agui_body(message: impl std::fmt::Display) -> Response {
 /// `agui-rs-server` reads its route body with `to_bytes(..., usize::MAX)`, so
 /// Axum's `DefaultBodyLimit` extractor layer does not constrain the direct
 /// AG-UI route. This middleware is deliberately a body-reading boundary rather
-/// than another extractor layer. It ALWAYS parses and validates the
+/// than another extractor layer — it is the ONLY size enforcement on that
+/// route. It ALWAYS parses and validates the
 /// `RunAgentInput` (keeping invalid inputs out of session admission and
 /// mapping them to HTTP 400) regardless of whether a body `limit` is
 /// configured; only the size check itself is limit-gated.
@@ -2934,8 +3421,22 @@ async fn agui_input_boundary(limit: Option<usize>, request: Request<Body>, next:
         return invalid_agui_body(error);
     }
 
-    next.run(Request::from_parts(parts, Body::from(bytes)))
-        .await
+    let (response, capacity_rejected) = CAPACITY_REJECTED
+        .scope(Cell::new(false), async {
+            let response = next
+                .run(Request::from_parts(parts, Body::from(bytes)))
+                .await;
+            let rejected = CAPACITY_REJECTED.try_with(Cell::get).unwrap_or(false);
+            (response, rejected)
+        })
+        .await;
+    if capacity_rejected && response.status() == StatusCode::INTERNAL_SERVER_ERROR {
+        let (mut parts, body) = response.into_parts();
+        parts.status = StatusCode::SERVICE_UNAVAILABLE;
+        Response::from_parts(parts, body)
+    } else {
+        response
+    }
 }
 
 /// Enforce the bridge's JSON-in / SSE-out media-type boundary on the AG-UI
@@ -3003,27 +3504,34 @@ fn reject_wrong_media_types(headers: &HeaderMap) -> Option<Response> {
 /// histories), build the router yourself by composing
 /// [`build_router_inner`] with your own `DefaultBodyLimit` layer.
 pub fn build_router(state: BridgeAppState) -> axum::Router {
-    build_router_inner_with_agui_body_limit(state, Some(DEFAULT_BODY_LIMIT_BYTES)).layer(
+    build_router_inner_with_agui_body_limit(state, DEFAULT_BODY_LIMIT_BYTES).layer(
         axum::extract::DefaultBodyLimit::max(DEFAULT_BODY_LIMIT_BYTES),
     )
 }
 
-/// Same as [`build_router`] without the request body limit. Compose your
-/// own [`axum::extract::DefaultBodyLimit`] when 16 MiB is wrong for your
-/// deployment.
+/// Same as [`build_router`] without the outer `DefaultBodyLimit` extractor
+/// layer.
+///
+/// The direct AG-UI route is still size-bounded internally: its body-reading
+/// boundary applies the same 16 MiB [`DEFAULT_BODY_LIMIT_BYTES`] cap, because
+/// `agui-rs-server` reads that route with `to_bytes(..., usize::MAX)` and no
+/// extractor layer can constrain it (see [`agui_input_boundary`]). There is
+/// no public way to raise that AG-UI-route cap; a request over the limit is
+/// rejected with HTTP 413.
 pub fn build_router_inner(state: BridgeAppState) -> axum::Router {
-    build_router_inner_with_agui_body_limit(state, None)
+    build_router_inner_with_agui_body_limit(state, DEFAULT_BODY_LIMIT_BYTES)
 }
 
 fn build_router_inner_with_agui_body_limit(
     state: BridgeAppState,
-    agui_body_limit: Option<usize>,
+    agui_body_limit: usize,
 ) -> axum::Router {
     use axum::{Json, extract::State, routing::get, routing::post};
 
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct ApprovalRequest {
+        thread_id: String,
         interrupt_id: String,
         approved: bool,
         option_id: Option<String>,
@@ -3050,7 +3558,7 @@ fn build_router_inner_with_agui_body_limit(
         } else {
             PermissionDecision::Deny
         };
-        match state.resolve_permission(&body.interrupt_id, decision) {
+        match state.resolve_permission(&body.thread_id, &body.interrupt_id, decision) {
             ResolveOutcome::Resolved => axum::http::StatusCode::OK,
             ResolveOutcome::InvalidOption => axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             ResolveOutcome::NotFound => axum::http::StatusCode::NOT_FOUND,
@@ -3332,7 +3840,7 @@ fn build_router_inner_with_agui_body_limit(
     let bearer_token = state.bearer_token();
     agui_rs_server::axum::agui_router(BridgeHandler::new(state))
         .layer(axum::middleware::from_fn(move |request, next| {
-            agui_input_boundary(agui_body_limit, request, next)
+            agui_input_boundary(Some(agui_body_limit), request, next)
         }))
         .merge(aux)
         .layer(axum::middleware::from_fn(move |request, next| {
@@ -3431,10 +3939,13 @@ impl BridgeAppStateBuilder {
         BridgeAppState {
             inner: Arc::new(Inner {
                 sessions: DashMap::new(),
+                mcp_credentials: DashMap::new(),
                 active_runs: DashMap::new(),
                 active_settings: DashMap::new(),
                 create_locks: DashMap::new(),
                 capacity_gate: tokio::sync::Mutex::new(()),
+                sessions_list_cache: tokio::sync::Mutex::new(None),
+                sessions_list_gate: tokio::sync::Mutex::new(()),
                 session_capacity: semaphore_for(self.config.max_sessions),
                 client: self.client,
                 cwd,
@@ -3572,7 +4083,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_headers_carry_token_without_leaking_into_debug() {
+    fn mcp_headers_never_carry_admin_token() {
         let state =
             BridgeAppState::builder(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"))
                 .with_self_url("http://127.0.0.1:8080")
@@ -3580,9 +4091,14 @@ mod tests {
                 .expect("test token is valid")
                 .build();
         let cfg = state.session_config_for("thread");
-        assert_eq!(cfg.mcp_headers.len(), 1);
-        assert_eq!(cfg.mcp_headers[0].name, "Authorization");
-        assert_eq!(cfg.mcp_headers[0].value, format!("Bearer {TEST_TOKEN}"));
+        assert!(
+            cfg.mcp_headers.is_empty(),
+            "transient config has no credential"
+        );
+        let scoped = McpCredential("scoped-token".into());
+        let headers = state.mcp_headers(Some(&scoped));
+        assert_eq!(headers[0].value, "Bearer scoped-token");
+        assert!(!headers[0].value.contains(TEST_TOKEN));
         assert!(!format!("{cfg:?}").contains(TEST_TOKEN));
     }
 
@@ -3604,7 +4120,6 @@ mod tests {
         let app = build_router(authenticated_state());
         let routes = [
             (Method::POST, "/"),
-            (Method::POST, "/mcp/thread"),
             (Method::POST, "/approval"),
             (Method::POST, "/tool-response"),
             (Method::GET, "/sessions"),
@@ -3942,6 +4457,7 @@ mod tests {
             PromptStream { events, finished },
             1,
             Duration::from_secs(30),
+            entry.handle.clone(),
             prompt_guard,
             run_guard,
         );
@@ -4004,6 +4520,160 @@ mod tests {
             Ok(())
         );
         assert_eq!(rx.recv().await, Some(3));
+    }
+
+    async fn disconnectable_test_session() -> (
+        Arc<AcpSessionHandle>,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let disconnect = Arc::new(tokio::sync::Notify::new());
+        let disconnect_agent = disconnect.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
+        let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+            let disconnect = disconnect_agent.clone();
+            let ready_tx = ready_tx.clone();
+            async move {
+                if let Some(tx) = ready_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                tokio::select! {
+                    result = crate::test_agents::run_cancel_aware_slow_agent(stream) => result,
+                    () = disconnect.notified() => Ok(()),
+                }
+            }
+        }));
+        let state = BridgeAppState::new(client, PathBuf::from("/"));
+        let session = Arc::new(
+            state
+                .inner
+                .client
+                .open_session(state.session_config_for("disconnectable"))
+                .await
+                .expect("in-process actor opens"),
+        );
+        (session, disconnect, ready_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_zero_send_unblocks_when_actor_retires() {
+        for prompt_path in [true, false] {
+            let (session, disconnect, agent_ready) = disconnectable_test_session().await;
+            tokio::time::timeout(Duration::from_secs(1), agent_ready)
+                .await
+                .expect("agent runner starts")
+                .expect("ready signal");
+            let turn_id = if prompt_path {
+                Some(
+                    session
+                        .prompt_with_turn("blocked send")
+                        .await
+                        .expect("turn starts")
+                        .1,
+                )
+            } else {
+                None
+            };
+            let (tx, _rx) = mpsc::channel(1);
+            tx.send(Ok(keepalive_event()))
+                .await
+                .expect("fill SSE channel");
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let send_session = session.clone();
+            let mut retired = RetiredSseDrain::default();
+            let task = tokio::spawn(async move {
+                let mut started_tx = Some(started_tx);
+                std::future::poll_fn(|_cx| {
+                    if let Some(signal) = started_tx.take() {
+                        let _ = signal.send(());
+                    }
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if let Some(turn_id) = turn_id {
+                    send_prompt_sse(
+                        &tx,
+                        Ok(keepalive_event()),
+                        Duration::ZERO,
+                        &send_session,
+                        "t",
+                        "r",
+                        turn_id,
+                        &mut retired,
+                    )
+                    .await
+                } else {
+                    send_history_sse(
+                        &tx,
+                        Ok(keepalive_event()),
+                        Duration::ZERO,
+                        "t",
+                        "r",
+                        &send_session,
+                        &mut retired,
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), started_rx)
+                .await
+                .expect("send task reaches helper")
+                .expect("signal");
+            // Polling the helper establishes the full-channel send is pending before actor EOF.
+            tokio::task::yield_now().await;
+            disconnect.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), session.closed())
+                .await
+                .expect("real actor observes agent EOF");
+            assert_eq!(
+                tokio::time::timeout(RETIRED_SSE_DRAIN_GRACE + Duration::from_secs(1), task)
+                    .await
+                    .expect("blocked SSE send unblocks")
+                    .expect("send task")
+                    .unwrap_err(),
+                SseSendError::ActorClosed,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_zero_send_keeps_waiting_for_live_actor() {
+        let (session, _disconnect, agent_ready) = disconnectable_test_session().await;
+        agent_ready.await.expect("agent runner starts");
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(Ok(keepalive_event()))
+            .await
+            .expect("fill SSE channel");
+        let send_session = session.clone();
+        let mut retired = RetiredSseDrain::default();
+        let mut send = tokio::spawn(async move {
+            send_history_sse(
+                &tx,
+                Ok(keepalive_event()),
+                Duration::ZERO,
+                "t",
+                "r",
+                &send_session,
+                &mut retired,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut send)
+                .await
+                .is_err(),
+            "healthy actor must not trigger an arbitrary zero-timeout"
+        );
+        assert!(rx.recv().await.unwrap().is_ok());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), send)
+                .await
+                .expect("send completes after capacity frees")
+                .expect("task"),
+            Ok(())
+        );
+        assert!(rx.recv().await.unwrap().is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4077,6 +4747,128 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_stalled_prompt_releases_claim_after_drain_grace() {
+        let (session, disconnect, agent_ready) = disconnectable_test_session().await;
+        tokio::time::timeout(Duration::from_secs(1), agent_ready)
+            .await
+            .expect("agent runner starts")
+            .expect("ready signal");
+        let (actual_prompt, turn_id) = session
+            .prompt_with_turn("stalled retired stream")
+            .await
+            .expect("prompt starts");
+        let PromptStream {
+            events: actual_events,
+            finished,
+        } = actual_prompt;
+
+        let state =
+            BridgeAppState::builder(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"))
+                .with_config(BridgeConfig {
+                    event_buffer: 1,
+                    slow_consumer_timeout: Duration::ZERO,
+                    ..BridgeConfig::default()
+                })
+                .build();
+        let entry = Arc::new(SessionEntry::new(session.clone(), None));
+        let registry_entry = state.inner.frontend_tools.entry("retired-stall");
+        let frontend_stream = install_frontend_sender(&registry_entry, 1);
+        let prompt_guard = entry.enter_prompt();
+        let run_guard = state
+            .try_claim_run("retired-stall", "stalled-run")
+            .expect("run claim acquired");
+        assert_eq!(entry.active_prompts(), 1);
+        assert!(state.try_claim_run("retired-stall", "overlap").is_none());
+
+        let (events_tx, events) = mpsc::channel(1);
+        let _stream = build_event_stream(
+            "retired-stall".into(),
+            "stalled-run".into(),
+            PromptStream { events, finished },
+            EventStreamContext {
+                session: session.clone(),
+                state: state.clone(),
+                registry_entry,
+                turn_id,
+                frontend_stream,
+            },
+            1,
+            prompt_guard,
+            run_guard,
+        );
+
+        events_tx
+            .send(BridgeStreamItem::SessionInit {
+                modes: None,
+                models: None,
+                config_options: None,
+            })
+            .await
+            .expect("queue first translated event");
+        let queued = tokio::time::timeout(Duration::from_secs(1), events_tx.reserve())
+            .await
+            .expect("stream task consumes first source event")
+            .expect("source event channel remains open");
+        queued.send(BridgeStreamItem::SessionInit {
+            modes: None,
+            models: None,
+            config_options: None,
+        });
+        assert!(matches!(
+            events_tx.try_send(BridgeStreamItem::SessionInit {
+                modes: None,
+                models: None,
+                config_options: None,
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+
+        // The internal output capacity is one: RUN_STARTED occupies it before
+        // the source channel is consumed. The queued source event plus Full
+        // result above prove the forwarding task is stalled behind that slot.
+        tokio::task::yield_now().await;
+        assert_eq!(entry.active_prompts(), 1);
+        assert!(state.try_claim_run("retired-stall", "overlap").is_none());
+
+        disconnect.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), session.closed())
+            .await
+            .expect("real ACP actor observes fixture EOF");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if let Some(claim) = state.try_claim_run("retired-stall", "early") {
+                        return claim;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "claim must remain held during retired-stream drain grace"
+        );
+
+        let claim = tokio::time::timeout(RETIRED_SSE_DRAIN_GRACE + Duration::from_secs(1), async {
+            loop {
+                if let Some(claim) = state.try_claim_run("retired-stall", "after-retirement") {
+                    return claim;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired stalled stream releases same-thread run claim");
+        assert_eq!(
+            entry.active_prompts(),
+            0,
+            "PromptGuard released on actor retirement"
+        );
+        drop(claim);
+        drop(_stream);
+        drop(actual_events);
+    }
+
     #[tokio::test]
     async fn stale_cleanup_does_not_remove_replacement_session() {
         let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
@@ -4118,5 +4910,552 @@ mod tests {
             &replacement_entry
         ));
         assert!(!state.inner.sessions.contains_key("race"));
+    }
+
+    /// Agent whose `session/list` counts calls and returns a fixed summary.
+    struct ListCountingClient {
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpClient for ListCountingClient {
+        async fn open_session(&self, cfg: SessionConfig) -> Result<AcpSessionHandle, BridgeError> {
+            InProcessAcpClient::new().open_session(cfg).await
+        }
+
+        async fn list_sessions(
+            &self,
+            _cfg: SessionConfig,
+        ) -> Result<Vec<agui_acp_bridge_core::SessionSummary>, BridgeError> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![agui_acp_bridge_core::SessionSummary {
+                session_id: "listed-session".into(),
+                cwd: "/".into(),
+                title: None,
+                updated_at: None,
+            }])
+        }
+    }
+
+    /// FIX 2 regression: N concurrent `GET /sessions` must collapse into ONE
+    /// `session/list` spawn (each spawn forks an agent subprocess).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_session_listings_collapse_into_one_spawn() {
+        let client = Arc::new(ListCountingClient {
+            lists: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let state = BridgeAppState::new(client.clone(), PathBuf::from("/"));
+
+        let mut tasks = Vec::new();
+        for _ in 0..25 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move { state.list_sessions().await }));
+        }
+        for task in tasks {
+            task.await.expect("list task").expect("listing succeeds");
+        }
+        assert_eq!(
+            client.lists.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "25 concurrent listings must produce exactly one agent query"
+        );
+
+        // Errors are NOT cached: an Unsupported agent keeps failing (and the
+        // gate still bounds concurrency), so callers see the real error.
+        let unsupported =
+            BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
+        assert!(unsupported.list_sessions().await.is_err());
+        assert!(unsupported.list_sessions().await.is_err());
+    }
+
+    /// Resume validation may list before capacity admission, but the listing
+    /// remains globally single-flight and a rejected request cannot evict a
+    /// busy session or open an actor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_validates_before_capacity_rejection_without_open_or_eviction() {
+        // Client that counts every `session/list`: the resume path uses it.
+        let client = Arc::new(ListCountingClient {
+            lists: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let state = BridgeAppState::builder(client.clone(), PathBuf::from("/"))
+            .with_config(BridgeConfig {
+                max_sessions: 1,
+                ..BridgeConfig::default()
+            })
+            .build();
+
+        // Fill the single capacity slot out-of-band.
+        let handle = Arc::new(
+            state
+                .inner
+                .client
+                .open_session(state.session_config_for("filler"))
+                .await
+                .expect("filler session opens"),
+        );
+        let permit = state
+            .reserve_session_capacity()
+            .await
+            .expect("capacity is free")
+            .expect("one permit available");
+        let s1 = Arc::new(SessionEntry::new(handle, Some(permit)));
+        state.inner.sessions.insert("filler".into(), s1.clone());
+        // Mark the slot busy so LRU eviction cannot free it: only then does a
+        // second resume hit the hard capacity wall instead of evicting.
+        let _prompt_guard = s1.enter_prompt();
+
+        // The valid marker is checked first; the full busy pool then rejects
+        // admission without an open or eviction.
+        let error = state
+            .session_for_resume(
+                "resume-thread",
+                Some(SessionId::from("listed-session".to_string())),
+            )
+            .await
+            .expect_err("capacity is exhausted");
+        assert!(
+            matches!(error, SessionAdmissionError::Capacity(_)),
+            "expected capacity rejection, got: {error:?}"
+        );
+        assert_eq!(
+            client.lists.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "resume validation should perform one bounded listing"
+        );
+        assert_eq!(state.session_count(), 1, "busy session must remain cached");
+        assert!(state.inner.sessions.contains_key("filler"));
+    }
+
+    /// #4 regression: when a free permit exists, capacity reservation must
+    /// NOT evict an idle session — the two-step fast path takes the permit
+    /// before any LRU victim selection runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_fast_path_never_evicts_an_idle_session() {
+        let state =
+            BridgeAppState::builder(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"))
+                .with_config(BridgeConfig {
+                    max_sessions: 2,
+                    ..BridgeConfig::default()
+                })
+                .build();
+
+        // Park one idle (unclaimed) session.
+        let handle = state
+            .inner
+            .client
+            .open_session(state.session_config_for("idle-victim"))
+            .await
+            .expect("idle victim opens");
+        state.inner.sessions.insert(
+            "idle-victim".into(),
+            Arc::new(SessionEntry::new(Arc::new(handle), None)),
+        );
+
+        // The pool has a free slot: acquiring it must leave the idle session
+        // cached, not evict it to make room.
+        let permit = state
+            .reserve_session_capacity()
+            .await
+            .expect("a free permit exists")
+            .expect("one permit available");
+        drop(permit);
+        assert_eq!(state.session_count(), 1, "fast path must not evict");
+        assert!(
+            state.inner.sessions.contains_key("idle-victim"),
+            "an idle cached session must survive a free-permit acquisition"
+        );
+    }
+
+    /// FIX 6 regression: `resolve_permission` only resolves within the
+    /// supplied thread. Drives the real in-process permission agent so a
+    /// genuine pending interrupt exists on one thread, then proves a
+    /// resolution attempt from another thread leaves it untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approval_resolution_is_thread_scoped() {
+        use agui_acp_bridge_policy::InterruptViaAgUiEvent;
+
+        let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(|stream| {
+            Box::pin(crate::test_agents::run_request_permission_agent(stream))
+        }));
+        let state = BridgeAppState::builder(client, PathBuf::from("/"))
+            .with_policy(Arc::new(InterruptViaAgUiEvent))
+            .build();
+
+        // A real prompt defers a permission request into the live session.
+        let session = Arc::new(
+            state
+                .inner
+                .client
+                .open_session(state.session_config_for("owner-thread"))
+                .await
+                .expect("session opens"),
+        );
+        let entry = Arc::new(SessionEntry::new(session.clone(), None));
+        state.inner.sessions.insert("owner-thread".into(), entry);
+        let (_prompt_stream, _turn) = session
+            .prompt_with_turn("request a permission")
+            .await
+            .expect("prompt opens");
+        // The policy mints a uuid interrupt id; grab whatever is pending.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let pending_id = session
+            .pending_permissions()
+            .iter()
+            .next()
+            .map(|entry| entry.key().clone())
+            .expect("agent must park a pending permission");
+
+        // Wrong thread: must NOT consume the interrupt…
+        let outcome = state.resolve_permission(
+            "other-thread",
+            &pending_id,
+            agui_acp_bridge_core::PermissionDecision::Deny,
+        );
+        assert_eq!(outcome, ResolveOutcome::NotFound);
+        assert!(
+            session.pending_permissions().contains_key(&pending_id),
+            "cross-thread approval must not consume another thread's pending permission"
+        );
+
+        // Right thread: resolves.
+        let outcome = state.resolve_permission(
+            "owner-thread",
+            &pending_id,
+            agui_acp_bridge_core::PermissionDecision::Deny,
+        );
+        assert_eq!(outcome, ResolveOutcome::Resolved);
+        assert!(!session.pending_permissions().contains_key(&pending_id));
+    }
+
+    /// Keepalive regression test: an idle stream must emit keepalives at
+    /// roughly the configured cadence AND must not flood — one frame per
+    /// interval, re-armed by every tick, over a window of several intervals.
+    /// Uses the ~50ms test interval so the whole run is well under a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_event_stream_emits_keepalives_at_cadence_without_flooding() {
+        let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(|stream| {
+            Box::pin(crate::test_agents::run_long_running_agent(stream))
+        }));
+        let state = BridgeAppState::builder(client, PathBuf::from("/"))
+            .with_config(BridgeConfig {
+                slow_consumer_timeout: Duration::from_secs(10),
+                ..BridgeConfig::default()
+            })
+            .build();
+        let session = Arc::new(
+            state
+                .inner
+                .client
+                .open_session(state.session_config_for("keepalive"))
+                .await
+                .expect("session opens"),
+        );
+        let (prompt_stream, turn_id) = session
+            .prompt_with_turn("never finishes soon")
+            .await
+            .expect("prompt opens");
+        let entry = Arc::new(SessionEntry::new(session.clone(), None));
+        let registry_entry = state.inner.frontend_tools.entry("keepalive");
+        let frontend_stream = install_frontend_sender(&registry_entry, 16);
+        let prompt_guard = entry.enter_prompt();
+        let run_guard = state.try_claim_run("keepalive", "run-ka").expect("claim");
+
+        let interval = keepalive_interval_for_tests();
+        let mut stream = build_event_stream_with_keepalive(
+            "keepalive".into(),
+            "run-ka".into(),
+            prompt_stream,
+            EventStreamContext {
+                session,
+                state: state.clone(),
+                registry_entry,
+                turn_id,
+                frontend_stream,
+            },
+            16,
+            prompt_guard,
+            run_guard,
+            interval,
+        );
+
+        // Observe keepalives over an idle window of ~4 intervals. Cadence:
+        // an idle turn emits one frame per interval (± one tick of jitter).
+        let window = interval * 4;
+        let mut keepalive_count = 0usize;
+        let _first_keepalive = tokio::time::timeout(window, async {
+            loop {
+                let event = tokio::time::timeout(interval * 3, stream.next())
+                    .await
+                    .expect("idle stream must produce events")
+                    .expect("event decodes")
+                    .expect("keepalive probe event");
+                if let Event::Custom(custom) = event
+                    && custom.name == "agent:keepalive"
+                {
+                    return custom;
+                }
+            }
+        })
+        .await
+        .expect("first keepalive within the window");
+        keepalive_count += 1;
+
+        // Flood check: after the first tick, count keepalives for another
+        // ~4 intervals. A re-armed deadline yields ≈1 per interval; the #2
+        // bug (missing re-arm) yields an unbounded flood instead.
+        let flood_window_end = tokio::time::Instant::now() + interval * 4;
+        while tokio::time::Instant::now() < flood_window_end {
+            let event = tokio::time::timeout(interval * 3, stream.next())
+                .await
+                .expect("idle stream must keep producing events")
+                .expect("event decodes")
+                .expect("flood-probe event");
+            if let Event::Custom(custom) = event
+                && custom.name == "agent:keepalive"
+            {
+                keepalive_count += 1;
+            }
+        }
+        assert!(
+            keepalive_count <= 8,
+            "idle stream emitted {keepalive_count} keepalives over ~8 intervals; \
+             >2 per interval means the deadline stopped re-arming (flood)"
+        );
+        assert!(
+            keepalive_count >= 3,
+            "idle stream emitted only {keepalive_count} keepalives over ~8 intervals; \
+             cadence regressed below one per two intervals"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_suppressed_tool_progress_does_not_postpone_keepalives() {
+        let interval = keepalive_interval_for_tests();
+        let update_interval = interval / 4;
+        let client: Arc<dyn AcpClient> = Arc::new(CustomAgentInProcessClient::new(move |stream| {
+            Box::pin(run_silent_tool_progress_agent(stream, update_interval, 32))
+        }));
+        let state = BridgeAppState::builder(client, PathBuf::from("/"))
+            .with_config(BridgeConfig {
+                slow_consumer_timeout: Duration::from_secs(5),
+                ..BridgeConfig::default()
+            })
+            .build();
+        let session = Arc::new(
+            state
+                .inner
+                .client
+                .open_session(state.session_config_for("silent-progress"))
+                .await
+                .expect("session opens"),
+        );
+        let (prompt_stream, turn_id) = session
+            .prompt_with_turn("silent progress")
+            .await
+            .expect("prompt opens");
+        let entry = Arc::new(SessionEntry::new(session.clone(), None));
+        let registry_entry = state.inner.frontend_tools.entry("silent-progress");
+        registry_entry.set_tools(vec![FrontendToolDef {
+            name: "silent_tool".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let frontend_stream = install_frontend_sender(&registry_entry, 16);
+        let prompt_guard = entry.enter_prompt();
+        let run_guard = state
+            .try_claim_run("silent-progress", "run-silent")
+            .expect("claim run");
+        let mut stream = build_event_stream_with_keepalive(
+            "silent-progress".into(),
+            "run-silent".into(),
+            prompt_stream,
+            EventStreamContext {
+                session,
+                state,
+                registry_entry,
+                turn_id,
+                frontend_stream,
+            },
+            16,
+            prompt_guard,
+            run_guard,
+            interval,
+        );
+
+        let mut keepalives = 0;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while let Some(event) = stream.next().await {
+                let event = event.expect("event stream remains healthy");
+                match event {
+                    Event::Custom(custom) if custom.name == "agent:keepalive" => {
+                        keepalives += 1;
+                    }
+                    Event::Custom(custom) if custom.name == "agent:session_init" => {}
+                    Event::RunStarted(_) => {}
+                    Event::RunFinished(_) => break,
+                    other => panic!("suppressed progress unexpectedly emitted {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("silent progress prompt completes on time");
+        assert!(
+            keepalives >= 3,
+            "continuous suppressed updates postponed keepalives: saw {keepalives}"
+        );
+        assert!(
+            keepalives <= 10,
+            "keepalives flooded during suppressed updates: saw {keepalives}"
+        );
+    }
+
+    async fn run_silent_tool_progress_agent(
+        stream: tokio::io::DuplexStream,
+        interval: Duration,
+        updates: usize,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeRequest, InitializeResponse, NewSessionRequest,
+            NewSessionResponse, PromptRequest, PromptResponse, SessionNotification, SessionUpdate,
+            StopReason, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+        agent_client_protocol::Agent
+            .builder()
+            .name("silent-suppressed-tool-progress-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("silent-progress")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest,
+                            responder,
+                            cx: agent_client_protocol::ConnectionTo<
+                    agent_client_protocol::Client,
+                >| {
+                    let session_id = req.session_id;
+                    cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCall(ToolCall::new(
+                            ToolCallId::new("silent-call"),
+                            "agui-acp-bridge_silent_tool",
+                        )),
+                    ))?;
+                    for _ in 0..updates {
+                        cx.send_notification(SessionNotification::new(
+                            session_id.clone(),
+                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                ToolCallId::new("silent-call"),
+                                ToolCallUpdateFields::new().status(ToolCallStatus::InProgress),
+                            )),
+                        ))?;
+                        tokio::time::sleep(interval).await;
+                    }
+                    responder.respond(PromptResponse::new(StopReason::EndTurn))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: agent_client_protocol::ConnectionTo<
+                    agent_client_protocol::Client,
+                >| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found()),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    // ponytail: the wire shape stays pinned so a refactor cannot silently
+    // emit an unparseable keepalive frame; cadence itself is covered by the
+    // test above.
+    #[test]
+    fn keepalive_frame_is_a_null_value_custom_event() {
+        let frame = agui_rs_encoder_ish();
+        assert!(frame.contains("agent:keepalive"));
+        assert!(frame.contains("\"value\":null"));
+    }
+
+    fn agui_rs_encoder_ish() -> String {
+        let event = keepalive_event();
+        serde_json::to_string(&event).expect("keepalive serializes")
+    }
+
+    /// `resume_cwd` must validate containment against the CANONICAL path but
+    /// hand the agent back its OWN spelling.
+    ///
+    /// The symlinked prefix is built explicitly so this bites on Linux too:
+    /// `/tmp` is not a symlink there, so the macOS bug this guards
+    /// (`/var` -> `/private/var`, which every `std::env::temp_dir()` path
+    /// traverses) was invisible to CI and only reproduced on developer
+    /// machines — where it failed every resume under a temp cwd.
+    #[test]
+    #[cfg(unix)]
+    fn resume_cwd_validates_canonically_but_returns_the_agent_spelling() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("agui-resume-cwd-{unique}"));
+        let real = base.join("real");
+        let nested = real.join("nested/project");
+        std::fs::create_dir_all(&nested).expect("create nested cwd");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked prefix");
+
+        let canonical_root = std::fs::canonicalize(&real).expect("canonical root");
+
+        // The agent persisted its cwd spelled through the symlink.
+        let reported = link.join("nested/project");
+        let chosen = resume_cwd(&reported, &canonical_root).expect("nested cwd is allowed");
+        assert_eq!(
+            chosen, reported,
+            "must hand back the spelling the agent persisted"
+        );
+        assert_ne!(
+            chosen,
+            std::fs::canonicalize(&reported).expect("canonical nested"),
+            "returning the canonical spelling is the bug this test guards"
+        );
+
+        // Containment still resolves symlinks: a link inside the root that
+        // points outside it must be rejected, not laundered.
+        let escape = link.join("escape");
+        std::os::unix::fs::symlink(std::env::temp_dir(), &escape).expect("escape symlink");
+        assert!(
+            resume_cwd(&escape, &canonical_root).is_err(),
+            "a symlink escaping the bridge root must be rejected"
+        );
+
+        // Plain outside-root and relative paths stay rejected.
+        assert!(resume_cwd(&nested, Path::new("/definitely/not/the/root")).is_err());
+        assert!(resume_cwd(Path::new("relative/path"), &canonical_root).is_err());
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

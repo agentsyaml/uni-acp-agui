@@ -2,6 +2,7 @@
 
 import { useAgent, CopilotChat } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
+import { approvalRequestBody } from "@/lib/approval";
 
 type PermissionOption = {
   optionId?: string;
@@ -13,6 +14,12 @@ type PermissionOption = {
 type ApprovalRequest = {
   pending: true;
   interruptId: string;
+  /**
+   * Thread of the run that produced this interrupt. The bridge's
+   * `/approval` is thread-scoped and rejects bodies without it (422),
+   * so Approve/Deny stay disabled while this is unset.
+   */
+  threadId?: string;
   toolName?: string;
   options: PermissionOption[];
 };
@@ -53,8 +60,13 @@ export default function ApprovalPage() {
           approval?.pending &&
           approval.interruptId !== resolvedInterruptIdRef.current
         ) {
-          pendingRef.current = approval;
-          setPending(approval);
+          // Same value source as useAcpFrontendTool's /tool-response posts:
+          // `agent.threadId` of the live run. The snapshot payload carries no
+          // thread id, so stamp it in at snapshot time while it is fresh.
+          const threadId = agent.threadId || undefined;
+          const stamped = { ...approval, threadId };
+          pendingRef.current = stamped;
+          setPending(stamped);
           const isNewRequest =
             lastSeenInterruptIdRef.current !== approval.interruptId;
           lastSeenInterruptIdRef.current = approval.interruptId;
@@ -76,6 +88,21 @@ export default function ApprovalPage() {
   ) => {
     const request = pendingRef.current;
     if (!request || submittingRef.current) return;
+    // The bridge's /approval is thread-scoped: a body without threadId is
+    // rejected with HTTP 422 before the handler runs, so refuse client-side.
+    const body = approvalRequestBody({
+      threadId: request.threadId,
+      interruptId: request.interruptId,
+      approved,
+      optionId,
+    });
+    if (!body) {
+      appendHistory(
+        setHistory,
+        `✗ No agent thread is active for ${request.interruptId.slice(0, 8)}…; cannot approve/deny.`,
+      );
+      return;
+    }
     submittingRef.current = true;
     setSubmitting(true);
     appendHistory(
@@ -88,11 +115,7 @@ export default function ApprovalPage() {
       const res = await fetch("/api/bridge/approval", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          interruptId: request.interruptId,
-          approved,
-          optionId,
-        }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
       const text = await res.text();
@@ -173,6 +196,12 @@ export default function ApprovalPage() {
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
+            {!pending.threadId && (
+              <p className="text-xs text-muted italic">
+                No active agent thread for this interrupt — approve/deny are
+                disabled (the bridge requires a thread-scoped decision).
+              </p>
+            )}
             {pending.options.length === 0 && (
               <p className="text-xs text-muted italic">
                 Agent provided no options — only deny is available.
@@ -186,7 +215,7 @@ export default function ApprovalPage() {
                   key={`${id}-${idx}`}
                   type="button"
                   className="btn btn-success"
-                  disabled={submitting}
+                  disabled={submitting || !pending.threadId}
                   onClick={() => respond(true, id, `Approved (optionId=${id})`)}
                 >
                   ✓ {label}
@@ -196,7 +225,7 @@ export default function ApprovalPage() {
             <button
               type="button"
               className="btn btn-danger"
-              disabled={submitting}
+              disabled={submitting || !pending.threadId}
               onClick={() => respond(false, undefined, "Denied")}
             >
               ✗ Deny

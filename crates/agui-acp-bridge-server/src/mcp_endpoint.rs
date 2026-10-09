@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use axum::{
     Json,
     body::Bytes,
-    extract::{Path, State},
+    extract::{FromRequestParts, Path, State},
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
@@ -665,17 +665,36 @@ fn discover_result() -> Value {
     result
 }
 
-/// Route handler. axum extracts the `{thread}` path parameter and the
-/// shared `BridgeAppState`.
+/// Authenticate using request parts so rejected requests never poll the body.
+pub(crate) struct AuthenticatedMcpThread(String);
+
+#[async_trait::async_trait]
+impl FromRequestParts<BridgeAppState> for AuthenticatedMcpThread {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &BridgeAppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(thread_id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        if !state.mcp_credential_valid(&thread_id, &parts.headers) {
+            return Err(StatusCode::UNAUTHORIZED.into_response());
+        }
+        if !state.mcp_origin_allowed(&parts.headers) {
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+        Ok(Self(thread_id))
+    }
+}
+
 pub(crate) async fn mcp_route(
-    Path(thread_id): Path<String>,
+    AuthenticatedMcpThread(thread_id): AuthenticatedMcpThread,
     State(state): State<BridgeAppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !state.mcp_origin_allowed(&headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
     if !is_json_content_type(&headers) {
         return transport_error(
             Value::Null,
@@ -1618,7 +1637,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::OK
+            StatusCode::UNAUTHORIZED
         );
 
         let mut invalid_origin = with_origin(

@@ -29,6 +29,7 @@
 //!   configured [`PermissionPolicy`] and the initialized platform backend.
 
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -55,6 +56,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, RequestCancellation};
 use dashmap::DashMap;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+#[cfg(test)]
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::acp::{
@@ -85,8 +87,412 @@ const MAX_LOAD_HISTORY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LIST_SESSIONS: usize = 10_000;
 const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LIST_PAGES: usize = 1000;
+const EVENT_DRIVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const EVENT_ITEM_LIMIT: usize = 4096;
+const EVENT_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+const EVENT_CHANNEL_CAPACITY: usize = EVENT_ITEM_LIMIT + 1;
+const FAILED_EVENT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
+const SPAWNED_WORK_ITEMS: usize = 128;
+const SPAWNED_WORK_BYTES: usize = 16 * 1024 * 1024;
 
-type EventSlot = Arc<Mutex<Option<mpsc::Sender<BridgeStreamItem>>>>;
+#[derive(Default)]
+struct WorkUsage {
+    items: usize,
+    bytes: usize,
+}
+
+struct WorkAdmission {
+    usage: Mutex<WorkUsage>,
+    limits: (usize, usize),
+    retire_tx: tokio::sync::watch::Sender<Option<agent_client_protocol::Error>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkPermit {
+    _lease: Arc<WorkLease>,
+}
+
+struct WorkLease {
+    admission: Arc<WorkAdmission>,
+    bytes: usize,
+}
+
+impl Drop for WorkLease {
+    fn drop(&mut self) {
+        let mut usage = self.admission.usage.lock().expect("work usage poisoned");
+        usage.items -= 1;
+        usage.bytes -= self.bytes;
+    }
+}
+
+impl WorkAdmission {
+    fn new() -> Arc<Self> {
+        Self::with_limits(SPAWNED_WORK_ITEMS, SPAWNED_WORK_BYTES)
+    }
+
+    fn with_limits(items: usize, bytes: usize) -> Arc<Self> {
+        let (retire_tx, _) = tokio::sync::watch::channel(None);
+        Arc::new(Self {
+            usage: Mutex::new(WorkUsage::default()),
+            limits: (items, bytes),
+            retire_tx,
+        })
+    }
+
+    fn try_acquire<T: serde::Serialize, I: serde::Serialize + ?Sized>(
+        self: &Arc<Self>,
+        request: &T,
+        id: &I,
+    ) -> Result<WorkPermit, ()> {
+        let bytes = json_size_bounded(&(request, id), self.limits.1);
+        let mut usage = self.usage.lock().expect("work usage poisoned");
+        if self.retire_tx.borrow().is_some()
+            || usage.items >= self.limits.0
+            || bytes == usize::MAX
+            || bytes > self.limits.1
+            || usage.bytes > self.limits.1 - bytes
+        {
+            drop(usage);
+            self.retire_tx.send_if_modified(|current| {
+                if current.is_none() {
+                    *current = Some(agent_client_protocol::Error::internal_error().data(serde_json::json!({"limit":"ACP_SPAWNED_WORK","items":self.limits.0,"bytes":self.limits.1})));
+                    true
+                } else { false }
+            });
+            return Err(());
+        }
+        usage.items += 1;
+        usage.bytes += bytes;
+        Ok(WorkPermit {
+            _lease: Arc::new(WorkLease {
+                admission: self.clone(),
+                bytes,
+            }),
+        })
+    }
+}
+
+type EventSlot = Arc<Mutex<Option<Arc<EventRoute>>>>;
+
+struct EventRoute {
+    events_tx: mpsc::Sender<BridgeStreamItem>,
+    turn: Arc<TurnState>,
+    state: Mutex<RouteState>,
+}
+
+#[derive(Default)]
+struct RouteState {
+    terminal: bool,
+    failed: bool,
+    limit: Option<EventLimit>,
+}
+
+struct EventMailbox {
+    tx: mpsc::Sender<QueuedEvent>,
+    budget: Arc<Mutex<EventBudget>>,
+    item_limit: usize,
+    byte_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EventLimit {
+    Count,
+    Bytes,
+}
+
+impl EventLimit {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Count => "item_count",
+            Self::Bytes => "serialized_bytes",
+        }
+    }
+}
+
+impl EventMailbox {
+    fn new() -> (EventMailboxTx, mpsc::Receiver<QueuedEvent>) {
+        Self::with_limits(EVENT_ITEM_LIMIT, EVENT_BYTE_LIMIT)
+    }
+
+    fn with_limits(
+        item_limit: usize,
+        byte_limit: usize,
+    ) -> (EventMailboxTx, mpsc::Receiver<QueuedEvent>) {
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        (
+            Arc::new(Self {
+                tx,
+                budget: Arc::new(Mutex::new(EventBudget::default())),
+                item_limit,
+                byte_limit,
+            }),
+            rx,
+        )
+    }
+
+    fn enqueue_data(
+        &self,
+        route: &Arc<EventRoute>,
+        item: BridgeStreamItem,
+    ) -> Result<(), EventLimit> {
+        let bytes = event_payload_bytes(&item);
+        let mut route_state = route.state.lock().expect("event route poisoned");
+        if route_state.terminal || route_state.failed {
+            return Err(EventLimit::Count);
+        }
+        let mut budget = self.budget.lock().expect("event budget poisoned");
+        let limit = if budget.items >= self.item_limit {
+            Some(EventLimit::Count)
+        } else if bytes > self.byte_limit || budget.bytes > self.byte_limit - bytes {
+            Some(EventLimit::Bytes)
+        } else {
+            None
+        };
+        if let Some(limit) = limit {
+            route_state.failed = true;
+            route_state.limit = Some(limit);
+            route.turn.fail();
+            return Err(limit);
+        }
+        budget.items += 1;
+        budget.bytes += bytes;
+        drop(budget);
+        let credit = EventCredit {
+            budget: self.budget.clone(),
+            bytes,
+        };
+        match self.tx.clone().try_reserve_owned() {
+            Ok(permit) => {
+                permit.send(QueuedEvent {
+                    route: route.clone(),
+                    item,
+                    credit: Some(credit),
+                    terminal_ack: None,
+                });
+                Ok(())
+            }
+            Err(_) => {
+                drop(credit);
+                route_state.failed = true;
+                route_state.limit = Some(EventLimit::Count);
+                route.turn.fail();
+                Err(EventLimit::Count)
+            }
+        }
+    }
+
+    fn enqueue_terminal(
+        &self,
+        route: &Arc<EventRoute>,
+        item: BridgeStreamItem,
+    ) -> oneshot::Receiver<Result<(), ()>> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let mut state = route.state.lock().expect("event route poisoned");
+        if state.terminal {
+            state.failed = true;
+            state.limit.get_or_insert(EventLimit::Count);
+            route.turn.fail();
+            let _ = ack_tx.send(Err(()));
+            return ack_rx;
+        }
+        state.terminal = true;
+        match self.tx.clone().try_reserve_owned() {
+            Ok(permit) => {
+                permit.send(QueuedEvent {
+                    route: route.clone(),
+                    item,
+                    credit: None,
+                    terminal_ack: Some(ack_tx),
+                });
+            }
+            Err(_) => {
+                state.failed = true;
+                state.limit.get_or_insert(EventLimit::Count);
+                route.turn.fail();
+                let _ = ack_tx.send(Err(()));
+            }
+        }
+        ack_rx
+    }
+}
+
+fn event_payload_bytes(item: &BridgeStreamItem) -> usize {
+    match item {
+        BridgeStreamItem::Update(update) => json_size_bounded(update, EVENT_BYTE_LIMIT),
+        BridgeStreamItem::Interrupt { id, request } => {
+            let remaining = EVENT_BYTE_LIMIT.saturating_sub(id.len());
+            let size = json_size_bounded(request, remaining);
+            if size == usize::MAX {
+                usize::MAX
+            } else {
+                size.saturating_add(id.len())
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn json_size_bounded(value: &impl serde::Serialize, limit: usize) -> usize {
+    struct Counter {
+        size: usize,
+        limit: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.size) {
+                return Err(std::io::Error::other("serialized size limit exceeded"));
+            }
+            self.size += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { size: 0, limit };
+    if serde_json::to_writer(&mut counter, value).is_err() {
+        usize::MAX
+    } else {
+        counter.size
+    }
+}
+
+#[derive(Default)]
+struct EventBudget {
+    items: usize,
+    bytes: usize,
+}
+
+struct EventCredit {
+    budget: Arc<Mutex<EventBudget>>,
+    bytes: usize,
+}
+
+impl Drop for EventCredit {
+    fn drop(&mut self) {
+        let mut budget = self.budget.lock().expect("event budget poisoned");
+        budget.items -= 1;
+        budget.bytes -= self.bytes;
+    }
+}
+
+/// One [`BridgeStreamItem`] queued by a handler running on the ACP SDK's
+/// single dispatch loop, awaiting off-loop delivery to the per-prompt
+/// channel named by `events_tx`.
+struct QueuedEvent {
+    route: Arc<EventRoute>,
+    item: BridgeStreamItem,
+    credit: Option<EventCredit>,
+    terminal_ack: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
+type EventMailboxTx = Arc<EventMailbox>;
+
+/// Sole consumer of the dispatch-loop event mailbox.
+///
+/// Items are enqueued strictly in dispatch order by the single-threaded
+/// dispatch loop and delivered by this single driver in the same order, so
+/// per-turn message ordering is exact — which a naive `cx.spawn`-per-send
+/// (concurrent `FuturesUnordered` tasks racing an unordered lock) could not
+/// guarantee for adjacent `AgentMessageChunk`s. The driver, not the dispatch
+/// loop, absorbs back-pressure: it awaits the bounded per-prompt channel.
+///
+/// The turn's TERMINAL item (`Finished`/`RunError`) travels through this
+/// same FIFO: because this driver is the mailbox's only consumer, FIFO
+/// order alone guarantees every update enqueued before the terminal has
+/// been pushed into the per-prompt channel before the consumer can observe
+/// the terminal. Without this barrier the `session/prompt` response (routed
+/// on the dispatch loop while the mailbox still holds undelivered updates)
+/// lets the actor finish the turn early — the SSE stream ends on
+/// `Finished` and the mailbox tail is lost.
+///
+/// The mailbox outlives individual turns (one connection = one driver), so
+/// a send failure — meaning that turn's consumer dropped and the turn is
+/// terminating via the `events_tx.closed()` watcher in
+/// `run_prompt_with_cancel` — skips only that item; queued items of the
+/// dead turn fail against its dead sender one by one, while items of any
+/// later turn carry their own live sender and deliver normally. The driver
+/// itself must NOT exit here: doing so would permanently kill event
+/// delivery for every future turn on the connection.
+async fn run_event_mailbox(
+    mut rx: mpsc::Receiver<QueuedEvent>,
+    unusable: Arc<AtomicBool>,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut failed_deadline: Option<(crate::acp::TurnId, tokio::time::Instant)> = None;
+    while let Some(event) = rx.recv().await {
+        let QueuedEvent {
+            route,
+            item,
+            credit,
+            terminal_ack,
+        } = event;
+        let mut failed = route.turn.is_failed();
+        let mut permit = None;
+        if !failed {
+            let notified = route.turn.failure_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if route.turn.is_failed() {
+                failed = true;
+            } else {
+                tokio::select! {
+                    result = route.events_tx.reserve() => {
+                        permit = result.ok();
+                    }
+                    () = &mut notified => failed = true,
+                }
+            }
+        }
+
+        if failed {
+            let turn_id = route.turn.id();
+            let deadline = match failed_deadline {
+                Some((id, deadline)) if id == turn_id => deadline,
+                _ => {
+                    let deadline = tokio::time::Instant::now() + FAILED_EVENT_DELIVERY_TIMEOUT;
+                    failed_deadline = Some((turn_id, deadline));
+                    deadline
+                }
+            };
+            permit = match tokio::time::timeout_at(deadline, route.events_tx.reserve()).await {
+                Ok(Ok(permit)) => Some(permit),
+                _ => None,
+            };
+            if permit.is_none() {
+                unusable.store(true, Ordering::Release);
+                drop(credit);
+                if let Some(ack) = terminal_ack {
+                    let _ = ack.send(Err(()));
+                }
+                while let Ok(mut queued) = rx.try_recv() {
+                    if let Some(ack) = queued.terminal_ack.take() {
+                        let _ = ack.send(Err(()));
+                    }
+                    drop(queued);
+                }
+                continue;
+            }
+            permit.expect("reserved event slot").send(item);
+            drop(credit);
+            if let Some(ack) = terminal_ack {
+                let _ = ack.send(Ok(()));
+            }
+        } else if let Some(permit) = permit {
+            permit.send(item);
+            drop(credit);
+            if let Some(ack) = terminal_ack {
+                let _ = ack.send(Ok(()));
+            }
+        } else {
+            drop(credit);
+            if let Some(ack) = terminal_ack {
+                let _ = ack.send(Ok(()));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Bounded spill for `session/update` notifications that arrive with no
 /// active prompt. ACP treats out-of-turn updates as protocol violations, but
@@ -190,6 +596,16 @@ fn session_limit_error(limit: &'static str, cap: usize) -> BridgeError {
     )
 }
 
+fn mailbox_limit_error(limit: EventLimit) -> BridgeError {
+    BridgeError::Acp(
+        agent_client_protocol::Error::internal_error().data(serde_json::json!({
+            "limit": limit.name(),
+            "items": EVENT_ITEM_LIMIT,
+            "bytes": EVENT_BYTE_LIMIT,
+        })),
+    )
+}
+
 fn load_history_limit_error() -> agent_client_protocol::Error {
     agent_client_protocol::Error::internal_error().data(serde_json::json!({
         "limit": "MAX_LOAD_HISTORY",
@@ -231,9 +647,38 @@ where
     }));
 
     let (read, write) = tokio::io::split(client_stream);
-    let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+    let transport = crate::guarded_transport::GuardedByteStreams::new(write, read);
 
     let result = spawn_session(transport, cfg).await;
+    if result.is_ok() {
+        agent_guard.disarm();
+    }
+    result
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn spawn_in_process_session_with_work<F>(
+    cfg: SessionConfig,
+    work: Arc<WorkAdmission>,
+    agent_runner: F,
+) -> Result<AcpSessionHandle, BridgeError>
+where
+    F: FnOnce(
+            tokio::io::DuplexStream,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), BridgeError>> + Send>,
+        > + Send
+        + 'static,
+{
+    let (agent_stream, client_stream) = tokio::io::duplex(IN_PROCESS_DUPLEX_BUFFER);
+    let mut agent_guard = AbortOnDrop::new(tokio::spawn(async move {
+        if let Err(err) = agent_runner(agent_stream).await {
+            tracing::warn!(error = %err, "in-process test agent terminated with error");
+        }
+    }));
+    let (read, write) = tokio::io::split(client_stream);
+    let transport = crate::guarded_transport::GuardedByteStreams::new(write, read);
+    let result = spawn_session_with_work(transport, cfg, work).await;
     if result.is_ok() {
         agent_guard.disarm();
     }
@@ -266,7 +711,7 @@ where
     });
 
     let (read, write) = tokio::io::split(client_stream);
-    let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+    let transport = crate::guarded_transport::GuardedByteStreams::new(write, read);
 
     list_sessions_via(transport, cfg).await
 }
@@ -295,7 +740,7 @@ where
     });
 
     let (read, write) = tokio::io::split(client_stream);
-    let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+    let transport = crate::guarded_transport::GuardedByteStreams::new(write, read);
 
     delete_session_via(transport, cfg, session_id).await
 }
@@ -303,6 +748,17 @@ where
 pub(crate) async fn spawn_session<T>(
     connector: T,
     cfg: SessionConfig,
+) -> Result<AcpSessionHandle, BridgeError>
+where
+    T: ConnectTo<Client> + Send + 'static,
+{
+    spawn_session_with_work(connector, cfg, WorkAdmission::new()).await
+}
+
+async fn spawn_session_with_work<T>(
+    connector: T,
+    cfg: SessionConfig,
+    work_admission: Arc<WorkAdmission>,
 ) -> Result<AcpSessionHandle, BridgeError>
 where
     T: ConnectTo<Client> + Send + 'static,
@@ -332,6 +788,7 @@ where
         cmd_rx,
         ready_tx,
         actor_state,
+        work_admission,
     )));
 
     match ready_rx.await {
@@ -413,9 +870,7 @@ where
                         router.route_with_result(result)
                     }
                     agent_client_protocol::Dispatch::Request(_, responder) => responder
-                        .respond_with_error(agent_client_protocol::util::internal_error(
-                            "unhandled request",
-                        )),
+                        .respond_with_error(agent_client_protocol::Error::method_not_found()),
                     agent_client_protocol::Dispatch::Notification(_) => Ok(()),
                 }
             },
@@ -469,9 +924,7 @@ where
                         router.route_with_result(result)
                     }
                     agent_client_protocol::Dispatch::Request(_, responder) => responder
-                        .respond_with_error(agent_client_protocol::util::internal_error(
-                            "unhandled request",
-                        )),
+                        .respond_with_error(agent_client_protocol::Error::method_not_found()),
                     agent_client_protocol::Dispatch::Notification(_) => Ok(()),
                 }
             },
@@ -641,6 +1094,7 @@ async fn run_actor<T>(
     cmd_rx: mpsc::Receiver<SessionCommand>,
     ready_tx: oneshot::Sender<Result<SessionReady, BridgeError>>,
     state: SessionActorState,
+    work_admission: Arc<WorkAdmission>,
 ) where
     T: ConnectTo<Client> + Send + 'static,
 {
@@ -656,9 +1110,20 @@ async fn run_actor<T>(
         unusable: unusable.clone(),
     };
     let event_slot: EventSlot = Arc::new(Mutex::new(None));
+    let error_slot: EventSlot = Arc::new(Mutex::new(None));
     let event_slot_for_notif = event_slot.clone();
     let event_slot_for_perm = event_slot.clone();
     let event_slot_for_session = event_slot.clone();
+    let error_slot_for_session = error_slot.clone();
+    let (event_mailbox_tx, event_mailbox_rx) = EventMailbox::new();
+    let mut work_retired = work_admission.retire_tx.subscribe();
+    let mut event_driver = AbortOnDrop::new(tokio::spawn(run_event_mailbox(
+        event_mailbox_rx,
+        unusable.clone(),
+    )));
+    let mailbox_for_notif = event_mailbox_tx.clone();
+    let mailbox_for_perm = event_mailbox_tx.clone();
+    let mailbox_for_prompt = event_mailbox_tx.clone();
     let spill: SpillBuffer = Arc::new(Mutex::new(Vec::new()));
     let spill_for_notif = spill.clone();
     let spill_for_teardown = spill.clone();
@@ -682,6 +1147,33 @@ async fn run_actor<T>(
     let filesystem_capabilities = filesystem_capabilities
         .read_text_file(read_filesystem_enabled)
         .write_text_file(write_filesystem_enabled);
+    let (filesystem_root, filesystem_root_guard) =
+        if read_filesystem_enabled || write_filesystem_enabled {
+            match tokio::task::spawn_blocking({
+                let cwd = cwd.clone();
+                move || {
+                    let root = std::fs::canonicalize(cwd)?;
+                    let guard = crate::file_ops::pin_filesystem_root(&root)?;
+                    Ok::<_, std::io::Error>((root, guard))
+                }
+            })
+            .await
+            {
+                Ok(Ok((root, guard))) => (Arc::new(root), Some(guard)),
+                Ok(Err(error)) => {
+                    let ready_tx = ready_tx;
+                    let _ = ready_tx.send(Err(BridgeError::Io(error)));
+                    return;
+                }
+                Err(error) => {
+                    let ready_tx = ready_tx;
+                    let _ = ready_tx.send(Err(BridgeError::Io(std::io::Error::other(error))));
+                    return;
+                }
+            }
+        } else {
+            (Arc::new(cwd.clone()), None)
+        };
     // Do not advertise terminal access unless the policy opts in and the
     // platform-specific cwd/process backend initialized successfully.
     let terminal_backend = if policy.terminal_capability() {
@@ -697,12 +1189,14 @@ async fn run_actor<T>(
         .unwrap_or((None, None));
 
     let pending_perms_for_handler = pending_permissions.clone();
+    let pending_perms_for_events = pending_permissions.clone();
     let pending_perms_for_drain = pending_permissions.clone();
-    let turns_for_handler = turn_queue.clone();
     let turns_for_session = turn_queue.clone();
     let unusable_for_session = unusable.clone();
     let read_filesystem_lock = filesystem_lock.clone();
     let write_filesystem_lock = filesystem_lock.clone();
+    let read_filesystem_root = filesystem_root.clone();
+    let write_filesystem_root = filesystem_root.clone();
     let ready_tx = std::sync::Mutex::new(Some(ready_tx));
 
     let result = agent_client_protocol::Client
@@ -766,12 +1260,28 @@ async fn run_actor<T>(
                             return Ok(());
                         }
                     }
-                    let sender = event_slot_for_notif
+                    let route = event_slot_for_notif
                         .lock()
                         .expect("event slot poisoned")
                         .clone();
-                    if let Some(tx) = sender {
-                        let _ = tx.send(BridgeStreamItem::Update(notification.update)).await;
+                    if let Some(route) = route {
+                        // The SDK runs this handler on its single sequential
+                        // dispatch loop, so a blocking `tx.send(..).await` on
+                        // the full per-prompt channel would stall every
+                        // response, request, and notification on this
+                        // connection — including `session/prompt`'s own
+                        // response, deadlocking the turn. Queue for the
+                        // off-loop mailbox driver instead (see
+                        // `run_event_mailbox`); enqueue order preserves the
+                        // agent's update order exactly.
+                        if let Err(limit) = mailbox_for_notif.enqueue_data(
+                            &route,
+                            BridgeStreamItem::Update(notification.update),
+                        ) && route.turn.is_failed()
+                        {
+                            route.turn.cancel_and_drain(&pending_perms_for_events);
+                            tracing::warn!(?limit, "session event mailbox limit exceeded");
+                        }
                     } else {
                         // No active prompt. The SDK's dispatch loop only logs
                         // errors from notification handlers (it cannot reply
@@ -803,8 +1313,8 @@ async fn run_actor<T>(
             {
                 let policy = policy.clone();
                 let event_slot_for_perm = event_slot_for_perm.clone();
+                let event_mailbox_for_perm = mailbox_for_perm.clone();
                 let pending_perms = pending_perms_for_handler.clone();
-                let turns = turns_for_handler.clone();
                 async move |req: RequestPermissionRequest,
                             responder: agent_client_protocol::Responder<
                     RequestPermissionResponse,
@@ -815,8 +1325,8 @@ async fn run_actor<T>(
                         responder,
                         policy.clone(),
                         event_slot_for_perm.clone(),
+                        event_mailbox_for_perm.clone(),
                         pending_perms.clone(),
-                        turns.clone(),
                         permission_timeout,
                     )
                     .await
@@ -826,8 +1336,9 @@ async fn run_actor<T>(
         )
         .on_receive_request(
             {
-                let cwd = cwd.clone();
+                let cwd = read_filesystem_root;
                 let filesystem_lock = read_filesystem_lock;
+                let work = work_admission.clone();
                 async move |req: ReadTextFileRequest, responder, cx| {
                     if !read_filesystem_enabled {
                         return responder.respond_with_error(
@@ -835,16 +1346,26 @@ async fn run_actor<T>(
                         );
                     }
 
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) {
+                        Ok(permit) => permit,
+                        Err(()) => {
+                            let mut retired = work.retire_tx.subscribe();
+                            return tokio::select! { biased; changed = retired.changed() => { let _ = changed; Ok(()) }, () = std::future::pending() => Ok(()) };
+                        }
+                    };
+
                     let cancellation = responder.cancellation();
                     let cwd = cwd.clone();
                     let filesystem_lock = filesystem_lock.clone();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit.clone();
                         let result = cancellation
-                            .run_until_cancelled(read_file_request(
+                            .run_until_cancelled(read_file_request_with_work(
                                 req,
                                 cwd,
                                 filesystem_lock,
                                 cancellation.clone(),
+                                Some(permit.clone()),
                             ))
                             .await;
                         let result = if cancellation.is_cancelled() {
@@ -866,24 +1387,37 @@ async fn run_actor<T>(
         )
         .on_receive_request(
             {
-                let cwd = cwd.clone();
+                let cwd = write_filesystem_root;
                 let filesystem_lock = write_filesystem_lock;
+                let work = work_admission.clone();
                 async move |req: WriteTextFileRequest, responder, cx| {
                     if !write_filesystem_enabled {
                         return responder.respond_with_error(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     }
+                    if let Some(error) = write_content_validation_error(&req.content) {
+                        return responder.respond_with_error(error);
+                    }
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) {
+                        Ok(permit) => permit,
+                        Err(()) => {
+                            let mut retired = work.retire_tx.subscribe();
+                            return tokio::select! { biased; changed = retired.changed() => { let _ = changed; Ok(()) }, () = std::future::pending() => Ok(()) };
+                        }
+                    };
 
                     let cancellation = responder.cancellation();
                     let cwd = cwd.clone();
                     let filesystem_lock = filesystem_lock.clone();
                     if let Err(error) = cx.spawn(async move {
-                        let result = write_file_request(
+                        let _permit = permit.clone();
+                        let result = write_file_request_with_work(
                             req,
                             cwd,
                             filesystem_lock,
                             cancellation.clone(),
+                            Some(permit.clone()),
                         )
                         .await;
                         if let Err(error) = responder.respond_with_result(result) {
@@ -901,6 +1435,7 @@ async fn run_actor<T>(
         .on_receive_request(
             {
                 let registry = terminal_registry.clone();
+                let work = work_admission.clone();
                 async move |req: CreateTerminalRequest, responder, cx| {
                     if !terminal_capability {
                         return responder.respond_with_error(
@@ -912,13 +1447,16 @@ async fn run_actor<T>(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     };
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) { Ok(p) => p, Err(()) => { let mut rx=work.retire_tx.subscribe(); return tokio::select! { biased; _=rx.changed()=>Ok(()), ()=std::future::pending()=>Ok(()) }; } };
                     let cancellation = responder.cancellation();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit.clone();
                         if let Err(error) = crate::terminal::create_request(
                             req,
                             registry,
                             cancellation,
                             responder,
+                            Some(permit.clone()),
                         )
                         .await
                         {
@@ -936,6 +1474,7 @@ async fn run_actor<T>(
         .on_receive_request(
             {
                 let registry = terminal_registry.clone();
+                let work = work_admission.clone();
                 async move |req: TerminalOutputRequest, responder, cx| {
                     if !terminal_capability {
                         return responder.respond_with_error(
@@ -947,8 +1486,10 @@ async fn run_actor<T>(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     };
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) { Ok(p) => p, Err(()) => { let mut rx=work.retire_tx.subscribe(); return tokio::select! { biased; _=rx.changed()=>Ok(()), ()=std::future::pending()=>Ok(()) }; } };
                     let cancellation = responder.cancellation();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit;
                         let result = crate::terminal::output_request(req, registry, cancellation).await;
                         if let Err(error) = responder.respond_with_result(result) {
                             tracing::debug!(?error, "terminal output response could not be sent");
@@ -965,6 +1506,7 @@ async fn run_actor<T>(
         .on_receive_request(
             {
                 let registry = terminal_registry.clone();
+                let work = work_admission.clone();
                 async move |req: WaitForTerminalExitRequest, responder, cx| {
                     if !terminal_capability {
                         return responder.respond_with_error(
@@ -976,8 +1518,10 @@ async fn run_actor<T>(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     };
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) { Ok(p) => p, Err(()) => { let mut rx=work.retire_tx.subscribe(); return tokio::select! { biased; _=rx.changed()=>Ok(()), ()=std::future::pending()=>Ok(()) }; } };
                     let cancellation = responder.cancellation();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit;
                         let result = crate::terminal::wait_request(req, registry, cancellation).await;
                         if let Err(error) = responder.respond_with_result(result) {
                             tracing::debug!(?error, "terminal wait response could not be sent");
@@ -994,6 +1538,7 @@ async fn run_actor<T>(
         .on_receive_request(
             {
                 let registry = terminal_registry.clone();
+                let work = work_admission.clone();
                 async move |req: KillTerminalRequest, responder, cx| {
                     if !terminal_capability {
                         return responder.respond_with_error(
@@ -1005,8 +1550,10 @@ async fn run_actor<T>(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     };
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) { Ok(p) => p, Err(()) => { let mut rx=work.retire_tx.subscribe(); return tokio::select! { biased; _=rx.changed()=>Ok(()), ()=std::future::pending()=>Ok(()) }; } };
                     let cancellation = responder.cancellation();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit;
                         let result = crate::terminal::kill_request(req, registry, cancellation).await;
                         if let Err(error) = responder.respond_with_result(result) {
                             tracing::debug!(?error, "terminal kill response could not be sent");
@@ -1023,6 +1570,7 @@ async fn run_actor<T>(
         .on_receive_request(
             {
                 let registry = terminal_registry.clone();
+                let work = work_admission.clone();
                 async move |req: ReleaseTerminalRequest, responder, cx| {
                     if !terminal_capability {
                         return responder.respond_with_error(
@@ -1034,8 +1582,10 @@ async fn run_actor<T>(
                             agent_client_protocol::Error::method_not_found(),
                         );
                     };
+                    let permit = match work.try_acquire(&req, &responder.id().to_string()) { Ok(p) => p, Err(()) => { let mut rx=work.retire_tx.subscribe(); return tokio::select! { biased; _=rx.changed()=>Ok(()), ()=std::future::pending()=>Ok(()) }; } };
                     let cancellation = responder.cancellation();
                     if let Err(error) = cx.spawn(async move {
+                        let _permit = permit;
                         let result = crate::terminal::release_request(req, registry, cancellation).await;
                         if let Err(error) = responder.respond_with_result(result) {
                             tracing::debug!(?error, "terminal release response could not be sent");
@@ -1049,10 +1599,27 @@ async fn run_actor<T>(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        // Keep unknown methods out of the SDK's fallback pending-request
+        // queue. Typed handlers above retain their normal dispatch path.
+        .on_receive_dispatch(
+            async move |message: agent_client_protocol::Dispatch, _cx: ConnectionTo<Agent>| {
+                match message {
+                    agent_client_protocol::Dispatch::Response(result, router) => {
+                        router.route_with_result(result)
+                    }
+                    agent_client_protocol::Dispatch::Request(_, responder) => {
+                        responder.respond_with_error(agent_client_protocol::Error::method_not_found())
+                    }
+                    agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .connect_with(connector, move |cx: ConnectionTo<Agent>| {
             let cwd = cwd.clone();
-            let ready_slot = ready_tx;
+            let ready_slot = Arc::new(ready_tx);
             let event_slot = event_slot_for_session;
+            let error_slot = error_slot_for_session;
             let pending_for_drain = pending_permissions.clone();
             let turn_queue = turns_for_session.clone();
             let unusable = unusable_for_session.clone();
@@ -1063,7 +1630,10 @@ async fn run_actor<T>(
             let load_session_id = load_session_id.clone();
             let load_buffer = load_buffer_for_session;
             let spill = spill;
+            let event_mailbox_tx = mailbox_for_prompt;
             async move {
+                let ready_slot_for_foreground = ready_slot.clone();
+                let foreground = async {
                 let (session_id, supports_close) = match initialize(
                     &cx,
                     cwd.as_ref().clone(),
@@ -1079,7 +1649,7 @@ async fn run_actor<T>(
                 {
                     Ok((id, init, supports_close)) => {
                         *init_state.lock().expect("init_state poisoned") = init.clone();
-                        if let Some(tx) = ready_slot.lock().expect("ready slot poisoned").take() {
+                        if let Some(tx) = ready_slot_for_foreground.lock().expect("ready slot poisoned").take() {
                             let _ = tx.send(Ok(SessionReady {
                                 session_id: id.clone(),
                                 supports_close,
@@ -1088,14 +1658,19 @@ async fn run_actor<T>(
                         (id, supports_close)
                     }
                     Err(err) => {
-                        if let Some(tx) = ready_slot.lock().expect("ready slot poisoned").take() {
+                        if let Some(tx) = ready_slot_for_foreground.lock().expect("ready slot poisoned").take() {
                             let _ = tx.send(Err(err));
                         }
                         return Ok(());
                     }
                 };
 
-                while let Some(cmd) = cmd_rx.recv().await {
+                loop {
+                    let cmd = tokio::select! {
+                        biased;
+                        () = cx.incoming_closed() => break,
+                        cmd = cmd_rx.recv() => match cmd { Some(cmd) => cmd, None => break },
+                    };
                     match cmd {
                         SessionCommand::Prompt {
                             prompt,
@@ -1103,9 +1678,13 @@ async fn run_actor<T>(
                             finished_tx,
                             turn,
                         } => {
-                            *event_slot.lock().expect("event slot poisoned") =
-                                Some(events_tx.clone());
-
+                            let route = Arc::new(EventRoute {
+                                events_tx: events_tx.clone(),
+                                turn: turn.clone(),
+                                state: Mutex::new(RouteState::default()),
+                            });
+                            *error_slot.lock().expect("error route slot poisoned") =
+                                Some(route.clone());
                             // Surface the cached SessionInit at the start of
                             // every prompt so reconnecting clients still see
                             // the picker before the first agent text.
@@ -1153,6 +1732,11 @@ async fn run_actor<T>(
                                 }
                             }
 
+                            // Do not expose the live route until bootstrap
+                            // history and spill have drained, or live updates
+                            // could overtake that prefix.
+                            *event_slot.lock().expect("event slot poisoned") = Some(route.clone());
+
                             // Run the prompt while concurrently watching for
                             // a cancel notification (via the turn state) and for
                             // the SSE consumer dropping. A naive serial
@@ -1170,16 +1754,77 @@ async fn run_actor<T>(
                             )
                             .await;
 
+                            // Capture retirement from the raw prompt outcome before a
+                            // mailbox-limit presentation error can replace it.
                             let grace_expired = matches!(
                                 &res,
                                 Err(BridgeError::CancelGraceExpired(_))
                             ) && turn.is_cancelled();
+                            let peer_closed = matches!(&res, Err(BridgeError::SessionClosed));
+                            let failure_limit = route
+                                .state
+                                .lock()
+                                .expect("event route poisoned")
+                                .limit;
+                            let mut res = if turn.is_failed() {
+                                Err(mailbox_limit_error(
+                                    failure_limit.unwrap_or(EventLimit::Count),
+                                ))
+                            } else {
+                                res
+                            };
+                            // A completed turn owns all of its deferred permission
+                            // callbacks; deny and unregister them before admitting the
+                            // next turn, without sending an ACP cancel notification.
+                            turn.cancel_and_drain(&pending_for_drain);
+
+                            let terminal = match &res {
+                                Ok(stop_reason) => BridgeStreamItem::Finished {
+                                    stop_reason: *stop_reason,
+                                },
+                                Err(error) => BridgeStreamItem::RunError {
+                                    message: if turn.is_failed() {
+                                        format!(
+                                            "session event mailbox {} limit exceeded",
+                                            failure_limit.unwrap_or(EventLimit::Count).name()
+                                        )
+                                    } else {
+                                        error.to_string()
+                                    },
+                                },
+                            };
+                            let terminal_ack = event_mailbox_tx.enqueue_terminal(&route, terminal);
+                            if turn.is_failed() && res.is_ok() {
+                                let limit = route
+                                    .state
+                                    .lock()
+                                    .expect("event route poisoned")
+                                    .limit
+                                    .unwrap_or(EventLimit::Count);
+                                res = Err(mailbox_limit_error(limit));
+                            }
 
                             *event_slot.lock().expect("event slot poisoned") = None;
+
+                            if grace_expired || peer_closed {
+                                unusable.store(true, Ordering::Release);
+                            }
 
                             let _ = finished_tx.send(res);
                             drop(events_tx);
                             turn_queue.remove(&turn);
+                            if !matches!(terminal_ack.await, Ok(Ok(()))) {
+                                unusable.store(true, Ordering::Release);
+                                let _ = error_slot
+                                    .lock()
+                                    .expect("error route slot poisoned")
+                                    .take();
+                                break;
+                            }
+                            let _ = error_slot
+                                .lock()
+                                .expect("error route slot poisoned")
+                                .take();
                             if grace_expired {
                                 // The agent did not acknowledge cancellation
                                 // within the grace window. Its session state
@@ -1260,6 +1905,13 @@ async fn run_actor<T>(
                             events_tx,
                             finished_tx,
                         } => {
+                            let route = Arc::new(EventRoute {
+                                events_tx: events_tx.clone(),
+                                turn: Arc::new(TurnState::new()),
+                                state: Mutex::new(RouteState::default()),
+                            });
+                            *error_slot.lock().expect("error route slot poisoned") =
+                                Some(route);
                             // Emit a SessionInit so the resuming client's
                             // picker is populated, then flush any loaded
                             // history, then finish — without prompting.
@@ -1283,8 +1935,28 @@ async fn run_actor<T>(
                                     }
                                 }
                             }
+
+                            // Mirror the Prompt arm: drain out-of-turn updates
+                            // spilled between `session/load` and this drain so
+                            // they are neither misattributed to a later turn
+                            // nor silently lost.
+                            let spilled: Vec<_> =
+                                std::mem::take(&mut *spill.lock().expect("spill buffer poisoned"));
+                            for update in spilled {
+                                if events_tx
+                                    .send(BridgeStreamItem::Update(update))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             let _ = finished_tx.send(Ok(StopReason::EndTurn));
                             drop(events_tx);
+                            let _ = error_slot
+                                .lock()
+                                .expect("error route slot poisoned")
+                                .take();
                         }
                     }
                 }
@@ -1294,6 +1966,21 @@ async fn run_actor<T>(
                 // reaping.
                 drain_pending_permissions(&pending_for_drain);
                 Ok(())
+                };
+                tokio::select! {
+                    biased;
+                    changed = work_retired.changed() => {
+                        let _ = changed;
+                        unusable.store(true, Ordering::Release);
+                        drain_pending_permissions(&pending_for_drain);
+                        let error = work_retired.borrow().clone().unwrap_or_else(agent_client_protocol::Error::internal_error);
+                        if let Some(tx) = ready_slot.lock().expect("ready slot poisoned").take() {
+                            let _ = tx.send(Err(BridgeError::Acp(error.clone())));
+                        }
+                        Err(error)
+                    }
+                    result = foreground => result,
+                }
             }
         })
         .await;
@@ -1302,6 +1989,12 @@ async fn run_actor<T>(
         registry.shutdown();
     }
     drop(terminal_registry_guard);
+    // SDK callback closures (and their in-flight operations) are gone after
+    // connect_with returns; release the session lease before mailbox draining.
+    #[cfg(target_os = "linux")]
+    drop(filesystem_root_guard);
+    #[cfg(not(target_os = "linux"))]
+    let _filesystem_root_guard = filesystem_root_guard;
 
     // Every exit path below represents a dead actor. Mark the shared handle
     // first so new prompts fail closed, then release every queued admission
@@ -1324,21 +2017,39 @@ async fn run_actor<T>(
         );
     }
 
+    drain_pending_permissions(&pending_perms_for_drain);
     if let Err(err) = result {
-        let sender = event_slot.lock().expect("event slot poisoned").clone();
-        if let Some(tx) = sender {
-            let _ = tx
-                .send(BridgeStreamItem::RunError {
-                    message: format!("acp connection terminated: {err}"),
-                })
-                .await;
+        let route = error_slot
+            .lock()
+            .expect("error route slot poisoned")
+            .take()
+            .or_else(|| event_slot.lock().expect("event slot poisoned").take());
+        if let Some(route) = route {
+            route.turn.fail();
+            route.turn.cancel_and_drain(&pending_perms_for_drain);
+            let terminal_ack = event_mailbox_tx.enqueue_terminal(
+                &route,
+                BridgeStreamItem::RunError {
+                    message: if work_admission.retire_tx.borrow().is_some() {
+                        "ACP_SPAWNED_WORK quota exceeded".into()
+                    } else {
+                        format!("acp connection terminated: {err}")
+                    },
+                },
+            );
+            let _ = terminal_ack.await;
         }
-        // Drain any pending permission waiters so their spawned timeout
-        // tasks don't dangle for `permission_timeout` after the actor
-        // exits. Sending `Deny` causes them to respond `Cancelled` to the
-        // agent (which is moot since the connection is gone) and to
-        // remove themselves from the pending map.
-        drain_pending_permissions(&pending_perms_for_drain);
+    }
+    // Release every producer before closing the FIFO; the connection error,
+    // when present, is queued behind all accepted events above.
+    drop(event_slot.lock().expect("event slot poisoned").take());
+    drop(event_mailbox_tx);
+    if let Some(handle) = event_driver.handle.as_mut()
+        && tokio::time::timeout(EVENT_DRIVER_SHUTDOWN_TIMEOUT, handle)
+            .await
+            .is_ok()
+    {
+        event_driver.disarm();
     }
 }
 
@@ -1450,16 +2161,18 @@ fn request_line(value: Option<u32>) -> Result<Option<usize>, agent_client_protoc
         .transpose()
 }
 
-async fn read_file_request(
+fn write_content_validation_error(content: &str) -> Option<agent_client_protocol::Error> {
+    (content.len() > crate::file_ops::MAX_TEXT_FILE_BYTES)
+        .then(agent_client_protocol::Error::invalid_params)
+}
+
+async fn read_file_request_with_work(
     request: ReadTextFileRequest,
     cwd: Arc<PathBuf>,
     filesystem_lock: Arc<AsyncMutex<()>>,
     cancellation: RequestCancellation,
+    permit: Option<WorkPermit>,
 ) -> Result<ReadTextFileResponse, agent_client_protocol::Error> {
-    if cancellation.is_cancelled() {
-        return Err(agent_client_protocol::Error::request_cancelled());
-    }
-
     let path = request_path(&request.path)?;
     let line = request_line(request.line)?;
     let limit = request_line(request.limit)?;
@@ -1467,24 +2180,24 @@ async fn read_file_request(
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-
-    crate::file_ops::read_text_file_range(cwd.as_path(), path, line, limit)
+    crate::file_ops::read_text_file_range_with_work(cwd.as_path(), path, line, limit, permit)
         .await
         .map(ReadTextFileResponse::new)
         .map_err(file_operation_error)
 }
 
-async fn write_file_request(
+async fn write_file_request_with_work(
     request: WriteTextFileRequest,
     cwd: Arc<PathBuf>,
     filesystem_lock: Arc<AsyncMutex<()>>,
     cancellation: RequestCancellation,
+    permit: Option<WorkPermit>,
 ) -> Result<WriteTextFileResponse, agent_client_protocol::Error> {
     if cancellation.is_cancelled() {
         return Err(agent_client_protocol::Error::request_cancelled());
     }
-    if request.content.len() > crate::file_ops::MAX_TEXT_FILE_BYTES {
-        return Err(agent_client_protocol::Error::invalid_params());
+    if let Some(error) = write_content_validation_error(&request.content) {
+        return Err(error);
     }
 
     let path = request_path(&request.path)?;
@@ -1499,7 +2212,7 @@ async fn write_file_request(
         return Err(agent_client_protocol::Error::request_cancelled());
     }
 
-    crate::file_ops::write_text_file(cwd.as_path(), path, &request.content)
+    crate::file_ops::write_text_file_with_work(cwd.as_path(), path, &request.content, permit)
         .await
         .map(|_| WriteTextFileResponse::new())
         .map_err(file_operation_error)
@@ -1837,6 +2550,7 @@ async fn send_set_config_option(
 ///
 /// Subsequent cancel signals while we're already awaiting are absorbed
 /// silently — the first cancel did the work.
+#[allow(clippy::too_many_arguments)]
 async fn run_prompt_with_cancel(
     cx: &ConnectionTo<Agent>,
     session_id: &agent_client_protocol::schema::v1::SessionId,
@@ -1857,11 +2571,6 @@ async fn run_prompt_with_cancel(
     // an ACP prompt for a caller that has already disconnected.
     if turn.is_cancelled() {
         turn.cancel_and_drain(&pending_permissions);
-        let _ = events_tx
-            .send(BridgeStreamItem::Finished {
-                stop_reason: StopReason::Cancelled,
-            })
-            .await;
         return Ok(StopReason::Cancelled);
     }
 
@@ -1876,11 +2585,17 @@ async fn run_prompt_with_cancel(
         100 * 365 * 24 * 60 * 60,
     )));
     let mut already_cancelled = false;
+    let incoming_closed = cx.incoming_closed();
+    tokio::pin!(incoming_closed);
     let response = loop {
         tokio::select! {
             biased;
 
             res = &mut prompt_fut => break res,
+
+            // Prefer a response already queued by the dispatch loop over EOF,
+            // while still terminating an outstanding RPC when the peer closes.
+            () = &mut incoming_closed => break Err(BridgeError::SessionClosed),
 
             () = &mut cancelled, if !already_cancelled => {
                 already_cancelled = true;
@@ -1921,12 +2636,6 @@ async fn run_prompt_with_cancel(
     };
 
     let response = response?;
-    let _ = events_tx
-        .send(BridgeStreamItem::Finished {
-            stop_reason: response.stop_reason,
-        })
-        .await;
-
     Ok(response.stop_reason)
 }
 
@@ -1943,22 +2652,36 @@ async fn run_prompt_with_cancel(
 ///   a critical correctness property since the loop also delivers
 ///   `session/update` notifications and other concurrent work for the
 ///   same connection. Timeout / no-active-prompt fall back to `Cancelled`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_permission_request(
     req: RequestPermissionRequest,
     responder: agent_client_protocol::Responder<RequestPermissionResponse>,
     policy: Arc<dyn PermissionPolicy>,
     event_slot: EventSlot,
+    event_mailbox: EventMailboxTx,
     pending_permissions: PendingPermissions,
-    turn_queue: Arc<SessionTurnQueue>,
     permission_timeout: Duration,
 ) -> Result<(), agent_client_protocol::Error> {
-    let turn = turn_queue.current();
+    let route = event_slot.lock().expect("event slot poisoned").clone();
+    let Some(route) = route else {
+        return responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+    };
+    let turn = route.turn.clone();
+    let request_bytes =
+        json_size_bounded(&req, crate::acp::MAX_PENDING_PERMISSION_BYTES_PER_REQUEST);
+    let Some(permission_budget) = turn.reserve_permission(request_bytes) else {
+        return responder.respond(RequestPermissionResponse::new(
+            RequestPermissionOutcome::Cancelled,
+        ));
+    };
     let decision = policy.decide(&req).await;
 
     // A policy may have been awaiting its own async work when the turn was
     // cancelled. Do not let that late decision resurrect a cancelled ACP
     // permission request.
-    if turn.as_ref().is_some_and(|turn| turn.is_cancelled()) {
+    if turn.is_cancelled() || turn.is_failed() {
         return responder.respond(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
         ));
@@ -1974,24 +2697,6 @@ async fn handle_permission_request(
             RequestPermissionOutcome::Cancelled,
         )),
         PermissionDecision::Defer { interrupt_id } => {
-            let Some(turn) = turn else {
-                tracing::warn!("permission request arrived with no active turn; denying");
-                return responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Cancelled,
-                ));
-            };
-
-            // Look up the active prompt's event channel to emit the
-            // Interrupt. Without an active prompt there's nobody listening,
-            // so we deny rather than dangle the request.
-            let sender = event_slot.lock().expect("event slot poisoned").clone();
-            let Some(tx) = sender else {
-                tracing::warn!("permission request arrived with no active prompt; denying");
-                return responder.respond(RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Cancelled,
-                ));
-            };
-
             // Register the pending permission BEFORE sending the Interrupt,
             // so a resolve() call that arrives before our await on rx still
             // hits the map.
@@ -2004,7 +2709,12 @@ async fn handle_permission_request(
             let registered = turn.register_pending(
                 &pending_permissions,
                 interrupt_id.clone(),
-                crate::acp::PendingPermission::new(resolve_tx, valid_option_ids, turn.clone()),
+                crate::acp::PendingPermission::new(
+                    resolve_tx,
+                    valid_option_ids,
+                    turn.clone(),
+                    permission_budget,
+                ),
             );
             if !registered {
                 return responder.respond(RequestPermissionResponse::new(
@@ -2012,12 +2722,22 @@ async fn handle_permission_request(
                 ));
             }
 
-            let interrupt = BridgeStreamItem::Interrupt {
-                id: interrupt_id.clone(),
-                request: req.clone(),
-            };
-            if tx.send(interrupt).await.is_err() {
-                // Receiver dropped (client disconnected) — clean up and deny.
+            // Same dispatch-loop constraint as the notification handler: a
+            // blocking send here would stall `session/prompt`'s response and
+            // deadlock the turn when the channel is full. Enqueue off-loop.
+            if event_mailbox
+                .enqueue_data(
+                    &route,
+                    BridgeStreamItem::Interrupt {
+                        id: interrupt_id.clone(),
+                        request: req.clone(),
+                    },
+                )
+                .is_err()
+            {
+                if turn.is_failed() {
+                    turn.cancel_and_drain(&pending_permissions);
+                }
                 turn.remove_pending(&pending_permissions, &interrupt_id);
                 return responder.respond(RequestPermissionResponse::new(
                     RequestPermissionOutcome::Cancelled,
@@ -2072,6 +2792,241 @@ async fn handle_permission_request(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(target_os = "linux")]
+    static FILESYSTEM_WRITE_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    struct WriteGateReset;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for WriteGateReset {
+        fn drop(&mut self) {
+            crate::file_ops::clear_write_gate();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_admission_latches_once_and_blocking_clone_keeps_credit() {
+        let work = WorkAdmission::with_limits(2, 4096);
+        let retired = work.retire_tx.subscribe();
+        let first = work.try_acquire(&"first", "id-1").unwrap();
+        let second = work.try_acquire(&"second", "id-2").unwrap();
+        let blocking_lease = first.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking = tokio::task::spawn_blocking(move || {
+            let _lease = blocking_lease;
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+        drop(first);
+        assert!(work.try_acquire(&"third", "id-3").is_err());
+        let error = retired.borrow().clone().expect("quota error is latched");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"limit":"ACP_SPAWNED_WORK","items":2,"bytes":4096}))
+        );
+        assert!(work.try_acquire(&"fourth", "id-4").is_err());
+        assert_eq!(
+            retired.borrow().as_ref(),
+            Some(&error),
+            "first quota error remains authoritative"
+        );
+        drop(second);
+        assert!(
+            work.try_acquire(&"fifth", "id-5").is_err(),
+            "blocking clone retains the first credit"
+        );
+        release_tx.send(()).unwrap();
+        blocking.await.unwrap();
+        assert_eq!(work.usage.lock().unwrap().items, 0);
+    }
+
+    fn test_route(events_tx: mpsc::Sender<BridgeStreamItem>) -> Arc<EventRoute> {
+        Arc::new(EventRoute {
+            events_tx,
+            turn: Arc::new(TurnState::new()),
+            state: Mutex::new(RouteState::default()),
+        })
+    }
+
+    #[tokio::test]
+    async fn mailbox_limits_fail_closed_without_poisoning_later_turns() {
+        use agent_client_protocol::schema::v1::{CurrentModeUpdate, SessionUpdate};
+
+        let (mailbox, rx) = EventMailbox::with_limits(1, 1024);
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        events_tx
+            .send(BridgeStreamItem::SessionInit {
+                modes: None,
+                models: None,
+                config_options: None,
+            })
+            .await
+            .unwrap();
+        let route = test_route(events_tx.clone());
+        let driver = tokio::spawn(run_event_mailbox(rx, Arc::new(AtomicBool::new(false))));
+        let pending_permissions: PendingPermissions = Arc::new(DashMap::new());
+        let (permission_tx, permission_rx) = oneshot::channel();
+        assert!(route.turn.register_pending(
+            &pending_permissions,
+            "mailbox-permission".into(),
+            crate::acp::PendingPermission::new(
+                permission_tx,
+                std::collections::HashSet::new(),
+                route.turn.clone(),
+                route.turn.reserve_permission(16).unwrap(),
+            ),
+        ));
+        let first = BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(
+            CurrentModeUpdate::new("prefix"),
+        ));
+        mailbox.enqueue_data(&route, first).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while mailbox.tx.capacity() != EVENT_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("driver dequeued the event and is blocked on the full turn channel");
+        assert_eq!(
+            mailbox.budget.lock().unwrap().items,
+            1,
+            "driver in-flight event remains charged"
+        );
+        assert!(matches!(
+            mailbox.enqueue_data(
+                &route,
+                BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    "overflow"
+                ),)),
+            ),
+            Err(EventLimit::Count)
+        ));
+        route.turn.cancel_and_drain(&pending_permissions);
+        assert!(matches!(permission_rx.await, Ok(PermissionDecision::Deny)));
+        let terminal_ack = mailbox.enqueue_terminal(
+            &route,
+            BridgeStreamItem::RunError {
+                message: "event item limit".into(),
+            },
+        );
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(BridgeStreamItem::SessionInit { .. })
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(BridgeStreamItem::Update(_))
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(BridgeStreamItem::RunError { .. })
+        ));
+        assert!(
+            events_rx.try_recv().is_err(),
+            "one terminal only; no Finished follows"
+        );
+        assert_eq!(terminal_ack.await.unwrap(), Ok(()));
+        drop(mailbox);
+        driver.await.unwrap().unwrap();
+
+        let (mailbox, _rx) = EventMailbox::with_limits(8, 8);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let route = test_route(events_tx);
+        assert!(matches!(
+            mailbox.enqueue_data(
+                &route,
+                BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    "payload too large"
+                ),)),
+            ),
+            Err(EventLimit::Bytes)
+        ));
+
+        let (mailbox, rx) = EventMailbox::with_limits(1, 1024);
+        let (events_tx, _events_rx) = mpsc::channel(1);
+        let route = test_route(events_tx.clone());
+        events_tx
+            .send(BridgeStreamItem::SessionInit {
+                modes: None,
+                models: None,
+                config_options: None,
+            })
+            .await
+            .unwrap();
+        let unusable = Arc::new(AtomicBool::new(false));
+        let driver = tokio::spawn(run_event_mailbox(rx, unusable.clone()));
+        mailbox
+            .enqueue_data(
+                &route,
+                BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    "accepted",
+                ))),
+            )
+            .unwrap();
+        assert!(
+            mailbox
+                .enqueue_data(
+                    &route,
+                    BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(
+                        CurrentModeUpdate::new("overflow"),
+                    )),
+                )
+                .is_err()
+        );
+        let terminal_ack = mailbox.enqueue_terminal(
+            &route,
+            BridgeStreamItem::RunError {
+                message: "event item limit".into(),
+            },
+        );
+        assert_eq!(
+            tokio::time::timeout(
+                FAILED_EVENT_DELIVERY_TIMEOUT + Duration::from_secs(1),
+                terminal_ack
+            )
+            .await
+            .expect("failed route must retire within its independent deadline")
+            .unwrap(),
+            Err(())
+        );
+        assert!(unusable.load(Ordering::Acquire));
+        drop(mailbox);
+        driver.await.unwrap().unwrap();
+
+        // An ordinary dead-turn receiver is item-local: later route events
+        // remain deliverable on the same driver.
+        let (mailbox, rx) = EventMailbox::with_limits(4, 1024);
+        let driver = tokio::spawn(run_event_mailbox(rx, Arc::new(AtomicBool::new(false))));
+        let (dead_tx, dead_rx) = mpsc::channel(1);
+        drop(dead_rx);
+        mailbox
+            .enqueue_data(
+                &test_route(dead_tx),
+                BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    "dead",
+                ))),
+            )
+            .unwrap();
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
+        mailbox
+            .enqueue_data(
+                &test_route(healthy_tx),
+                BridgeStreamItem::Update(SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    "healthy",
+                ))),
+            )
+            .unwrap();
+        assert!(matches!(
+            healthy_rx.recv().await,
+            Some(BridgeStreamItem::Update(_))
+        ));
+        drop(mailbox);
+        driver.await.unwrap().unwrap();
+    }
 
     #[derive(Debug)]
     struct DenyPolicy;
@@ -2489,6 +3444,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         crate::file_ops::install_write_gate(gate.clone());
+        let _gate_reset = WriteGateReset;
         let started = gate.started.notified();
         let probe = Arc::new(Mutex::new(CancellationProbe::default()));
         let probe_for_agent = probe.clone();
@@ -2542,6 +3498,214 @@ mod tests {
         let after_release = (first_target.exists(), second_target.exists());
         let _ = std::fs::remove_dir_all(raw);
         (result, before_release, after_release)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawned_write_quota_retires_actor_while_mutex_work_is_blocked() {
+        let _gate_lock = FILESYSTEM_WRITE_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let raw =
+            std::env::temp_dir().join(format!("agui-work-admission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&raw).unwrap();
+        let cwd = crate::file_ops::canonicalize_cwd(&raw).unwrap();
+        let paths: Vec<_> = ["first.txt", "second.txt", "third.txt"]
+            .into_iter()
+            .map(|name| cwd.join(name))
+            .collect();
+        let gate = Arc::new(crate::file_ops::WriteGate {
+            path: paths[0].clone(),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        crate::file_ops::install_write_gate(gate.clone());
+        let _gate_reset = WriteGateReset;
+        let started = gate.started.notified();
+        let work = WorkAdmission::with_limits(2, 4096);
+        let mut retired = work.retire_tx.subscribe();
+        let (third_tx, third_rx) = oneshot::channel();
+        let agent_gate = gate.clone();
+        let agent_paths: Vec<_> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let cfg = SessionConfig {
+            cwd,
+            policy: Arc::new(FilesystemPolicy {
+                capabilities: FileSystemCapabilities::new().write_text_file(true),
+            }),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with_work(cfg, work.clone(), move |stream| {
+            Box::pin(run_quota_write_agent(
+                stream,
+                agent_paths,
+                agent_gate,
+                third_rx,
+            ))
+        })
+        .await
+        .expect("filesystem quota session opens");
+        let mut prompt = handle.prompt("quota").await.expect("prompt opens");
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("first write reaches existing filesystem gate");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while work.usage.lock().unwrap().items != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first gated and second mutex-queued requests are both charged");
+        assert_eq!(work.usage.lock().unwrap().items, 2);
+        third_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), retired.changed())
+            .await
+            .expect("third RPC retires work admission")
+            .expect("work admission sender remains alive");
+
+        let mut run_errors = 0;
+        while let Some(item) = tokio::time::timeout(Duration::from_secs(5), prompt.events.recv())
+            .await
+            .expect("quota error reaches the active prompt")
+        {
+            match item {
+                BridgeStreamItem::RunError { message } => {
+                    run_errors += 1;
+                    assert!(message.contains("ACP_SPAWNED_WORK"), "{message}");
+                }
+                BridgeStreamItem::Finished { .. } => panic!("quota retirement emitted Finished"),
+                _ => {}
+            }
+        }
+        assert_eq!(run_errors, 1, "exactly one terminal quota error is emitted");
+        assert!(
+            prompt.finished.await.is_err(),
+            "retired prompt is not successful"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
+            .await
+            .expect("quota retirement closes the session handle");
+
+        gate.release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while work.usage.lock().unwrap().items != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both queued and blocking work credits release");
+        assert!(
+            !paths[2].exists(),
+            "third request never reaches a write executor"
+        );
+        crate::file_ops::clear_write_gate();
+        let _ = std::fs::remove_dir_all(raw);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_quota_write_agent(
+        stream: tokio::io::DuplexStream,
+        paths: Vec<String>,
+        gate: Arc<crate::file_ops::WriteGate>,
+        third_trigger: oneshot::Receiver<()>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PromptResponse,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+        Agent
+            .builder()
+            .name("agui-bridge-work-admission-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("quota-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let paths = paths.clone();
+                    let gate = gate.clone();
+                    let third_trigger = Arc::new(Mutex::new(Some(third_trigger)));
+                    async move |req: PromptRequest, responder, cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let paths = paths.clone();
+                        let gate = gate.clone();
+                        let third_trigger = third_trigger.lock().expect("test trigger poisoned").take().unwrap();
+                        let spawn_cx = cx.clone();
+                        spawn_cx.spawn(async move {
+                            let session_id = req.session_id;
+                            let mut tasks = Vec::new();
+                            let mut third_trigger = Some(third_trigger);
+                            let first_started = gate.started.notified();
+                            tokio::pin!(first_started);
+                            for (index, path) in paths.into_iter().enumerate() {
+                                let request_cx = cx.clone();
+                                let request_spawn = request_cx.clone();
+                                let session_id = session_id.clone();
+                                let (done_tx, done_rx) = oneshot::channel();
+                                tasks.push(done_rx);
+                                request_spawn.spawn(async move {
+                                    let request = WriteTextFileRequest::new(
+                                        session_id,
+                                        path,
+                                        format!("write-{index}"),
+                                    );
+                                    let _ = request_cx.send_request(request).block_task().await;
+                                    let _ = done_tx.send(());
+                                    Ok(())
+                                })
+                                .expect("agent outbound write task starts");
+                                if index == 0 {
+                                    first_started.as_mut().await;
+                                }
+                                if index == 1 {
+                                    let _ = third_trigger.take().unwrap().await;
+                                }
+                            }
+                            for task in tasks {
+                                let _ = task.await;
+                            }
+                            responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found()),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
     }
 
     #[cfg(target_os = "linux")]
@@ -2660,7 +3824,6 @@ mod tests {
         missing: String,
         invalid_utf8: String,
         ordinary_io: String,
-        oversized_write: String,
     }
 
     #[cfg(target_os = "linux")]
@@ -2670,7 +3833,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    async fn run_filesystem_boundary_probe() -> (BoundaryProbe, bool) {
+    async fn run_filesystem_boundary_probe() -> BoundaryProbe {
         let raw =
             std::env::temp_dir().join(format!("agui-filesystem-boundary-{}", uuid::Uuid::new_v4()));
         let outside_raw = std::env::temp_dir().join(format!(
@@ -2693,7 +3856,6 @@ mod tests {
                 .join("child.txt")
                 .to_string_lossy()
                 .into_owned(),
-            oversized_write: cwd.join("oversized.txt").to_string_lossy().into_owned(),
         };
         let probe = Arc::new(Mutex::new(BoundaryProbe::default()));
         let probe_for_agent = probe.clone();
@@ -2723,10 +3885,9 @@ mod tests {
         assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
         drop(handle);
         let result = probe.lock().unwrap().clone();
-        let oversized_exists = raw.join("oversized.txt").exists();
         let _ = std::fs::remove_dir_all(raw);
         let _ = std::fs::remove_dir_all(outside_raw);
-        (result, oversized_exists)
+        result
     }
 
     #[cfg(target_os = "linux")]
@@ -2779,7 +3940,7 @@ mod tests {
                                 Ok(_) => 0,
                                 Err(error) => error.code.into(),
                             };
-                            let mut codes = Vec::with_capacity(6);
+                            let mut codes = Vec::with_capacity(5);
                             codes.push(
                                 code(cx_for_requests
                                     .send_request(ReadTextFileRequest::new(
@@ -2830,18 +3991,6 @@ mod tests {
                                 Err(error) => error.code.into(),
                             });
 
-                            let oversized = cx_for_requests
-                                .send_request(WriteTextFileRequest::new(
-                                    session_id,
-                                    paths.oversized_write,
-                                    "x".repeat(crate::file_ops::MAX_TEXT_FILE_BYTES + 1),
-                                ))
-                                .block_task()
-                                .await;
-                            codes.push(match oversized {
-                                Ok(_) => 0,
-                                Err(error) => error.code.into(),
-                            });
                             probe.lock().unwrap().codes = codes;
                             responder.respond(PromptResponse::new(StopReason::EndTurn))
                         })
@@ -2860,6 +4009,90 @@ mod tests {
                             .respond_with_error(agent_client_protocol::util::internal_error(
                                 "unhandled request",
                             )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn run_oversized_frame_agent(
+        stream: tokio::io::DuplexStream,
+        target_path: String,
+        result_tx: oneshot::Sender<Option<String>>,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PromptResponse,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+        Agent
+            .builder()
+            .name("agui-bridge-oversized-wire-frame-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("wire-limit-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let target_path = Arc::new(target_path);
+                    let result_tx = Arc::new(Mutex::new(Some(result_tx)));
+                    async move |req: PromptRequest,
+                                responder,
+                                cx: ConnectionTo<agent_client_protocol::Client>| {
+                        let target_path = target_path.clone();
+                        let result_tx = result_tx.clone();
+                        let spawn_cx = cx.clone();
+                        spawn_cx.spawn(async move {
+                            let request = WriteTextFileRequest::new(
+                                req.session_id,
+                                target_path.as_str(),
+                                "x".repeat(16 * 1024 * 1024 + 1),
+                            );
+                            let result = cx.send_request(request).block_task().await;
+                            let result = match result {
+                                Ok(_) => None,
+                                Err(error) => Some(error.to_string()),
+                            };
+                            if let Some(tx) =
+                                result_tx.lock().expect("wire result poisoned").take()
+                            {
+                                let _ = tx.send(result);
+                            }
+                            let _ = responder.respond(PromptResponse::new(StopReason::EndTurn));
+                            Ok(())
+                        })
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found()),
                         agent_client_protocol::Dispatch::Notification(_) => Ok(()),
                     }
                 },
@@ -3132,20 +4365,108 @@ mod tests {
         if !crate::file_ops::read_text_file_supported() {
             return;
         }
-        let (probe, oversized_exists) = run_filesystem_boundary_probe().await;
-        assert_eq!(
-            probe.codes,
-            vec![-32602, -32602, -32002, -32603, -32603, -32602]
+        let probe = run_filesystem_boundary_probe().await;
+        assert_eq!(probe.codes, vec![-32602, -32602, -32002, -32603, -32603]);
+    }
+
+    #[test]
+    fn oversized_write_rpc_preflight_returns_invalid_params_without_creating_file() {
+        let raw = std::env::temp_dir().join(format!(
+            "agui-oversized-write-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&raw).unwrap();
+        let target = raw.join("oversized.txt");
+        let request = WriteTextFileRequest::new(
+            SessionId::from("oversized-preflight-test"),
+            target.to_string_lossy().into_owned(),
+            "x".repeat(crate::file_ops::MAX_TEXT_FILE_BYTES + 1),
+        );
+        let error = write_content_validation_error(&request.content)
+            .expect("oversized content must fail before filesystem access");
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(!target.exists(), "invalid request cannot create its target");
+        let _ = std::fs::remove_dir_all(raw);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_wire_frame_is_rejected_by_guarded_inprocess_transport() {
+        let raw = std::env::temp_dir().join(format!(
+            "agui-oversized-wire-frame-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&raw).unwrap();
+        let cwd = crate::file_ops::canonicalize_cwd(&raw).unwrap();
+        let target = cwd.join("must-not-exist.txt");
+        let target_path = target.to_string_lossy().into_owned();
+        let (agent_result_tx, agent_result_rx) = oneshot::channel();
+        let cfg = SessionConfig {
+            cwd,
+            policy: Arc::new(FilesystemPolicy {
+                capabilities: FileSystemCapabilities::new().write_text_file(true),
+            }),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(run_oversized_frame_agent(
+                stream,
+                target_path,
+                agent_result_tx,
+            ))
+        })
+        .await
+        .expect("wire-boundary session opens");
+        let mut prompt = handle.prompt("oversized-wire").await.expect("prompt opens");
+        let run_error = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(item) = prompt.events.recv().await {
+                match item {
+                    BridgeStreamItem::RunError { message } => return message,
+                    BridgeStreamItem::Finished { .. } => {
+                        panic!("oversized frame must not produce RunFinished")
+                    }
+                    _ => {}
+                }
+            }
+            panic!("oversized frame ended the stream without a terminal RunError")
+        })
+        .await
+        .expect("guarded wire frame rejection finishes promptly");
+        assert!(handle.is_unusable(), "oversized frame poisons the session");
+        tokio::time::timeout(Duration::from_secs(5), handle.closed())
+            .await
+            .expect("oversized frame closes the session handle");
+        assert!(
+            !target.exists(),
+            "oversized frame must be rejected before the write handler executes"
+        );
+        let agent_error = tokio::time::timeout(Duration::from_secs(10), agent_result_rx)
+            .await
+            .expect("agent outbound request observes the closed transport")
+            .expect("agent reports its send result");
+        assert!(
+            agent_error.is_some(),
+            "oversized write has no successful RPC reply"
         );
         assert!(
-            !oversized_exists,
-            "an oversized write must be rejected before touching disk"
+            run_error.contains("frame bytes limit exceeded")
+                || agent_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("frame bytes limit exceeded")),
+            "expected guarded transport frame diagnostic; run error={run_error:?}, agent error={agent_error:?}"
         );
+        let _ = std::fs::remove_dir_all(raw);
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn write_cancellation_is_deterministic_before_and_after_start() {
+        let _gate_lock = FILESYSTEM_WRITE_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !crate::file_ops::read_text_file_supported() {
             return;
         }
@@ -3269,5 +4590,344 @@ mod tests {
         assert!(next_list_cursor(MAX_LIST_PAGES - 1, Some("next".into())).is_ok());
         assert!(next_list_cursor(MAX_LIST_PAGES, Some("next".into())).is_err());
         assert!(next_list_cursor(MAX_LIST_PAGES, None).is_ok());
+    }
+
+    /// Policy that defers every permission request to the AG-UI client.
+    #[derive(Debug)]
+    struct DeferPolicy;
+
+    #[async_trait::async_trait]
+    impl crate::policy::PermissionPolicy for DeferPolicy {
+        async fn decide(
+            &self,
+            _request: &agent_client_protocol::schema::v1::RequestPermissionRequest,
+        ) -> PermissionDecision {
+            PermissionDecision::Defer {
+                interrupt_id: "test-interrupt".into(),
+            }
+        }
+    }
+
+    /// Regression agent for the dispatch-loop stall (BUG 1): on prompt it
+    /// floods more `session/update` notifications than the per-prompt event
+    /// channel holds and then issues a `requestPermission` request. Before
+    /// the fix, the notification handler's blocking send filled the channel
+    /// and hung the SDK's single dispatch loop, so neither the
+    /// `session/prompt` response nor the permission request was ever routed.
+    async fn run_flooding_permission_agent(
+        stream: tokio::io::DuplexStream,
+        update_count: usize,
+    ) -> Result<(), BridgeError> {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, ContentChunk, InitializeResponse, NewSessionRequest,
+            NewSessionResponse, PermissionOption, PermissionOptionId, PermissionOptionKind,
+            PromptResponse, SessionUpdate, StopReason, TextContent, ToolCallId, ToolCallUpdate,
+            ToolCallUpdateFields,
+        };
+
+        let (read, write) = tokio::io::split(stream);
+        let transport =
+            agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+
+        Agent
+            .builder()
+            .name("agui-bridge-flooding-permission-test")
+            .on_receive_request(
+                async move |req: InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new()),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: NewSessionRequest, responder, _cx| {
+                    responder.respond(NewSessionResponse::new(SessionId::from("flood-test")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: PromptRequest,
+                            responder: agent_client_protocol::Responder<
+                    agent_client_protocol::schema::v1::PromptResponse,
+                >,
+                            cx: ConnectionTo<agent_client_protocol::Client>| {
+                    let session_id = req.session_id;
+                    // Spawn: awaiting the permission response inline here
+                    // would block the agent's own dispatch loop (which must
+                    // stay free to read that very response).
+                    let cx_for_task = cx.clone();
+                    let _ = cx.spawn(async move {
+                        for i in 0..update_count {
+                            cx_for_task.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!("chunk-{i} "))),
+                                )),
+                            ))?;
+                        }
+                        // Then ask for permission — this must be readable by
+                        // the client even while the event channel is full.
+                        cx_for_task
+                            .send_request(RequestPermissionRequest::new(
+                                session_id.clone(),
+                                ToolCallUpdate::new(
+                                    ToolCallId::new("flood-tc"),
+                                    ToolCallUpdateFields::new().title("Flood permission"),
+                                ),
+                                vec![PermissionOption::new(
+                                    PermissionOptionId::new("allow-once"),
+                                    "Allow once",
+                                    PermissionOptionKind::AllowOnce,
+                                )],
+                            ))
+                            .block_task()
+                            .await?;
+                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                    });
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_dispatch(
+                async move |message: agent_client_protocol::Dispatch,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => {
+                            router.route_with_result(result)
+                        }
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder
+                            .respond_with_error(agent_client_protocol::util::internal_error(
+                                "unhandled request",
+                            )),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }
+                },
+                agent_client_protocol::on_receive_dispatch!(),
+            )
+            .connect_to(transport)
+            .await
+            .map_err(BridgeError::Acp)
+    }
+
+    /// Regression test for the dispatch-loop stall (BUG 1): the agent floods
+    /// 4x the per-prompt event channel's capacity with `session/update`s and
+    /// then issues a `requestPermission` mid-turn. Before the fix, the
+    /// notification handler's blocking send filled the channel and hung the
+    /// SDK's single sequential dispatch loop — the `session/prompt` response
+    /// and the permission request were never routed, so the turn never
+    /// completed. Now the mailbox delivers everything and the turn finishes.
+    #[tokio::test]
+    async fn flooding_updates_do_not_stall_dispatch_loop_and_permission_is_answered() {
+        use agent_client_protocol::schema::v1::PermissionOptionId;
+
+        // Default event_buffer is 64; flood well past it.
+        const UPDATE_COUNT: usize = 256;
+
+        let handle = spawn_in_process_session_with(
+            SessionConfig {
+                cwd: PathBuf::from("/"),
+                policy: Arc::new(DeferPolicy),
+                config: crate::config::BridgeConfig::default(),
+                mcp_url: None,
+                mcp_headers: Vec::new(),
+                load_session_id: None,
+            },
+            move |stream| Box::pin(run_flooding_permission_agent(stream, UPDATE_COUNT)),
+        )
+        .await
+        .expect("flooding session opens");
+
+        let mut prompt = handle.prompt("flood").await.expect("prompt opens");
+
+        // Consume like a slow-but-connected SSE consumer: drain events and,
+        // when the deferred permission interrupt surfaces, answer it from the
+        // "frontend". Before the fix the first recv() already timed out — the
+        // stalled dispatch loop could not even route the prompt response.
+        let mut updates = 0usize;
+        let mut interrupts = 0usize;
+        loop {
+            let item =
+                tokio::time::timeout(std::time::Duration::from_secs(10), prompt.events.recv())
+                    .await
+                    .expect("event arrives before timeout (dispatch loop must not stall)");
+            let Some(item) = item else {
+                break;
+            };
+            match item {
+                BridgeStreamItem::Update(_) => updates += 1,
+                BridgeStreamItem::Interrupt { .. } => {
+                    interrupts += 1;
+                    assert!(
+                        handle.resolve_permission(
+                            "test-interrupt",
+                            PermissionDecision::Allow {
+                                option_id: PermissionOptionId::new("allow-once"),
+                            },
+                        ),
+                        "interrupt resolution must be accepted mid-turn"
+                    );
+                }
+                BridgeStreamItem::Finished { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            interrupts >= 1,
+            "the agent's requestPermission must surface as an Interrupt"
+        );
+        assert_eq!(updates, UPDATE_COUNT);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), prompt.finished)
+                .await
+                .expect("finished arrives before timeout")
+                .expect("finished sender remains")
+                .expect("prompt succeeds"),
+            StopReason::EndTurn
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_turn_drains_deferred_permissions_before_next_turn() {
+        use agent_client_protocol::schema::v1::{
+            AgentCapabilities, InitializeResponse, NewSessionRequest, NewSessionResponse,
+            PermissionOption, PermissionOptionId, PermissionOptionKind, PromptResponse, ToolCallId,
+            ToolCallUpdate, ToolCallUpdateFields,
+        };
+
+        // The current fixture uses a constant interrupt ID; unique request IDs
+        // are needed here because all 80 callbacks remain pending together.
+        #[derive(Debug)]
+        struct UniqueDeferPolicy;
+        #[async_trait::async_trait]
+        impl crate::policy::PermissionPolicy for UniqueDeferPolicy {
+            async fn decide(&self, request: &RequestPermissionRequest) -> PermissionDecision {
+                PermissionDecision::Defer {
+                    interrupt_id: request.tool_call.fields.title.clone().unwrap(),
+                }
+            }
+        }
+        let (start_tx, mut start_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
+        let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel::<(usize, usize, bool)>();
+        let cfg = SessionConfig {
+            cwd: PathBuf::from("/"),
+            policy: Arc::new(UniqueDeferPolicy),
+            config: crate::config::BridgeConfig::default(),
+            mcp_url: None,
+            mcp_headers: Vec::new(),
+            load_session_id: None,
+        };
+        let handle = spawn_in_process_session_with(cfg, move |stream| {
+            Box::pin(async move {
+                let (read, write) = tokio::io::split(stream);
+                let transport = agent_client_protocol::ByteStreams::new(write.compat_write(), read.compat());
+                Agent.builder().name("completed-turn-permissions-test")
+                    .on_receive_request(async move |req: InitializeRequest, responder, _cx| {
+                        responder.respond(InitializeResponse::new(req.protocol_version).agent_capabilities(AgentCapabilities::new()))
+                    }, agent_client_protocol::on_receive_request!())
+                    .on_receive_request(async move |_req: NewSessionRequest, responder, _cx| {
+                        responder.respond(NewSessionResponse::new(SessionId::from("drain-test")))
+                    }, agent_client_protocol::on_receive_request!())
+                    .on_receive_request({
+                        let start_tx = start_tx.clone();
+                        let cancelled_tx = cancelled_tx.clone();
+                        async move |req: PromptRequest, responder, cx: ConnectionTo<agent_client_protocol::Client>| {
+                            let start_tx = start_tx.clone();
+                            let cancelled_tx = cancelled_tx.clone();
+                            let round = req.prompt.iter().filter_map(|b| match b { ContentBlock::Text(t) => t.text.parse::<usize>().ok(), _ => None }).next().unwrap();
+                            let (go_tx, go_rx) = oneshot::channel(); start_tx.send(go_tx).unwrap();
+                            let cx = cx.clone();
+                            let spawn_cx = cx.clone();
+                            spawn_cx.spawn(async move {
+                                for i in 0..80 {
+                                    let req = RequestPermissionRequest::new(req.session_id.clone(), ToolCallUpdate::new(ToolCallId::new(format!("{round}-{i}")), ToolCallUpdateFields::new().title(format!("{round}-{i}"))), vec![PermissionOption::new(PermissionOptionId::new("allow"), "Allow", PermissionOptionKind::AllowOnce)]);
+                                    let request_cx = cx.clone(); let request_spawn = request_cx.clone();
+                                    let cancelled_tx = cancelled_tx.clone();
+                                    let _ = request_cx.spawn(async move {
+                                        let result = request_spawn.send_request(req).block_task().await;
+                                        let cancelled = matches!(result, Ok(response) if response.outcome == RequestPermissionOutcome::Cancelled);
+                                        let _ = cancelled_tx.send((round, i, cancelled));
+                                        Ok(())
+                                    });
+                                }
+                                let _ = go_rx.await;
+                                responder.respond(PromptResponse::new(StopReason::EndTurn))
+                            }).expect("agent prompt task spawned"); Ok(())
+                        }
+                    }, agent_client_protocol::on_receive_request!())
+                    .on_receive_dispatch(async move |message: agent_client_protocol::Dispatch, _cx: ConnectionTo<agent_client_protocol::Client>| match message {
+                        agent_client_protocol::Dispatch::Response(result, router) => router.route_with_result(result),
+                        agent_client_protocol::Dispatch::Request(_, responder) => responder.respond_with_error(agent_client_protocol::Error::method_not_found()),
+                        agent_client_protocol::Dispatch::Notification(_) => Ok(()),
+                    }, agent_client_protocol::on_receive_dispatch!())
+                    .connect_to(transport).await.map_err(BridgeError::Acp)
+            })
+        }).await.expect("session opens");
+        for round in 0..2 {
+            let mut prompt = handle.prompt(round.to_string()).await.unwrap();
+            let release = start_rx.recv().await.unwrap();
+            let mut ids = Vec::new();
+            while ids.len() < 80 {
+                if let BridgeStreamItem::Interrupt { id, .. } = prompt.events.recv().await.unwrap()
+                {
+                    ids.push(id);
+                }
+            }
+            release.send(()).unwrap();
+            let mut finished = false;
+            while let Some(item) = prompt.events.recv().await {
+                if matches!(item, BridgeStreamItem::Finished { .. }) {
+                    finished = true;
+                    break;
+                }
+                assert!(!matches!(item, BridgeStreamItem::RunError { .. }));
+            }
+            assert!(finished);
+            assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
+            assert!(handle.pending_permissions().is_empty());
+            assert!(ids.iter().all(|id| !handle.resolve_permission(
+                id,
+                PermissionDecision::Allow {
+                    option_id: PermissionOptionId::new("allow")
+                }
+            )));
+            let mut cancelled_count = 0;
+            for _ in 0..80 {
+                let (actual_round, index, cancelled) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), cancelled_rx.recv())
+                        .await
+                        .expect("permission response arrives")
+                        .expect("agent response channel remains connected");
+                assert_eq!(actual_round, round);
+                assert!(index < 80);
+                assert!(
+                    cancelled,
+                    "request permission response must be Cancelled, not approval or another error"
+                );
+                cancelled_count += 1;
+            }
+            assert_eq!(cancelled_count, 80);
+        }
+        let mut prompt = handle.prompt("2").await.unwrap();
+        let release = start_rx.recv().await.unwrap();
+        let mut count = 0;
+        while count < 80 {
+            if matches!(
+                prompt.events.recv().await.unwrap(),
+                BridgeStreamItem::Interrupt { .. }
+            ) {
+                count += 1;
+            }
+        }
+        release.send(()).unwrap();
+        while let Some(item) = prompt.events.recv().await {
+            if matches!(item, BridgeStreamItem::Finished { .. }) {
+                break;
+            }
+        }
+        assert_eq!(prompt.finished.await.unwrap().unwrap(), StopReason::EndTurn);
+        assert_eq!(count, 80);
+        assert!(handle.pending_permissions().is_empty());
     }
 }

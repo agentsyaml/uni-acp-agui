@@ -272,3 +272,71 @@ async fn open_session_with_invalid_command_fails_fast() {
     let opened = result.expect("must not hang on bad command");
     assert!(opened.is_err(), "expected open_session to fail, got Ok");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_parent_exit_with_held_pipes_is_observed_and_group_killed() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let pid_file = std::env::temp_dir().join(format!(
+        "agui-acp-descendant-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = struct_drop_path(pid_file.clone());
+    let script = "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; exit 17";
+    let client = ProcessAcpClient::new("/bin/sh").with_args([
+        "-c",
+        script,
+        "agui-test",
+        pid_file.to_str().unwrap(),
+    ]);
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.open_session(cfg(std::env::current_dir().unwrap())),
+    )
+    .await;
+    let result = result.expect("opener must observe parent exit while descendant holds pipes");
+    let mut pid = None;
+    for _ in 0..300 {
+        if let Ok(value) = std::fs::read_to_string(&pid_file) {
+            pid = value.parse::<u32>().ok();
+            if pid.is_some() {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    let pid = pid.expect("launcher must publish descendant PID");
+    let error = result
+        .expect_err("agent exit 17 must fail opener")
+        .to_string();
+    assert!(error.contains("17"), "exit code must be reported: {error}");
+    for _ in 0..300 {
+        let alive = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "kill -0 \"$1\" 2>/dev/null",
+                "agui-probe",
+                &pid.to_string(),
+            ])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !alive {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("descendant {pid} remained alive after process-group cleanup");
+}
+
+#[cfg(unix)]
+fn struct_drop_path(path: std::path::PathBuf) -> impl Drop {
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    Cleanup(path)
+}

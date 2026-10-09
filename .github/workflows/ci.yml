@@ -66,12 +66,17 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Type-check
         run: bun run type-check
       - name: Lint
         run: bun run lint
+      - name: Contract and security regression tests
+        run: bun run test
       - name: Build
         run: bun run build
 
