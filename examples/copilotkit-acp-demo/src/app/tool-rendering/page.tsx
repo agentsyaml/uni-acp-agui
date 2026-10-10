@@ -1,6 +1,7 @@
 "use client";
 
-import { CopilotChat, useDefaultRenderTool } from "@copilotkit/react-core/v2";
+import { useDefaultRenderTool } from "@copilotkit/react-core/v2";
+import { ChatSurface } from "@/components/persistent-chat";
 
 /**
  * Tool-call rendering demo.
@@ -46,7 +47,7 @@ export default function ToolRenderingPage() {
       </header>
 
       <div className="demo-card h-[70vh] flex flex-col p-2">
-        <CopilotChat className="flex-1" />
+        <ChatSurface className="flex-1" />
       </div>
     </div>
   );

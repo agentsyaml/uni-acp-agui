@@ -88,22 +88,19 @@ pub enum BridgeStreamItem {
         id: String,
         request: RequestPermissionRequest,
     },
-    /// Start of a frontend-defined tool call routed through the bridge's
-    /// in-process MCP endpoint. The SSE task translates this into AG-UI
-    /// `TOOL_CALL_START` / `TOOL_CALL_ARGS`. The matching MCP request is
-    /// parked on a oneshot keyed by `tool_call_id`; the `/tool-response`
-    /// endpoint resolves it once the frontend posts back, at which point
-    /// the MCP endpoint emits a [`BridgeStreamItem::FrontendToolEnd`].
+    /// Complete frontend-defined invocation routed through the bridge's
+    /// in-process MCP endpoint. The SSE task sends its AG-UI start, optional
+    /// complete args, and end events in order before waiting for browser
+    /// execution. The matching MCP request remains parked on a oneshot keyed
+    /// by `tool_call_id` until `/tool-response` resolves it.
     FrontendToolCall {
         tool_call_id: String,
         tool_name: String,
         arguments: Value,
     },
-    /// Terminal half of a frontend tool call. Translated into
-    /// `TOOL_CALL_END`. Emitted by the MCP endpoint after the frontend
-    /// posts a result back, regardless of success — failures are
-    /// reflected in the MCP envelope returned to the agent, not in this
-    /// signal.
+    /// Legacy terminal signal for frontend tool calls. Canonical
+    /// [`BridgeStreamItem::FrontendToolCall`] items already contain their end
+    /// event; this variant remains for compatibility with older producers.
     FrontendToolEnd { tool_call_id: String },
     /// Terminal error for the run; converts into AG-UI `RUN_ERROR`.
     RunError { message: String },

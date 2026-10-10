@@ -215,6 +215,7 @@ async function driveRun(opts) {
   let toolEnded = false;
   let runFinished = false;
   let agentText = "";
+  const toolCalls = new Map();
 
   const decoder = new TextDecoder();
   let buf = "";
@@ -241,44 +242,49 @@ async function driveRun(opts) {
         switch (event.type) {
           case "TOOL_CALL_START": {
             toolCallSeen = true;
+            toolCalls.set(event.toolCallId, {
+              name: event.toolCallName,
+              args: "",
+            });
             console.log(
               `  → TOOL_CALL_START id=${event.toolCallId} name=${event.toolCallName}`,
             );
             break;
           }
           case "TOOL_CALL_ARGS": {
-            // Fire on ARGS-complete; the bridge sends raw_input as one delta.
             const id = event.toolCallId;
-            const argsStr = event.delta ?? "";
-            let parsed;
-            try {
-              parsed = JSON.parse(argsStr);
-            } catch {
-              break;
-            }
-            const result = opts.handler(parsed);
-            (async () => {
-              const r = await fetch(`${baseUrl}/tool-response`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  toolCallId: id,
-                  threadId: opts.threadId,
-                  content: result.content,
-                  isError: !result.ok,
-                }),
-              });
-              if (!r.ok) {
-                console.error(
-                  `tool-response ${r.status} for id=${id}: ${await r.text()}`,
-                );
-              }
-            })();
+            const call = toolCalls.get(id);
+            if (call) call.args += event.delta ?? "";
             break;
           }
-          case "TOOL_CALL_END":
+          case "TOOL_CALL_END": {
             toolEnded = true;
+            const id = event.toolCallId;
+            const call = toolCalls.get(id);
+            if (!call) break;
+            toolCalls.delete(id);
+            let args;
+            try {
+              args = call.args === "" ? {} : JSON.parse(call.args);
+            } catch (error) {
+              throw new Error(`invalid complete TOOL_CALL_ARGS JSON for ${id}: ${error}`);
+            }
+            const result = opts.handler(args);
+            const response = await fetch(`${baseUrl}/tool-response`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                toolCallId: id,
+                threadId: opts.threadId,
+                content: result.content,
+                isError: !result.ok,
+              }),
+            });
+            if (!response.ok) {
+              throw new Error(`tool-response ${response.status}: ${await response.text()}`);
+            }
             break;
+          }
           case "TEXT_MESSAGE_CONTENT":
             if (typeof event.delta === "string") agentText += event.delta;
             break;

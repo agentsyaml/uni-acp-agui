@@ -1,9 +1,9 @@
 "use client";
 
-import { CopilotChat } from "@copilotkit/react-core/v2";
 import { useState } from "react";
 import { z } from "zod";
 import { useAcpFrontendTool } from "@/hooks/use-acp-frontend-tool";
+import { ChatSurface } from "@/components/persistent-chat";
 
 /**
  * `useFrontendTool` end-to-end demo.
@@ -93,7 +93,7 @@ export default function FrontendToolsPage() {
 
       <div className="grid lg:grid-cols-2 gap-4">
         <div className="demo-card h-[70vh] flex flex-col p-2">
-          <CopilotChat className="flex-1" />
+          <ChatSurface className="flex-1" />
         </div>
 
         <div className="demo-card h-[70vh] flex flex-col">

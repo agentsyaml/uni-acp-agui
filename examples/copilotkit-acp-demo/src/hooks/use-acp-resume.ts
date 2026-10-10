@@ -4,6 +4,37 @@ import { useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useRef } from "react";
 import { useConversations } from "@/components/copilot-provider";
 
+type ResumeAgent = {
+  runAgent: (input: { forwardedProps: { acpResume: { sessionId: string } } }) => Promise<unknown>;
+};
+
+export function scheduleAcpResume(
+  agent: ResumeAgent | null | undefined,
+  isReady: boolean,
+  resumeToken: number,
+  resumeSessionId: string | null,
+  resumeError: string | null,
+  lastHandledToken: { current: number },
+  reportResumeFailure: (message: string) => void,
+  timer = { setTimeout, clearTimeout },
+) {
+  if (
+    !isReady || !agent || resumeToken === 0 ||
+    resumeToken === lastHandledToken.current || !resumeSessionId || resumeError
+  ) return;
+
+  const id = timer.setTimeout(() => {
+    lastHandledToken.current = resumeToken;
+    void agent
+      .runAgent({ forwardedProps: { acpResume: { sessionId: resumeSessionId } } })
+      .catch((err: unknown) => {
+        console.error("[useAcpResume] resume run failed", err);
+        reportResumeFailure(err instanceof Error ? err.message : String(err));
+      });
+  }, 0);
+  return () => timer.clearTimeout(id);
+}
+
 /**
  * Drives an **explicit resume run** when the user opens a past conversation.
  *
@@ -21,10 +52,12 @@ import { useConversations } from "@/components/copilot-provider";
  * agent replays the conversation history as AG-UI `TEXT_MESSAGE_*` events,
  * which `runAgent` applies to `agent.messages`, and `<CopilotChat>` renders.
  *
- * Keyed on `resumeToken` so re-opening the same conversation re-resumes.
+ * Mounted with the persistent CopilotChat controller so route changes do
+ * not drop the resume listener. Keyed on `resumeToken` so reopening a
+ * conversation re-runs the explicit resume.
  */
 export function useAcpResume() {
-  const { agent } = useAgent();
+  const { agent, isReady } = useAgent();
   const {
     resumeSessionId,
     threadId,
@@ -35,45 +68,22 @@ export function useAcpResume() {
   const lastHandledToken = useRef<number>(0);
 
   useEffect(() => {
-    if (!agent) return;
-    // resumeToken starts at 0 (initial load, not an explicit open). Only act
-    // on genuine user-driven opens.
-    if (
-      resumeToken === 0 ||
-      resumeToken === lastHandledToken.current ||
-      !resumeSessionId
-    )
-      return;
-    lastHandledToken.current = resumeToken;
-
-    // `<CopilotChat threadId={threadId}>` binds the agent's threadId in its
-    // own layout effect. Defer to a microtask so that binding (and the
-    // matching message reset) is in place before we fire the run, then issue
-    // an explicit private resume run (no new user message). The bridge only
-    // issues session/load when this marker is present; normal bootstrap runs
-    // remain ordinary connection/no-op runs.
+    // The persistent `<CopilotChat threadId={threadId}>` binds the new agent
+    // thread independently of route surfaces. Defer the resume run until
+    // after that thread binding and message reset have committed. The bridge
+    // only issues session/load when this marker is present.
     //
     // We do NOT mutate the agent object directly (threadId/messages) — the
     // React Compiler treats it as immutable, and CopilotChat owns that state.
     // Don't retry automatically after a failure: the stale session id has
     // already been cleared, so refiring would just error again on reload.
-    if (resumeError) return;
-
-    const id = setTimeout(() => {
-      void agent
-        .runAgent({
-          forwardedProps: { acpResume: { sessionId: resumeSessionId } },
-        })
-        .catch((err: unknown) => {
-          console.error("[useAcpResume] resume run failed", err);
-          reportResumeFailure(
-            err instanceof Error ? err.message : String(err),
-          );
-        });
-    }, 0);
-    return () => clearTimeout(id);
+    return scheduleAcpResume(
+      agent, isReady, resumeToken, resumeSessionId, resumeError,
+      lastHandledToken, reportResumeFailure,
+    );
   }, [
     agent,
+    isReady,
     resumeSessionId,
     threadId,
     resumeToken,

@@ -1,8 +1,9 @@
 "use client";
 
-import { useAgent, CopilotChat } from "@copilotkit/react-core/v2";
+import { useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useRef, useState } from "react";
 import { approvalRequestBody } from "@/lib/approval";
+import { ChatSurface } from "@/components/persistent-chat";
 
 type PermissionOption = {
   optionId?: string;
@@ -244,7 +245,7 @@ export default function ApprovalPage() {
 
       <div className="grid lg:grid-cols-2 gap-4">
         <div className="demo-card h-[60vh] flex flex-col p-2">
-          <CopilotChat className="flex-1" />
+          <ChatSurface className="flex-1" />
         </div>
 
         <div className="demo-card h-[60vh] flex flex-col">

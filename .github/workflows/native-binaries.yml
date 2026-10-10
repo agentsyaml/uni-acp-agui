@@ -1,0 +1,81 @@
+name: Native binaries
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            python: python3
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            python: python3
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            python: python
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6.1.0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Verify native runner and test workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '/^host: / {print $2}')"
+          test "$host" = '${{ matrix.target }}' || { printf 'runner host %s != target %s\n' "$host" '${{ matrix.target }}' >&2; exit 1; }
+          cargo test --workspace --all-targets --all-features --locked
+      - name: Build distributable CLI
+        shell: bash
+        run: cargo build --locked --release -p agui-acp-bridge-cli --bin agui-acp-bridge --target '${{ matrix.target }}'
+      - name: Package and check binary
+        shell: bash
+        run: |
+          version="$(${{ matrix.python }} -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          ${{ matrix.python }} scripts/release.py package --binary "target/${{ matrix.target }}/release/agui-acp-bridge${{ runner.os == 'Windows' && '.exe' || '' }}" --target '${{ matrix.target }}' --version "$version" --output dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-artifacts:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.1.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: native-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.x'
+      - name: Verify complete artifact set and checksums
+        run: |
+          python scripts/test_release.py
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          python scripts/release.py check --directory dist --version "$version"

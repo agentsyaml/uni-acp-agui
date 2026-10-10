@@ -1,8 +1,9 @@
 "use client";
 
-import { useAgent, CopilotChat } from "@copilotkit/react-core/v2";
+import { useAgent } from "@copilotkit/react-core/v2";
 import type { BaseEvent } from "@ag-ui/client";
 import { useEffect, useState } from "react";
+import { ChatSurface } from "@/components/persistent-chat";
 
 type LogEntry = {
   ts: string;
@@ -51,7 +52,7 @@ export default function RawEventsPage() {
 
       <div className="grid lg:grid-cols-2 gap-4">
         <div className="demo-card h-[70vh] flex flex-col p-2">
-          <CopilotChat className="flex-1" />
+          <ChatSurface className="flex-1" />
         </div>
 
         <div className="demo-card h-[70vh] flex flex-col">

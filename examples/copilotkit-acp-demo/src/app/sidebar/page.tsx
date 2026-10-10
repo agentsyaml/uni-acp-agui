@@ -1,6 +1,6 @@
 "use client";
 
-import { CopilotSidebar } from "@copilotkit/react-core/v2";
+import { ChatSurface } from "@/components/persistent-chat";
 
 export default function SidebarPage() {
   return (
@@ -34,7 +34,7 @@ export default function SidebarPage() {
         </p>
       </article>
 
-      <CopilotSidebar defaultOpen={false} />
+      <ChatSurface sidebar />
     </div>
   );
 }

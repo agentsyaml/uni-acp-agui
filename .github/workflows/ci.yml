@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -17,10 +19,13 @@ jobs:
         toolchain: ["1.88.0", stable]
         features: [default, all-features, no-default-features]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
       - name: Test workspace
         shell: bash
         run: |
@@ -45,11 +50,12 @@ jobs:
     name: Rust quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
@@ -62,7 +68,7 @@ jobs:
       run:
         working-directory: examples/copilotkit-acp-demo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.1.0
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
@@ -85,13 +91,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - name: Audit Rust dependencies
         uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
@@ -105,3 +114,6 @@ jobs:
       - name: Block critical frontend advisories
         working-directory: examples/copilotkit-acp-demo
         run: bun audit --audit-level=critical
+
+  native-binaries:
+    uses: ./.github/workflows/native-binaries.yml

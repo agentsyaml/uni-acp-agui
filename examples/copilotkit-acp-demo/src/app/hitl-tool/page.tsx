@@ -1,9 +1,9 @@
 "use client";
 
-import { CopilotChat } from "@copilotkit/react-core/v2";
 import { useState } from "react";
 import { z } from "zod";
 import { useAcpHumanInTheLoop } from "@/hooks/use-acp-human-in-the-loop";
+import { ChatSurface } from "@/components/persistent-chat";
 
 /**
  * Human-in-the-loop tool demo.
@@ -148,7 +148,7 @@ export default function HitlToolPage() {
 
       <div className="grid lg:grid-cols-2 gap-4">
         <div className="demo-card h-[60vh] flex flex-col p-2">
-          <CopilotChat className="flex-1" />
+          <ChatSurface className="flex-1" />
         </div>
 
         <div className="demo-card h-[60vh] flex flex-col">

@@ -1,16 +1,16 @@
 "use client";
 
-import { CopilotChat, useAgent } from "@copilotkit/react-core/v2";
+import { useAgent } from "@copilotkit/react-core/v2";
 import { useEffect, useState } from "react";
 import { ConversationHistory } from "@/components/conversation-history";
 import { useConversations } from "@/components/copilot-provider";
-import { useAcpResume } from "@/hooks/use-acp-resume";
+import { ChatSurface } from "@/components/persistent-chat";
 import { friendlyRunErrorMessage } from "@/lib/agui-run-errors";
 
 export default function ChatPage() {
   // The active AG-UI thread comes from the conversation switcher. It remains
   // distinct from the ACP SessionId used by an explicit resume.
-  const { threadId, resumeError, dismissResumeError } = useConversations();
+  const { resumeError, dismissResumeError } = useConversations();
   const { agent } = useAgent();
   const [runError, setRunError] = useState<string | null>(null);
 
@@ -30,11 +30,6 @@ export default function ChatPage() {
     });
     return () => subscription.unsubscribe();
   }, [agent]);
-
-  // Drive an explicit `session/load` resume run when a past conversation is
-  // opened. CopilotKit's own connect path does not reach a self-hosted
-  // bridge, so we trigger the resume ourselves (see the hook docs).
-  useAcpResume();
 
   return (
     <div className="space-y-6">
@@ -76,13 +71,9 @@ export default function ChatPage() {
       <div className="demo-card h-[70vh] flex overflow-hidden p-0">
         <ConversationHistory />
         <div className="flex-1 flex flex-col p-2">
-          <CopilotChat
-            threadId={threadId}
+          <ChatSurface
             className="flex-1"
-            labels={{
-              welcomeMessageText:
-                "Hi, I'm opencode wired through the agui-acp-bridge. Ask me anything.",
-            }}
+            welcomeMessageText="Hi, I'm opencode wired through the agui-acp-bridge. Ask me anything."
           />
         </div>
       </div>

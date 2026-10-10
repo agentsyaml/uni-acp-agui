@@ -3,6 +3,10 @@
 import { useAgent, useFrontendTool } from "@copilotkit/react-core/v2";
 import { useEffect, useRef } from "react";
 import type { StandardSchemaV1 } from "@standard-schema/spec";
+import {
+  frontendToolDeclaration,
+  subscribeAcpFrontendTool,
+} from "@/lib/acp-frontend-tool-subscriber";
 
 /**
  * Single-hook API for AG-UI frontend tools driven through the
@@ -28,11 +32,10 @@ import type { StandardSchemaV1 } from "@standard-schema/spec";
  *    on a single canonical path: the bridge's MCP route.
  *
  * 2. Subscribes to AG-UI tool-call events on the same agent. When the
- *    bridge dispatches a `TOOL_CALL_START` whose name matches `name`
- *    (or its MCP-prefixed variant `agui-acp-bridge_<name>`), the hook
- *    waits for the args to arrive, runs the user-supplied handler, and
- *    POSTs the result to `/api/bridge/tool-response`. That endpoint is
- *    a thin Next.js proxy to the bridge's `/tool-response`.
+ *    bridge dispatches a matching `TOOL_CALL_START`, the hook accumulates
+ *    arguments and runs the handler only on `TOOL_CALL_END`, then POSTs
+ *    the result to `/api/bridge/tool-response`, a thin Next.js proxy to
+ *    the bridge's `/tool-response`.
  *
  * Parallel tool calls are tracked in a `Map` keyed by `toolCallId`, so
  * the agent issuing two calls in the same turn (`Estimate A100` *and*
@@ -79,14 +82,15 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
   // Register only the *declaration* with CopilotKit so it ends up in
   // `RunAgentInput.tools`. We deliberately omit `handler` and force
   // `followUp: false` — see the class doc for why.
-  useFrontendTool({
-    name: opts.name,
-    description: opts.description ?? "",
-    parameters: opts.parameters as
-      | StandardSchemaV1<unknown, Record<string, unknown>>
-      | undefined,
-    followUp: false,
-  });
+  useFrontendTool(
+    frontendToolDeclaration({
+      name: opts.name,
+      description: opts.description ?? "",
+      parameters: opts.parameters as
+        | StandardSchemaV1<unknown, Record<string, unknown>>
+        | undefined,
+    }),
+  );
 
   // Refs let us update the user-supplied handler without re-subscribing.
   const handlerRef = useRef(opts.handler);
@@ -104,109 +108,11 @@ export function useAcpFrontendTool<Args extends Record<string, unknown>>(opts: {
   useEffect(() => {
     if (!agent) return;
 
-    type ActiveCall = {
-      id: string;
-      threadId: string;
-      argsDelta: string;
-      resolved: boolean;
-    };
-    // Tracking *every* in-flight call (not just the most recent) is
-    // required for parallel tool calls. The agent legitimately emits
-    // `Estimate the cost of 3 units of A100 and 2 of B200` as two
-    // independent TOOL_CALL_START events; a single-slot tracker would
-    // overwrite the first and strand it.
-    const activeCalls = new Map<string, ActiveCall>();
-
-    const subscription = agent.subscribe({
-      onToolCallStartEvent: ({ event }) => {
-        const e = event as {
-          toolCallId?: string;
-          toolCallName?: string;
-        };
-        const id = e.toolCallId ?? "";
-        const name = e.toolCallName ?? "";
-        const threadId = agent.threadId;
-        if (!id || !threadId || !matchNamesRef.current.has(name)) {
-          return;
-        }
-        activeCalls.set(id, { id, threadId, argsDelta: "", resolved: false });
-      },
-      onToolCallArgsEvent: ({ event }) => {
-        const e = event as { toolCallId?: string; delta?: string };
-        const id = e.toolCallId ?? "";
-        const call = activeCalls.get(id);
-        if (!call || call.resolved) return;
-        call.argsDelta += e.delta ?? "";
-        // Deliberately do NOT parse or fire here: a valid JSON *prefix*
-        // (e.g. `{}`) would parse before the full args arrive and fire the
-        // handler prematurely. The handler runs exclusively on
-        // TOOL_CALL_END, where the args are complete.
-      },
-      onToolCallEndEvent: ({ event }) => {
-        const e = event as { toolCallId?: string };
-        const id = e.toolCallId ?? "";
-        const call = activeCalls.get(id);
-        if (!call || call.resolved) return;
-        call.resolved = true;
-        // No-arg tool path: the agent ended the call without ever
-        // streaming args, leaving `argsDelta` empty. Fire with `{}` so the
-        // bridge's MCP request resolves instead of timing out.
-        let args = {} as Args;
-        if (call.argsDelta.length > 0) {
-          try {
-            args = JSON.parse(call.argsDelta) as Args;
-          } catch (err) {
-            logRef.current(
-              "[useAcpFrontendTool] unparseable tool-call args; resolving with {}",
-              { toolCallId: id, err },
-            );
-          }
-        }
-        void runHandler(id, call.threadId, args);
-        activeCalls.delete(id);
-      },
+    return subscribeAcpFrontendTool<Args>(agent, {
+      matchNames: () => matchNamesRef.current,
+      handler: (args) => handlerRef.current(args),
+      log: (...args) => logRef.current(...args),
     });
-
-    return () => {
-      subscription.unsubscribe();
-      activeCalls.clear();
-    };
-
-    async function runHandler(toolCallId: string, threadId: string, args: Args) {
-      let isError = false;
-      let content: string;
-      try {
-        const result = await Promise.resolve(handlerRef.current(args));
-        content = typeof result === "string" ? result : JSON.stringify(result);
-        logRef.current("[useAcpFrontendTool] resolved", {
-          toolCallId,
-          content,
-        });
-      } catch (err) {
-        isError = true;
-        content = err instanceof Error ? err.message : String(err);
-        logRef.current("[useAcpFrontendTool] handler errored", {
-          toolCallId,
-          err,
-        });
-      }
-      try {
-        const res = await fetch("/api/bridge/tool-response", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ threadId, toolCallId, content, isError }),
-        });
-        if (!res.ok) {
-          logRef.current(
-            "[useAcpFrontendTool] /tool-response non-ok",
-            res.status,
-            await res.text(),
-          );
-        }
-      } catch (postErr) {
-        logRef.current("[useAcpFrontendTool] /tool-response failed", postErr);
-      }
-    }
   }, [agent]);
 }
 

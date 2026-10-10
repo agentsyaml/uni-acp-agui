@@ -1,6 +1,7 @@
 "use client";
 
 import { CopilotKit } from "@copilotkit/react-core/v2";
+import { PersistentChatHost } from "@/components/persistent-chat";
 import {
   createContext,
   useCallback,
@@ -189,7 +190,7 @@ export function CopilotProvider({ children }: { children: ReactNode }) {
   return (
     <CopilotKit runtimeUrl="/api/copilotkit" threadId={threadId}>
       <ConversationsContext.Provider value={ctx}>
-        {children}
+        <PersistentChatHost>{children}</PersistentChatHost>
       </ConversationsContext.Provider>
     </CopilotKit>
   );

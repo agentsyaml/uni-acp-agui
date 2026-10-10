@@ -11,6 +11,8 @@ The bridge translates supported ACP turns and updates into AG-UI events, with op
 
 Security boundaries and current dependency advisories: [Security notes](./docs/SECURITY_NOTES.md).
 
+Release process and binary portability notes: [Releasing](./docs/RELEASING.md).
+
 ## Quick start
 
 Spin up an in-process echo gateway (no external agent binary required):
@@ -242,6 +244,8 @@ Workspace layout:
 | `agui-acp-bridge-policy` | `PermissionPolicy` implementations: `AutoAllow` / `AutoDeny` / `Allowlist` / `InterruptViaAgUiEvent` |
 | `agui-acp-bridge-server` | `BridgeHandler`, `BridgeAppState`, `build_router`, AG-UI SSE/session routes, auth, and frontend-tool MCP |
 | `agui-acp-bridge-cli`    | The `agui-acp-bridge` binary                                                                    |
+
+For the server/core module map, see [Code structure](./docs/CODE_STRUCTURE.md).
 
 End-to-end demos in `crates/agui-acp-bridge-server/examples/`:
 
