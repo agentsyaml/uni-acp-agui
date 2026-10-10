@@ -119,11 +119,12 @@ fn prefer_observed_process_failure<T>(
     diagnostic: &ProcessDiagnostic,
 ) -> Result<T, BridgeError> {
     match result {
-        Err(BridgeError::Acp(error))
-            if agent_client_protocol::is_incoming_transport_closed(&error) =>
+        Err(error @ BridgeError::SessionClosed) | Err(error @ BridgeError::Acp(_))
+            if matches!(error, BridgeError::SessionClosed)
+                || matches!(&error, BridgeError::Acp(error) if agent_client_protocol::is_incoming_transport_closed(error)) =>
         {
             let (Some(status), stderr) = diagnostic.snapshot() else {
-                return Err(BridgeError::Acp(error));
+                return Err(error);
             };
             Err(BridgeError::Io(std::io::Error::other(format!(
                 "ACP agent exited with {status}; stderr: {}",
@@ -196,6 +197,79 @@ mod tests {
         assert!(
             prefer_observed_process_failure(Ok::<_, BridgeError>(7), &diagnostic).unwrap() == 7
         );
+        assert!(matches!(
+            prefer_observed_process_failure::<()>(Err(BridgeError::SessionClosed), &diagnostic),
+            Err(BridgeError::SessionClosed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observed_exit_overrides_background_first_session_closed() {
+        use futures::FutureExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        #[derive(Debug)]
+        struct DenyPolicy;
+        #[async_trait::async_trait]
+        impl crate::policy::PermissionPolicy for DenyPolicy {
+            async fn decide(
+                &self,
+                _request: &agent_client_protocol::schema::v1::RequestPermissionRequest,
+            ) -> crate::policy::PermissionDecision {
+                crate::policy::PermissionDecision::Deny
+            }
+        }
+
+        struct FailingConnector(ProcessDiagnostic);
+        impl agent_client_protocol::ConnectTo<agent_client_protocol::Client> for FailingConnector {
+            async fn connect_to(
+                self,
+                _client: impl agent_client_protocol::ConnectTo<agent_client_protocol::Agent>,
+            ) -> agent_client_protocol::Result<()> {
+                unreachable!("the test connector supplies its transport future")
+            }
+
+            fn into_channel_and_future(
+                self,
+            ) -> (
+                agent_client_protocol::Channel,
+                futures::future::BoxFuture<'static, agent_client_protocol::Result<()>>,
+            ) {
+                let (endpoint, peer) = agent_client_protocol::Channel::duplex();
+                let diagnostic = self.0;
+                let future = async move {
+                    let _peer = peer;
+                    diagnostic.observe_failure(&std::process::ExitStatus::from_raw(17 << 8));
+                    diagnostic.append_stderr(b"background failure");
+                    Err(agent_client_protocol::Error::internal_error())
+                }
+                .boxed();
+                (endpoint, future)
+            }
+        }
+
+        let diagnostic = ProcessDiagnostic::default();
+        let result = crate::session::spawn_session(
+            FailingConnector(diagnostic.clone()),
+            SessionConfig {
+                cwd: std::env::current_dir().unwrap(),
+                policy: std::sync::Arc::new(DenyPolicy),
+                config: crate::BridgeConfig::default(),
+                mcp_url: None,
+                mcp_headers: Vec::new(),
+                load_session_id: None,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(BridgeError::SessionClosed)));
+        let observed = prefer_observed_process_failure(result, &diagnostic).unwrap_err();
+        assert!(matches!(
+            observed,
+            BridgeError::Io(ref error)
+                if error.to_string().contains("17")
+                    && error.to_string().contains("background failure")
+        ));
     }
 
     #[test]

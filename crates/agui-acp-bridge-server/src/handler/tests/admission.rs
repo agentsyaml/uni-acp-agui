@@ -1,4 +1,9 @@
 use super::*;
+
+fn test_cwd() -> PathBuf {
+    std::env::current_dir().expect("test working directory is absolute")
+}
+
 #[test]
 fn run_admission_releases_only_its_own_claim() {
     let state = BridgeAppState::new(Arc::new(InProcessAcpClient::new()), PathBuf::from("/"));
@@ -158,7 +163,7 @@ impl AcpClient for ListCountingClient {
         self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(vec![agui_acp_bridge_core::SessionSummary {
             session_id: "listed-session".into(),
-            cwd: "/".into(),
+            cwd: test_cwd().to_string_lossy().into_owned(),
             title: None,
             updated_at: None,
         }])
@@ -204,7 +209,7 @@ async fn resume_validates_before_capacity_rejection_without_open_or_eviction() {
     let client = Arc::new(ListCountingClient {
         lists: std::sync::atomic::AtomicUsize::new(0),
     });
-    let state = BridgeAppState::builder(client.clone(), PathBuf::from("/"))
+    let state = BridgeAppState::builder(client.clone(), test_cwd())
         .with_config(BridgeConfig {
             max_sessions: 1,
             ..BridgeConfig::default()
